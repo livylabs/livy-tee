@@ -276,6 +276,22 @@ mod tests {
     }
 
     #[test]
+    fn entry_count_survives_from_bytes_and_from_base64() {
+        let mut values = PublicValues::new();
+        values.commit(&"one").unwrap();
+        values.commit(&"two").unwrap();
+        values.commit(&3u8).unwrap();
+
+        let from_bytes = PublicValues::from_bytes(values.as_bytes().to_vec()).unwrap();
+        let from_base64 = PublicValues::from_base64(&values.to_base64()).unwrap();
+
+        assert_eq!(from_bytes.entry_count(), 3);
+        assert_eq!(from_base64.entry_count(), 3);
+        assert_eq!(from_bytes.entries_raw(), values.entries_raw());
+        assert_eq!(from_base64.entries_raw(), values.entries_raw());
+    }
+
+    #[test]
     fn entries_raw_does_not_advance_the_read_cursor() {
         let mut values = PublicValues::new();
         values.commit(&"first").unwrap();
