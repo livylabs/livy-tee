@@ -20,6 +20,7 @@
 
 pub mod evidence;
 pub mod generate;
+pub mod public_values;
 pub mod report;
 pub mod verify;
 
@@ -29,10 +30,10 @@ pub mod attest;
 pub mod bind;
 
 pub use evidence::Evidence;
-pub use report::{build_id_from_binary, build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION};
-
-pub use generate::{binary_hash, generate_evidence, GenerateError};
 pub use evidence::EvidenceError;
+pub use public_values::{entry_hash, PublicValues, PublicValuesError};
+pub use report::{build_id_from_binary, build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION};
+pub use generate::{binary_hash, generate_evidence, GenerateError};
 
 pub use verify::extract::{extract_mrtd, extract_report_data, ExtractError};
 
