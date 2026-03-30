@@ -12,7 +12,7 @@ fn sample_payload() -> [u8; 32] {
 }
 
 fn sample_build_id() -> [u8; 8] {
-    build_id_from_hash_hex(&binary_hash().unwrap()).unwrap()
+    build_id_from_hash_hex(&binary_hash().unwrap())
 }
 
 fn sample_report() -> ReportData {

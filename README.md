@@ -13,6 +13,132 @@ The crate is the trust anchor of the Livy stack. Every provenance claim produced
 
 ---
 
+## Trust model
+
+livy-tee provides **computation attestation**: cryptographic proof that a specific binary processed specific inputs and produced specific outputs inside a genuine Intel TDX enclave.
+
+### What the hardware guarantees
+
+A TDX quote is signed by the CPU's hardware key. It binds three things together:
+
+1. **Binary identity** (MRTD) — the exact measurement of the code running in the TEE. Anyone who builds the same source gets the same MRTD. A different binary, even one bit off, produces a different measurement.
+2. **REPORTDATA** (64 bytes) — arbitrary data chosen by the code at attestation time. livy-tee fills this with a `ReportData` struct containing a `payload_hash` (SHA-256 of input+output hashes), a build fingerprint, a version code, and a monotonic nonce.
+3. **Intel signature chain** — the quote's ECDSA signature chains back to Intel's root CA via the platform's PCK certificate. Verifiable against Intel PCS without trusting anyone else.
+
+No software — including the host OS, hypervisor, or cloud provider — can forge or tamper with these three bindings once the quote is generated.
+
+### The attestation object
+
+When you call `livy.attest()`, commit values, and call `.finalize().await`, the library:
+
+1. Serializes all committed values into a `public_values` buffer
+2. Computes `payload_hash = SHA-256(public_values buffer)`
+3. Packs `payload_hash` + build metadata into a 64-byte `ReportData` struct
+4. Asks the TDX hardware to generate a quote binding that struct
+5. Sends the quote to Intel Trust Authority for verification
+6. Returns an `Attestation` containing the quote, the ITA JWT, and the public values
+
+### Privacy and selective disclosure
+
+**Public values are not private.** Anything committed via `.commit()` is stored in plain text inside the `public_values` buffer and is readable by any party who receives the attestation. Only commit data that is intended to be public.
+
+For sensitive inputs that must be bound to the attestation without revealing them, use `.commit_hashed()` — this stores a SHA-256 hash of the value instead of the value itself:
+
+```rust
+// Binds the photo bytes to the attestation without revealing them.
+builder.commit_hashed(&raw_photo_bytes);
+
+// The verifier recomputes SHA-256(raw_photo_bytes) and checks it matches.
+```
+
+A verifier who does not have the raw bytes can still confirm the attestation is genuine (Intel signed it) but cannot learn the original value. The user decides when and to whom they reveal the original data.
+
+### Reconstructing the proof — anyone can verify
+
+This is the key property: given the raw input and output, **any third party** can independently reconstruct the `payload_hash` and verify it matches what's in the TDX quote. No Livy infrastructure needed, no trust in any intermediary.
+
+```
+┌─────────┐     ┌──────────┐     ┌───────────────┐
+│  User    │     │ Verifier │     │ Intel PCS     │
+│          │     │ (anyone) │     │ (public)      │
+└────┬─────┘     └────┬─────┘     └───────┬───────┘
+     │                │                   │
+     │  shares: Proof + raw input/output  │
+     │───────────────>│                   │
+     │                │                   │
+     │                │ 1. SHA-256(input) → input_hash
+     │                │ 2. SHA-256(output) → output_hash
+     │                │ 3. SHA-256(input_hash ‖ output_hash) → payload_hash
+     │                │ 4. Extract REPORTDATA from TDX quote
+     │                │ 5. Assert payload_hash == reportdata.payload_hash
+     │                │ 6. Assert build_id matches expected binary
+     │                │ 7. Assert nonce matches expected counter
+     │                │                   │
+     │                │  verify quote sig  │
+     │                │──────────────────>│
+     │                │  ✓ genuine Intel  │
+     │                │<──────────────────│
+     │                │                   │
+     │                │ ✓ Proven: this binary processed
+     │                │   this input and produced this output
+     │                │   inside a genuine TDX enclave
+```
+
+### Example: proving provenance of a photo
+
+```rust
+// ── On the TEE server ──────────────────────────────────────────────
+let livy = Livy::from_env()?;
+
+let input = raw_photo_bytes;              // original camera capture
+let output = provenance_record_bytes;     // the record the server created
+
+// Use commit_hashed for sensitive data — binds by SHA-256 hash, not plaintext.
+// Use commit for public metadata that verifiers should be able to read directly.
+let mut builder = livy.attest();
+builder.commit_hashed(&input);                     // binds photo without revealing it
+builder.commit_hashed(&output);                    // binds record without revealing it
+builder.commit(&content_hash);                     // public: verifiers can read this
+builder.nonce(counter);                            // monotonic — prevents replay
+let attestation = builder.finalize().await?;
+
+// Store attestation publicly (on-chain, in C2PA manifest, anywhere).
+// Sensitive values are bound by hash — the raw photo is not included.
+
+// ── Later: user wants to prove their photo is authentic ────────────
+// They share: the Attestation, the original photo, and the provenance record.
+
+// ── Any verifier, anywhere ─────────────────────────────────────────
+use sha2::{Digest, Sha256};
+
+// Read the public content_hash committed in plain text.
+let committed_hash: [u8; 32] = attestation.public_values.read(); // skip hashed entries
+assert_eq!(committed_hash, expected_content_hash);
+
+// Verify the full chain: public values → REPORTDATA → TDX quote (no network needed).
+assert!(attestation.verify().unwrap());
+
+// At this point the verifier knows:
+// - The photo and record were processed by the exact binary measured in the quote (MRTD)
+// - This happened inside a genuine Intel TDX enclave (hardware guarantee)
+// - The attestation hasn't been replayed (nonce is unique and monotonic)
+```
+
+### What you can and cannot prove
+
+| Claim | Proven by | How |
+|-------|-----------|-----|
+| This binary ran in a genuine TDX enclave | TDX quote + Intel PCS signature | Hardware guarantee — unforgeable |
+| This binary processed this exact input | `payload_hash` binding in REPORTDATA | Reconstructible from raw bytes |
+| This binary produced this exact output | `payload_hash` binding in REPORTDATA | Reconstructible from raw bytes |
+| The proof is fresh, not replayed | Application nonce (monotonic counter) | Verifier checks against expected value |
+| The quote wasn't relayed from another machine | ITA verifier nonce | Intel Trust Authority checks server-side |
+| The input data is authentic (e.g. a real photo) | **Not proven by livy-tee alone** | Requires additional trust anchors (App Attest, Secure Enclave, C2PA) |
+
+livy-tee proves computation integrity — "this code processed this data inside a TEE." Proving the input itself is authentic (e.g. it came from a real camera on a real device) requires the layers above: Apple Secure Enclave for device identity, App Attest for device genuineness, and C2PA for content provenance metadata.
+
+---
+
 ## Feature flags
 
 | Feature | Default | Description |
@@ -47,20 +173,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input  = b"user request or input data";
     let output = b"computed result or output data";
 
-    // 3. Bind input + output to a TDX attestation.
-    let proof = livy.attest()
-        .input(input)
-        .output(output)
-        .commit()
-        .await?;
+    // 3. Commit values and generate a TDX attestation.
+    //    commit()       — stores value in plain text (public, readable by anyone)
+    //    commit_hashed() — stores SHA-256(value) (binds without revealing)
+    let mut builder = livy.attest();
+    builder.commit_hashed(input);   // bind input by hash — not revealed in attestation
+    builder.commit_hashed(output);  // bind output by hash — not revealed in attestation
+    let attestation = builder.finalize().await?;
 
-    println!("ita_token:    {}", proof.ita_token);
-    println!("mrtd:         {}", proof.mrtd);
-    println!("tcb_status:   {}", proof.tcb_status);
-    println!("payload_hash: {}", proof.payload_hash_hex());
+    println!("ita_token:    {}", attestation.ita_token);
+    println!("mrtd:         {}", attestation.mrtd);
+    println!("tcb_status:   {}", attestation.tcb_status);
+    println!("payload_hash: {}", attestation.payload_hash_hex());
 
-    // Locally verify the proof covers these exact bytes — no network needed.
-    assert!(proof.verify_binding(input, output));
+    // Locally verify the full chain — no network needed.
+    assert!(attestation.verify().unwrap());
     Ok(())
 }
 ```
@@ -72,9 +199,9 @@ ITA_API_KEY=<your-key> ./your-binary
 
 ---
 
-## The proof
+## The attestation
 
-`livy.attest().commit()` returns a `Proof` containing:
+`builder.finalize().await` returns an `Attestation` containing:
 
 | Field | Description |
 |-------|-------------|
@@ -86,44 +213,41 @@ ITA_API_KEY=<your-key> ./your-binary
 | `verifier_nonce_val` | Base64-encoded verifier nonce value (from ITA GET /nonce, used in REPORTDATA computation). |
 | `verifier_nonce_iat` | Base64-encoded verifier nonce issued-at (from ITA GET /nonce, used in REPORTDATA computation). |
 | `report_data` | Structured `ReportData` — parsed from `runtime_data` bytes. Contains `payload_hash`, `build_id`, etc. |
-| `input_hash` | SHA-256 of the input bytes (or `[0u8;32]` if no input was bound). |
-| `output_hash` | SHA-256 of the output bytes (or `[0u8;32]` if no output was bound). |
+| `public_values` | All values committed via `.commit()` / `.commit_hashed()`. **Plain-text** — readable by any party with the attestation. |
 
 ### Payload hash
 
 The 32-byte `payload_hash` embedded in the `ReportData` struct (and stored in `runtime_data`) is:
 
 ```
-payload_hash = SHA-256( SHA-256(input) ‖ SHA-256(output) )
+payload_hash = SHA-256(public_values buffer)
 ```
 
-This is deterministic and reproducible from the original bytes — no Livy infrastructure needed.
+The `public_values` buffer is the concatenation of all length-prefixed serialized entries committed via `.commit()` or `.commit_hashed()`. This is deterministic and reproducible — no Livy infrastructure needed.
 
 ---
 
 ## External / independent verification
 
-Any third party who has the proof and the original data can verify the binding without contacting Livy or Intel:
+Any third party who has the attestation and the `public_values` buffer can verify the binding without contacting Livy or Intel:
 
 ```rust
-use livy_tee::{verify_quote, payload_hash_for};
+use livy_tee::verify_quote_with_public_values;
 
-// Full Intel CLI-compatible verification via raw DCAP quote.
+// Full chain verification via raw DCAP quote.
 // Checks: SHA-512(nonce_val ‖ nonce_iat ‖ runtime_data) == quote REPORTDATA
-//     AND: ReportData.payload_hash == SHA-256(SHA-256(input) ‖ SHA-256(output))
-let ok = verify_quote(
-    &proof.raw_quote,
-    &proof.runtime_data,        // base64 of our 64-byte ReportData struct
-    &proof.verifier_nonce_val,  // base64 of ITA verifier nonce val
-    &proof.verifier_nonce_iat,  // base64 of ITA verifier nonce iat
-    input,
-    output,
+//     AND: SHA-256(public_values buffer) == ReportData.payload_hash
+let ok = verify_quote_with_public_values(
+    &attestation.raw_quote,
+    &attestation.runtime_data,        // base64 of our 64-byte ReportData struct
+    &attestation.verifier_nonce_val,  // base64 of ITA verifier nonce val
+    &attestation.verifier_nonce_iat,  // base64 of ITA verifier nonce iat
+    &attestation.public_values,
 )?;
 assert!(ok);
 
-// Recompute the expected payload_hash from scratch.
-let expected_hash = payload_hash_for(input, output); // [u8; 32]
-assert_eq!(expected_hash, proof.report_data.payload_hash);
+// Or use the method form — identical check:
+assert!(attestation.verify().unwrap());
 ```
 
 ### Step-by-step manual verification recipe
@@ -133,7 +257,7 @@ assert_eq!(expected_hash, proof.report_data.payload_hash);
 3. Extract bytes `[568..632]` from the quote — the REPORTDATA field (= SHA-512 hash).
 4. Recompute `SHA-512(nonce_val ‖ nonce_iat ‖ runtime_data)` and assert it matches step 3.
 5. Parse `runtime_data` bytes: `ReportData::from_bytes(&bytes)`.
-6. Recompute: `SHA-256(SHA-256(input) ‖ SHA-256(output))`.
+6. Recompute `SHA-256(public_values buffer)` from the raw public values bytes.
 7. Assert `rd.verify_payload(&expected_hash)`.
 8. Assert `rd.build_id == build_id_from_hash_hex(&tee_binary_hash)` — confirms which binary ran.
 9. Assert `rd.nonce == expected_nonce` — replay protection.
@@ -181,7 +305,7 @@ use livy_tee::{binary_hash, report::{build_id_from_hash_hex, ReportData, REPORT_
 
 let rd = ReportData::new(
     payload_hash,                           // [u8; 32] — your hash
-    build_id_from_hash_hex(&binary_hash()?)?, // [u8; 8]
+    build_id_from_hash_hex(&binary_hash()?), // [u8; 8]
     REPORT_DATA_VERSION,                    // u32 — currently 1
     0,                                      // build_number (0 in dev)
     nonce,                                  // u64 — monotonic counter
@@ -228,6 +352,30 @@ let attested = generate_and_attest(&rd.to_bytes(), &config).await?;
 // attested.nonce_val    — decoded verifier nonce val bytes
 // attested.nonce_iat    — decoded verifier nonce iat bytes
 ```
+
+### Verifying a quote built with the low-level API
+
+If you computed your own `payload_hash` without `PublicValues` — for example,
+`SHA-256(SHA-256(input) ‖ SHA-256(output))` — use `verify_quote` directly:
+
+```rust
+use livy_tee::verify_quote;
+
+// Checks: SHA-512(nonce_val ‖ nonce_iat ‖ runtime_data) == quote REPORTDATA
+//     AND: ReportData.payload_hash == expected_payload_hash
+let ok = verify_quote(
+    &attested_b64_quote,
+    &attested_b64_runtime_data,
+    &attested_b64_nonce_val,
+    &attested_b64_nonce_iat,
+    &expected_payload_hash,    // [u8; 32] — whatever you put in ReportData
+)?;
+assert!(ok);
+```
+
+For the high-level commit/read model, use `verify_quote_with_public_values` or
+`Attestation::verify()` instead — both compute the `payload_hash` from the
+`PublicValues` buffer automatically.
 
 ### Extracting REPORTDATA from an ITA JWT
 
@@ -279,14 +427,13 @@ payload hash.
 
 ```rust
 // Application maintains a persistent counter (e.g. in a database).
-let proof = livy.attest()
-    .input(request_bytes)
-    .output(response_bytes)
-    .nonce(counter)   // monotonically increasing — increment per request
-    .commit()
-    .await?;
+let mut builder = livy.attest();
+builder.commit_hashed(request_bytes);
+builder.commit_hashed(response_bytes);
+builder.nonce(counter);   // monotonically increasing — increment per request
+let attestation = builder.finalize().await?;
 
-// Verifier checks: stored_nonce_for_this_request == proof.report_data.nonce
+// Verifier checks: stored_nonce_for_this_request == attestation.report_data.nonce
 ```
 
 Defaults to `0` if `.nonce()` is not called — acceptable for single-request workloads.
@@ -296,9 +443,9 @@ Defaults to `0` if `.nonce()` is not called — acceptable for single-request wo
 | | ITA verifier nonce | Application nonce |
 |---|---|---|
 | Issued by | Intel Trust Authority | Developer's application |
-| Prevents | Quote theft across machines | Proof reuse across requests |
-| Verified by | ITA (server-side) + `verify_quote` (locally) | Application logic |
-| Location in proof | `verifier_nonce_val` / `verifier_nonce_iat` | `report_data.nonce` |
+| Prevents | Quote theft across machines | Attestation reuse across requests |
+| Verified by | ITA (server-side) + `verify_quote_with_public_values` (locally) | Application logic |
+| Location in attestation | `verifier_nonce_val` / `verifier_nonce_iat` | `report_data.nonce` |
 
 The two are complementary: the ITA nonce pins the quote to a specific ITA session;
 the application nonce pins the proof to a specific request slot.
@@ -351,7 +498,7 @@ In `mock-tee` mode, `generate_evidence` returns a correctly-shaped 632-byte DCAP
 
 ```
 livy-tee
-├── bind.rs          High-level Livy API (Livy, AttestBuilder, Proof, verify_quote, verify_token)
+├── bind.rs          High-level Livy API (Livy, AttestBuilder, Attestation, verify_quote_with_public_values)
 ├── report.rs        ReportData wire format + build_id helpers
 ├── evidence.rs      Evidence type (wraps raw DCAP quote bytes)
 ├── generate/

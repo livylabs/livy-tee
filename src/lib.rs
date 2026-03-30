@@ -20,6 +20,7 @@
 
 pub mod evidence;
 pub mod generate;
+pub mod public_values;
 pub mod report;
 pub mod verify;
 
@@ -28,12 +29,18 @@ pub mod attest;
 #[cfg(feature = "ita-verify")]
 pub mod bind;
 
+// ── Core types ─────────────────────────────────────────────────────────────
 pub use evidence::Evidence;
-pub use report::{build_id_from_binary, build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION};
+pub use public_values::{PublicValues, PublicValuesError};
+pub use report::{
+    build_id_from_binary, build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION,
+};
 
+// ── Generation ─────────────────────────────────────────────────────────────
 pub use generate::{binary_hash, generate_evidence, GenerateError};
 pub use evidence::EvidenceError;
 
+// ── Verification — local (always available) ────────────────────────────────
 pub use verify::extract::{extract_mrtd, extract_report_data, ExtractError};
 
 #[cfg(feature = "ita-verify")]
@@ -45,7 +52,7 @@ pub use verify::VerifyError;
 pub use attest::{generate_and_attest, AttestedEvidence, AttestError};
 
 #[cfg(feature = "ita-verify")]
-pub use bind::{payload_hash_for, verify_quote, verify_token, AttestBuilder, Livy, Proof};
+pub use bind::{verify_quote, verify_quote_with_public_values, Attestation, AttestBuilder, Livy};
 
 #[cfg(feature = "ita-verify")]
 pub use verify::ita::report_data_from_token;

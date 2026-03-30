@@ -7,18 +7,18 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use livy_tee::{
     binary_hash, extract_report_data, generate_and_attest, generate_evidence,
-    payload_hash_for, report_data_from_token, verify_quote, verify_token,
+    report_data_from_token, verify_quote_with_public_values,
     report::{build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION},
-    ItaConfig, Livy,
+    ItaConfig, Livy, PublicValues,
 };
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha512};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 fn sample_build_id() -> [u8; 8] {
-    build_id_from_hash_hex(&binary_hash().unwrap()).unwrap()
+    build_id_from_hash_hex(&binary_hash().unwrap())
 }
 
 fn default_config() -> ItaConfig {
@@ -37,46 +37,53 @@ fn fake_jwt(payload_json: &str) -> String {
 }
 
 // ===========================================================================
-// payload_hash_for
+// PublicValues commitment
 // ===========================================================================
 
 #[test]
-fn payload_hash_for_is_deterministic() {
-    let h1 = payload_hash_for(b"input", b"output");
-    let h2 = payload_hash_for(b"input", b"output");
-    assert_eq!(h1, h2);
+fn commitment_hash_is_deterministic() {
+    let mut a = PublicValues::new();
+    a.commit(&"input");
+    a.commit(&"output");
+
+    let mut b = PublicValues::new();
+    b.commit(&"input");
+    b.commit(&"output");
+
+    assert_eq!(a.commitment_hash(), b.commitment_hash());
 }
 
 #[test]
-fn payload_hash_for_changes_with_input() {
-    let h1 = payload_hash_for(b"input-a", b"output");
-    let h2 = payload_hash_for(b"input-b", b"output");
-    assert_ne!(h1, h2);
+fn commitment_hash_changes_with_values() {
+    let mut a = PublicValues::new();
+    a.commit(&"input-a");
+
+    let mut b = PublicValues::new();
+    b.commit(&"input-b");
+
+    assert_ne!(a.commitment_hash(), b.commitment_hash());
 }
 
 #[test]
-fn payload_hash_for_changes_with_output() {
-    let h1 = payload_hash_for(b"input", b"output-a");
-    let h2 = payload_hash_for(b"input", b"output-b");
-    assert_ne!(h1, h2);
-}
+fn commitment_hash_changes_with_order() {
+    let mut a = PublicValues::new();
+    a.commit(&1u32);
+    a.commit(&2u32);
 
-#[test]
-fn payload_hash_for_empty_inputs() {
-    // Empty byte slices should not panic and should produce a valid 32-byte hash.
-    let h = payload_hash_for(b"", b"");
-    assert_eq!(h.len(), 32);
-    // Different from a non-empty input.
-    assert_ne!(h, payload_hash_for(b"x", b""));
+    let mut b = PublicValues::new();
+    b.commit(&2u32);
+    b.commit(&1u32);
+
+    assert_ne!(a.commitment_hash(), b.commitment_hash());
 }
 
 // ===========================================================================
-// verify_quote (mock mode — full chain)
+// verify_quote_with_public_values (mock mode — full chain)
 // ===========================================================================
 
 /// Construct the same chain that generate_and_attest builds internally.
-fn mock_chain(input: &[u8], output: &[u8]) -> (String, String, String, String) {
-    let ph = payload_hash_for(input, output);
+fn mock_chain(pv: &PublicValues) -> (String, String, String, String) {
+    let ph = pv.commitment_hash();
     let rd = ReportData::new(ph, sample_build_id(), REPORT_DATA_VERSION, 0, 0);
     let rd_bytes = rd.to_bytes();
 
@@ -105,54 +112,45 @@ fn mock_chain(input: &[u8], output: &[u8]) -> (String, String, String, String) {
 
 #[test]
 fn verify_quote_accepts_correct_mock_binding() {
-    let input = b"hello";
-    let output = b"world";
-    let (quote_b64, rd_b64, nonce_val_b64, nonce_iat_b64) = mock_chain(input, output);
+    let mut pv = PublicValues::new();
+    pv.commit(&"hello");
+    pv.commit(&"world");
+    let (quote_b64, rd_b64, nonce_val_b64, nonce_iat_b64) = mock_chain(&pv);
 
-    let ok = verify_quote(&quote_b64, &rd_b64, &nonce_val_b64, &nonce_iat_b64, input, output)
-        .expect("verify_quote should not error");
-    assert!(ok, "verify_quote should accept correct mock binding");
+    let ok = verify_quote_with_public_values(
+        &quote_b64, &rd_b64, &nonce_val_b64, &nonce_iat_b64, &pv,
+    )
+    .expect("verify should not error");
+    assert!(ok, "should accept correct mock binding");
 }
 
 #[test]
-fn verify_quote_rejects_tampered_input_mock() {
-    let input = b"hello";
-    let output = b"world";
-    let (quote_b64, rd_b64, nonce_val_b64, nonce_iat_b64) = mock_chain(input, output);
+fn verify_quote_rejects_tampered_values_mock() {
+    let mut pv = PublicValues::new();
+    pv.commit(&"hello");
+    pv.commit(&"world");
+    let (quote_b64, rd_b64, nonce_val_b64, nonce_iat_b64) = mock_chain(&pv);
 
-    let ok = verify_quote(
-        &quote_b64, &rd_b64, &nonce_val_b64, &nonce_iat_b64,
-        b"TAMPERED", output,
+    let mut tampered = PublicValues::new();
+    tampered.commit(&"TAMPERED");
+    tampered.commit(&"world");
+
+    let ok = verify_quote_with_public_values(
+        &quote_b64, &rd_b64, &nonce_val_b64, &nonce_iat_b64, &tampered,
     )
     .expect("should not error");
-    assert!(!ok, "tampered input should be rejected");
-}
-
-#[test]
-fn verify_quote_rejects_tampered_output_mock() {
-    let input = b"hello";
-    let output = b"world";
-    let (quote_b64, rd_b64, nonce_val_b64, nonce_iat_b64) = mock_chain(input, output);
-
-    let ok = verify_quote(
-        &quote_b64, &rd_b64, &nonce_val_b64, &nonce_iat_b64,
-        input, b"TAMPERED",
-    )
-    .expect("should not error");
-    assert!(!ok, "tampered output should be rejected");
+    assert!(!ok, "tampered values should be rejected");
 }
 
 #[test]
 fn verify_quote_rejects_wrong_nonce_mock() {
-    let input = b"hello";
-    let output = b"world";
-    let (quote_b64, rd_b64, _nonce_val_b64, nonce_iat_b64) = mock_chain(input, output);
+    let mut pv = PublicValues::new();
+    pv.commit(&"hello");
+    let (quote_b64, rd_b64, _nonce_val_b64, nonce_iat_b64) = mock_chain(&pv);
 
-    // Use wrong nonce val bytes.
     let wrong_nonce_val = BASE64.encode([0xffu8; 32]);
-    let ok = verify_quote(
-        &quote_b64, &rd_b64, &wrong_nonce_val, &nonce_iat_b64,
-        input, output,
+    let ok = verify_quote_with_public_values(
+        &quote_b64, &rd_b64, &wrong_nonce_val, &nonce_iat_b64, &pv,
     )
     .expect("should not error");
     assert!(!ok, "wrong nonce should be rejected");
@@ -160,26 +158,10 @@ fn verify_quote_rejects_wrong_nonce_mock() {
 
 #[test]
 fn verify_quote_rejects_invalid_base64() {
-    let result = verify_quote("!!!invalid!!!", "AAAA", "AAAA", "AAAA", b"x", b"y");
-    // Should error (invalid base64 for the quote).
-    assert!(result.is_err());
-}
-
-// ===========================================================================
-// verify_token
-// ===========================================================================
-
-#[test]
-fn verify_token_returns_none_for_missing_report_data() {
-    // JWT with no tdx_report_data field.
-    let jwt = fake_jwt(r#"{"tdx":{}}"#);
-    let result = verify_token(&jwt, b"input", b"output").unwrap();
-    assert!(result.is_none());
-}
-
-#[test]
-fn verify_token_rejects_malformed_jwt() {
-    let result = verify_token("not-a-jwt", b"input", b"output");
+    let pv = PublicValues::new();
+    let result = verify_quote_with_public_values(
+        "!!!invalid!!!", "AAAA", "AAAA", "AAAA", &pv,
+    );
     assert!(result.is_err());
 }
 
@@ -200,17 +182,19 @@ async fn generate_and_attest_mock_returns_empty_token() {
 
 #[tokio::test]
 async fn generate_and_attest_mock_returns_valid_evidence() {
-    let ph = payload_hash_for(b"in", b"out");
+    let mut pv = PublicValues::new();
+    pv.commit(&"in");
+    pv.commit(&"out");
+    let ph = pv.commitment_hash();
+
     let rd = ReportData::new(ph, sample_build_id(), REPORT_DATA_VERSION, 0, 0);
     let rd_bytes = rd.to_bytes();
     let attested = generate_and_attest(&rd_bytes, &default_config())
         .await
         .unwrap();
 
-    // The runtime_data should be exactly our original rd_bytes.
     assert_eq!(attested.runtime_data, rd_bytes);
 
-    // The evidence should have a valid REPORTDATA = SHA-512(nonce_val ‖ nonce_iat ‖ rd_bytes).
     let extracted_rd = extract_report_data(&attested.evidence).unwrap();
     let expected_rd: [u8; 64] = {
         let mut h = Sha512::new();
@@ -250,97 +234,87 @@ fn report_data_from_token_empty_report_data() {
 }
 
 // ===========================================================================
-// Proof via AttestBuilder (mock)
+// Proof via AttestBuilder (mock) — new commit/public_values API
 // ===========================================================================
 
 #[tokio::test]
 async fn proof_via_attest_builder_mock() {
     let livy = Livy::new("mock-key");
-    let proof = livy
-        .attest()
-        .input(b"test-input")
-        .output(b"test-output")
-        .nonce(42)
-        .commit()
-        .await
-        .unwrap();
+    let mut builder = livy.attest();
+    builder.commit(&"test-input");
+    builder.commit(&"test-output");
+    builder.nonce(42);
+    let att = builder.finalize().await.unwrap();
 
-    // In mock mode, ita_token is empty.
-    assert!(proof.ita_token.is_empty());
-    // report_data should have nonce 42.
-    assert_eq!(proof.report_data.nonce, 42);
-    // input_hash and output_hash should be correct SHA-256 digests.
-    assert_eq!(proof.input_hash, <[u8; 32]>::from(Sha256::digest(b"test-input")));
-    assert_eq!(proof.output_hash, <[u8; 32]>::from(Sha256::digest(b"test-output")));
+    assert!(att.ita_token.is_empty());
+    assert_eq!(att.report_data.nonce, 42);
+
+    // Read back values.
+    let v1: String = att.public_values.read();
+    let v2: String = att.public_values.read();
+    assert_eq!(v1, "test-input");
+    assert_eq!(v2, "test-output");
 }
 
 #[tokio::test]
-async fn proof_verify_binding_mock() {
+async fn proof_verify_mock() {
     let livy = Livy::new("mock-key");
-    let proof = livy
-        .attest()
-        .input(b"correct-input")
-        .output(b"correct-output")
-        .commit()
-        .await
-        .unwrap();
+    let mut builder = livy.attest();
+    builder.commit(&"correct-data");
+    let att = builder.finalize().await.unwrap();
 
-    assert!(proof.verify_binding(b"correct-input", b"correct-output"));
-    assert!(!proof.verify_binding(b"wrong-input", b"correct-output"));
-    assert!(!proof.verify_binding(b"correct-input", b"wrong-output"));
+    assert!(
+        att.verify().expect("verify should not error"),
+        "att.verify() should pass for matching public values"
+    );
 }
 
 #[tokio::test]
 async fn proof_payload_hash_hex_mock() {
     let livy = Livy::new("mock-key");
-    let proof = livy
-        .attest()
-        .input(b"in")
-        .output(b"out")
-        .commit()
-        .await
-        .unwrap();
+    let mut builder = livy.attest();
+    builder.commit(&"in");
+    builder.commit(&"out");
+    let att = builder.finalize().await.unwrap();
 
-    let hex_str = proof.payload_hash_hex();
-    // Should be 64 hex characters (32 bytes).
+    let hex_str = att.payload_hash_hex();
     assert_eq!(hex_str.len(), 64);
-    // Should match payload_hash_for.
-    assert_eq!(hex_str, hex::encode(payload_hash_for(b"in", b"out")));
+
+    // Should match PublicValues commitment hash.
+    let mut pv = PublicValues::new();
+    pv.commit(&"in");
+    pv.commit(&"out");
+    assert_eq!(hex_str, hex::encode(pv.commitment_hash()));
 }
 
 #[tokio::test]
 async fn verify_quote_full_chain_mock() {
     let livy = Livy::new("mock-key");
-    let input = b"chain-input";
-    let output = b"chain-output";
-    let proof = livy
-        .attest()
-        .input(input)
-        .output(output)
-        .commit()
-        .await
-        .unwrap();
+    let mut builder = livy.attest();
+    builder.commit(&"chain-input");
+    builder.commit(&"chain-output");
+    let att = builder.finalize().await.unwrap();
 
-    let ok = verify_quote(
-        &proof.raw_quote,
-        &proof.runtime_data,
-        &proof.verifier_nonce_val,
-        &proof.verifier_nonce_iat,
-        input,
-        output,
+    let ok = verify_quote_with_public_values(
+        &att.raw_quote,
+        &att.runtime_data,
+        &att.verifier_nonce_val,
+        &att.verifier_nonce_iat,
+        &att.public_values,
     )
-    .expect("verify_quote should not error");
+    .expect("verify should not error");
     assert!(ok, "full chain verification should pass");
 
-    // Tampered input should fail.
-    let ok2 = verify_quote(
-        &proof.raw_quote,
-        &proof.runtime_data,
-        &proof.verifier_nonce_val,
-        &proof.verifier_nonce_iat,
-        b"tampered",
-        output,
+    // Tampered public values should fail.
+    let mut tampered = PublicValues::new();
+    tampered.commit(&"tampered");
+    let ok2 = verify_quote_with_public_values(
+        &att.raw_quote,
+        &att.runtime_data,
+        &att.verifier_nonce_val,
+        &att.verifier_nonce_iat,
+        &tampered,
     )
     .expect("should not error");
-    assert!(!ok2, "tampered input should fail full chain");
+    assert!(!ok2, "tampered values should fail full chain");
 }
