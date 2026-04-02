@@ -7,19 +7,16 @@
 //!   - **ITA** (`ita`, feature = `ita-verify`): POST to Intel Trust Authority
 //!     for full hardware chain verification.
 
-pub mod extract;
+pub(crate) mod extract;
 
 #[cfg(feature = "ita-verify")]
-pub mod ita;
-
-pub use extract::{extract_mrtd, extract_report_data, ExtractError};
+pub(crate) mod ita;
 
 #[cfg(feature = "ita-verify")]
-pub use ita::{verify_evidence, ItaConfig, VerifiedClaims};
-
 use thiserror::Error;
 
 /// Errors returned by Intel Trust Authority verification calls.
+#[cfg(feature = "ita-verify")]
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum VerifyError {

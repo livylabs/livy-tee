@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 use base64::Engine;
 use livy_tee::{
-    binary_hash, extract_report_data, generate_evidence,
-    report::{build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION},
-    Evidence,
+    binary_hash, build_id_from_hash_hex, extract_report_data, generate_evidence, Evidence,
+    EvidenceError, ReportData, REPORT_DATA_VERSION,
 };
 use sha2::{Digest, Sha256};
 
@@ -109,7 +108,6 @@ fn extract_report_data_roundtrip() {
 
 #[test]
 fn evidence_from_bytes_rejects_short_buffer() {
-    use livy_tee::evidence::EvidenceError;
     let result = Evidence::from_bytes(vec![0u8; 100]);
     assert!(matches!(result, Err(EvidenceError::TooShort(100))));
 }
@@ -153,14 +151,12 @@ fn livy_from_env_fails_when_key_missing() {
 
 #[test]
 fn evidence_from_base64_rejects_invalid_base64() {
-    use livy_tee::evidence::EvidenceError;
     let result = Evidence::from_base64("not-valid-base64!!!");
     assert!(matches!(result, Err(EvidenceError::Base64(_))));
 }
 
 #[test]
 fn evidence_from_base64_rejects_short_decoded() {
-    use livy_tee::evidence::EvidenceError;
     // Valid base64 but decodes to only 3 bytes — well under 632.
     let b64 = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
     let result = Evidence::from_base64(&b64);
