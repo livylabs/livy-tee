@@ -18,23 +18,27 @@
 //! | `mock-tee`   | no      | Correctly-shaped 632-byte stub — no hardware required |
 //! | `ita-verify` | no      | Intel Trust Authority REST API verification |
 
-pub mod evidence;
-pub mod generate;
-pub mod public_values;
-pub mod report;
-pub mod verify;
+mod evidence;
+mod generate;
+mod parser;
+mod public_values;
+mod report;
+mod types;
+mod verify;
 
 #[cfg(feature = "ita-verify")]
-pub mod attest;
+mod attest;
 #[cfg(feature = "ita-verify")]
-pub mod bind;
+mod bind;
 
 // ── Core types ─────────────────────────────────────────────────────────────
 pub use evidence::Evidence;
+pub use parser::parse;
 pub use public_values::{PublicValues, PublicValuesError};
 pub use report::{
     build_id_from_binary, build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION,
 };
+pub use types::Config;
 
 // ── Generation ─────────────────────────────────────────────────────────────
 pub use generate::{binary_hash, generate_evidence, GenerateError};
