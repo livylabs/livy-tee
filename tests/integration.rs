@@ -15,7 +15,13 @@ fn sample_build_id() -> [u8; 8] {
 }
 
 fn sample_report() -> ReportData {
-    ReportData::new(sample_payload(), sample_build_id(), REPORT_DATA_VERSION, 0, 1)
+    ReportData::new(
+        sample_payload(),
+        sample_build_id(),
+        REPORT_DATA_VERSION,
+        0,
+        1,
+    )
 }
 
 #[test]
@@ -33,14 +39,26 @@ fn report_data_is_deterministic() {
 fn report_data_changes_with_different_payload() {
     let r1 = sample_report();
     let different_payload: [u8; 32] = Sha256::digest(b"different").into();
-    let r2 = ReportData::new(different_payload, sample_build_id(), REPORT_DATA_VERSION, 0, 1);
+    let r2 = ReportData::new(
+        different_payload,
+        sample_build_id(),
+        REPORT_DATA_VERSION,
+        0,
+        1,
+    );
     assert_ne!(r1.to_bytes(), r2.to_bytes());
 }
 
 #[test]
 fn report_data_changes_with_nonce() {
     let r1 = sample_report();
-    let r2 = ReportData::new(sample_payload(), sample_build_id(), REPORT_DATA_VERSION, 0, 2);
+    let r2 = ReportData::new(
+        sample_payload(),
+        sample_build_id(),
+        REPORT_DATA_VERSION,
+        0,
+        2,
+    );
     assert_ne!(r1.to_bytes(), r2.to_bytes());
 }
 

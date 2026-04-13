@@ -118,7 +118,10 @@ mod tests {
         buf[0] = 3; // version = 3
         buf[4] = 0x81; // tee_type = TDX
         let evidence = Evidence::from_bytes(buf).unwrap();
-        assert!(matches!(extract_report_data(&evidence), Err(ExtractError::UnsupportedVersion(3))));
+        assert!(matches!(
+            extract_report_data(&evidence),
+            Err(ExtractError::UnsupportedVersion(3))
+        ));
     }
 
     #[test]
@@ -127,6 +130,9 @@ mod tests {
         buf[0] = 4; // version = 4
         buf[4] = 0x00; // tee_type = 0 (SGX, not TDX)
         let evidence = Evidence::from_bytes(buf).unwrap();
-        assert!(matches!(extract_report_data(&evidence), Err(ExtractError::UnsupportedTeeType(0))));
+        assert!(matches!(
+            extract_report_data(&evidence),
+            Err(ExtractError::UnsupportedTeeType(0))
+        ));
     }
 }

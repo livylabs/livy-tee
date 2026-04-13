@@ -39,19 +39,13 @@ fn main() {
     );
     println!();
 
-    // [1/4] Generate TDX evidence
-    println!("[1/4] Generating TDX evidence via TSM configfs...");
+    // [1/5] Generate TDX evidence
+    println!("[1/5] Generating TDX evidence via runtime quote provider...");
 
     use sha2::{Digest, Sha256};
     let payload_hash: [u8; 32] = Sha256::digest(b"livy-tee smoke test v1").into();
     let build_id = livy_tee::build_id_from_hash_hex(&binary_hash);
-    let rd = livy_tee::ReportData::new(
-        payload_hash,
-        build_id,
-        livy_tee::REPORT_DATA_VERSION,
-        0,
-        0,
-    );
+    let rd = livy_tee::ReportData::new(payload_hash, build_id, livy_tee::REPORT_DATA_VERSION, 0, 0);
     let rd_bytes = rd.to_bytes();
 
     let evidence = match livy_tee::generate_evidence(&rd_bytes) {
@@ -66,8 +60,8 @@ fn main() {
     };
     println!();
 
-    // [2/4] Extract REPORTDATA (round-trip)
-    println!("[2/4] Extracting REPORTDATA (round-trip)...");
+    // [2/5] Extract REPORTDATA (round-trip)
+    println!("[2/5] Extracting REPORTDATA (round-trip)...");
 
     match livy_tee::extract_report_data(&evidence) {
         Ok(extracted) if extracted == rd_bytes => {
@@ -84,8 +78,8 @@ fn main() {
     }
     println!();
 
-    // [3/4] Extract MRTD
-    println!("[3/4] Extracting MRTD...");
+    // [3/5] Extract MRTD
+    println!("[3/5] Extracting MRTD...");
 
     match livy_tee::extract_mrtd(&evidence) {
         Ok(mrtd) => {
@@ -103,8 +97,8 @@ fn main() {
     }
     println!();
 
-    // [4/4] Intel Trust Authority verification
-    println!("[4/4] Intel Trust Authority verification (via Livy API)...");
+    // [4/5] Intel Trust Authority verification
+    println!("[4/5] Intel Trust Authority verification (via Livy API)...");
 
     #[cfg(feature = "ita-verify")]
     {
@@ -163,9 +157,15 @@ fn main() {
                     &att.verifier_nonce_iat,
                     &att.public_values,
                 ) {
-                    Ok(true)  => println!("  OK  verify_quote: SHA-512 binding + commitment match"),
-                    Ok(false) => { eprintln!("  FAIL  verify_quote: binding mismatch"); std::process::exit(1); }
-                    Err(e)    => { eprintln!("  FAIL  verify_quote: {e}"); std::process::exit(1); }
+                    Ok(true) => println!("  OK  verify_quote: SHA-512 binding + commitment match"),
+                    Ok(false) => {
+                        eprintln!("  FAIL  verify_quote: binding mismatch");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("  FAIL  verify_quote: {e}");
+                        std::process::exit(1);
+                    }
                 }
 
                 // Read back public values.

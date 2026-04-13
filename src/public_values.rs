@@ -48,14 +48,17 @@ impl PublicValues {
     /// buffer. Use [`commit_raw`](Self::commit_raw) when the payload is already
     /// pre-serialized (for example a precomputed hash).
     pub fn commit<T: Serialize>(&mut self, value: &T) {
-        let encoded = serde_json::to_vec(value)
-            .expect("PublicValues::commit: serialization should not fail");
+        let encoded =
+            serde_json::to_vec(value).expect("PublicValues::commit: serialization should not fail");
         self.commit_raw(&encoded);
     }
 
     /// Commit raw bytes directly (no serialization wrapper).
     pub fn commit_raw(&mut self, bytes: &[u8]) {
-        let len = bytes.len() as u32;
+        let len: u32 = bytes
+            .len()
+            .try_into()
+            .expect("PublicValues entry too large for wire format");
         self.buffer.extend_from_slice(&len.to_le_bytes());
         self.buffer.extend_from_slice(bytes);
     }
@@ -349,7 +352,10 @@ mod tests {
             assert_eq!(index as usize, expected_index);
             let payload_len = u32::from_le_bytes(wire_bytes[..4].try_into().unwrap()) as usize;
             assert_eq!(payload_len, expected_payloads[index as usize].len());
-            assert_eq!(&wire_bytes[4..], expected_payloads[index as usize].as_slice());
+            assert_eq!(
+                &wire_bytes[4..],
+                expected_payloads[index as usize].as_slice()
+            );
         }
     }
 
