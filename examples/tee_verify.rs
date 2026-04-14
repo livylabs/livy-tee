@@ -46,7 +46,13 @@ fn main() {
 
     use sha2::{Digest, Sha256};
     let payload_hash: [u8; 32] = Sha256::digest(b"livy-tee smoke test v1").into();
-    let build_id = livy_tee::build_id_from_hash_hex(&binary_hash);
+    let build_id = match livy_tee::build_id_from_hash_hex(&binary_hash) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("  FAIL  build_id_from_hash_hex: {e}");
+            std::process::exit(1);
+        }
+    };
     let rd = livy_tee::ReportData::new(payload_hash, build_id, livy_tee::REPORT_DATA_VERSION, 0, 0);
     let rd_bytes = rd.to_bytes();
 

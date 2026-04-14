@@ -56,24 +56,24 @@ pub fn verify_quote(
 ) -> Result<bool, ExtractError> {
     let raw = BASE64
         .decode(raw_quote_b64.trim())
-        .map_err(|_| ExtractError::TooShort(0))?;
+        .map_err(|err| ExtractError::Base64(err.to_string()))?;
     let raw_len = raw.len();
     let evidence = Evidence::from_bytes(raw).map_err(|_| ExtractError::TooShort(raw_len))?;
     let quote_rd_bytes = extract_report_data(&evidence)?;
 
     let runtime_data_bytes = BASE64
         .decode(runtime_data_b64.trim())
-        .map_err(|_| ExtractError::TooShort(0))?;
+        .map_err(|err| ExtractError::Base64(err.to_string()))?;
     let runtime_data: [u8; 64] = runtime_data_bytes
         .as_slice()
         .try_into()
         .map_err(|_| ExtractError::TooShort(runtime_data_bytes.len()))?;
     let nonce_val = BASE64
         .decode(nonce_val_b64.trim())
-        .map_err(|_| ExtractError::TooShort(0))?;
+        .map_err(|err| ExtractError::Base64(err.to_string()))?;
     let nonce_iat = BASE64
         .decode(nonce_iat_b64.trim())
-        .map_err(|_| ExtractError::TooShort(0))?;
+        .map_err(|err| ExtractError::Base64(err.to_string()))?;
 
     if quote_rd_bytes != nonce_and_runtime_hash(&nonce_val, &nonce_iat, &runtime_data) {
         return Ok(false);

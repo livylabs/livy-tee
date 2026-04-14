@@ -37,7 +37,9 @@ pub use cloud::{detect_cloud_provider, CloudProvider};
 pub use evidence::{Evidence, EvidenceError, PortableEvidence, QUOTE_MIN_LEN};
 pub use parser::parse;
 pub use public_values::{entry_hash, PublicValues, PublicValuesError};
-pub use report::{build_id_from_binary, build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION};
+pub use report::{
+    build_id_from_binary, build_id_from_hash_hex, BuildIdError, ReportData, REPORT_DATA_VERSION,
+};
 pub use types::Config;
 
 // ── Generation ─────────────────────────────────────────────────────────────

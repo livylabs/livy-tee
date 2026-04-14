@@ -8,8 +8,6 @@ This document is the Azure-specific reference for `livy-tee`. It explains what
 is different on Azure, what the library stores, what each verification method
 actually guarantees, and what was validated on a real Azure confidential VM.
 
-For the short status snapshot, see `docs/plan.md`.
-
 ---
 
 ## Why Azure is different

@@ -55,7 +55,12 @@ pub(crate) fn generate(report_data: &[u8; 64]) -> Result<Evidence, GenerateError
                 GenerateError::AzureQuoteResponse(format!("quote base64 decode failed: {e}"))
             })?;
 
-        if raw.len() < 632 {
+        if raw.len() < crate::evidence::QUOTE_MIN_LEN {
+            eprintln!(
+                "livy-tee: ignoring undersized Azure quote (got {} bytes, need at least {})",
+                raw.len(),
+                crate::evidence::QUOTE_MIN_LEN
+            );
             continue;
         }
 

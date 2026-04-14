@@ -42,6 +42,8 @@ use crate::evidence::Evidence;
 use crate::verify::codec::{decode_claim_array_64, decode_standard_base64_array_64};
 use crate::verify::VerifyError;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 /// Default Intel Trust Authority token-signing JWKS endpoint.
 pub(crate) const DEFAULT_JWKS_URL: &str = "https://portal.trustauthority.intel.com/certs";
@@ -241,36 +243,28 @@ struct ItaClaims {
 }
 
 impl ItaClaims {
-    fn tdx_mrtd(&self) -> &str {
-        if !self.tdx.tdx_mrtd.is_empty() {
-            &self.tdx.tdx_mrtd
+    fn nested_or_flat_str<'a>(nested: &'a str, flat: &'a str) -> &'a str {
+        if !nested.is_empty() {
+            nested
         } else {
-            &self.tdx_mrtd
+            flat
         }
+    }
+
+    fn tdx_mrtd(&self) -> &str {
+        Self::nested_or_flat_str(&self.tdx.tdx_mrtd, &self.tdx_mrtd)
     }
 
     fn tdx_report_data(&self) -> &str {
-        if !self.tdx.tdx_report_data.is_empty() {
-            &self.tdx.tdx_report_data
-        } else {
-            &self.tdx_report_data
-        }
+        Self::nested_or_flat_str(&self.tdx.tdx_report_data, &self.tdx_report_data)
     }
 
     fn attester_tcb_status(&self) -> &str {
-        if !self.tdx.attester_tcb_status.is_empty() {
-            &self.tdx.attester_tcb_status
-        } else {
-            &self.attester_tcb_status
-        }
+        Self::nested_or_flat_str(&self.tdx.attester_tcb_status, &self.attester_tcb_status)
     }
 
     fn attester_tcb_date(&self) -> Option<&str> {
-        let v = if !self.tdx.attester_tcb_date.is_empty() {
-            &self.tdx.attester_tcb_date
-        } else {
-            &self.attester_tcb_date
-        };
+        let v = Self::nested_or_flat_str(&self.tdx.attester_tcb_date, &self.attester_tcb_date);
         if v.is_empty() {
             None
         } else {
@@ -279,11 +273,7 @@ impl ItaClaims {
     }
 
     fn attester_held_data(&self) -> &str {
-        if !self.tdx.attester_held_data.is_empty() {
-            &self.tdx.attester_held_data
-        } else {
-            &self.attester_held_data
-        }
+        Self::nested_or_flat_str(&self.tdx.attester_held_data, &self.attester_held_data)
     }
 
     fn attester_runtime_user_data(&self) -> Option<&str> {
@@ -303,6 +293,32 @@ impl ItaClaims {
             || (!self.attester_held_data().is_empty()
                 && self.attester_runtime_user_data().is_some())
     }
+}
+
+fn http_client(request_timeout_secs: u64) -> Result<reqwest::Client, VerifyError> {
+    static CLIENTS: OnceLock<Mutex<HashMap<u64, reqwest::Client>>> = OnceLock::new();
+
+    let clients = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(client) = clients
+        .lock()
+        .expect("http client cache lock poisoned")
+        .get(&request_timeout_secs)
+        .cloned()
+    {
+        return Ok(client);
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(request_timeout_secs))
+        .build()
+        .map_err(|e| VerifyError::Network(e.to_string()))?;
+
+    clients
+        .lock()
+        .expect("http client cache lock poisoned")
+        .insert(request_timeout_secs, client.clone());
+
+    Ok(client)
 }
 
 /// Verify an ITA attestation token against Intel Trust Authority's JWKS.
@@ -336,10 +352,7 @@ pub(crate) async fn verify_attestation_token(
         .as_deref()
         .ok_or_else(|| VerifyError::JwtParse("JWT header missing kid".to_string()))?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(request_timeout_secs))
-        .build()
-        .map_err(|e| VerifyError::Network(e.to_string()))?;
+    let client = http_client(request_timeout_secs)?;
     let response = client
         .get(jwks_url)
         .header("Accept", "application/json")
@@ -400,10 +413,7 @@ pub async fn get_nonce(config: &ItaConfig) -> Result<VerifierNonce, VerifyError>
 
     let url = format!("{}/appraisal/v2/nonce", config.api_url);
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.request_timeout_secs))
-        .build()
-        .map_err(|e| VerifyError::Network(e.to_string()))?;
+    let client = http_client(config.request_timeout_secs)?;
     let response = client
         .get(&url)
         .header("x-api-key", &config.api_key)
@@ -511,10 +521,7 @@ pub async fn verify_evidence(
 
     let url = format!("{}{}", config.api_url, path);
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.request_timeout_secs))
-        .build()
-        .map_err(|e| VerifyError::Network(e.to_string()))?;
+    let client = http_client(config.request_timeout_secs)?;
     let response = client
         .post(&url)
         .header("x-api-key", &config.api_key)

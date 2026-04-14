@@ -71,11 +71,12 @@
 //! 5. Recompute the expected payload_hash from the record's fields using the
 //!    domain-specific hash function (e.g. `content_payload_hash` in tee-server).
 //! 6. Assert rd.verify_payload(&expected_hash) == true.
-//! 7. Assert rd.build_id == build_id_from_hash_hex(&record.tee_binary_hash).
+//! 7. Assert rd.build_id == build_id_from_hash_hex(&record.tee_binary_hash)?.
 //! 8. Assert rd.nonce == record.nonce.
 //! 9. (Real TDX only) verify the quote signature chain against Intel PCS.
 //! ```
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Schema version embedded in every REPORTDATA.
@@ -89,7 +90,7 @@ pub const REPORT_DATA_VERSION: u32 = 1;
 ///
 /// See the [module-level documentation](self) for the full wire layout and the
 /// step-by-step verification recipe.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportData {
     /// `[00..32]` SHA-256 of the domain-specific inputs for this attestation.
     pub payload_hash: [u8; 32],
@@ -166,6 +167,18 @@ impl ReportData {
     }
 }
 
+/// Errors returned by [`build_id_from_hash_hex`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum BuildIdError {
+    /// The provided hash was shorter than the required 16 hex characters.
+    #[error("hash hex too short: need at least 16 hex chars, got {0}")]
+    TooShort(usize),
+    /// The first 16 characters were not valid hex.
+    #[error("hash hex is not valid: {0}")]
+    InvalidHex(String),
+}
+
 /// Derive a `build_id` from raw binary bytes.
 ///
 /// Computes `SHA-256(binary_bytes)` and returns the first 8 bytes.
@@ -185,13 +198,14 @@ pub fn build_id_from_binary(binary_bytes: &[u8]) -> [u8; 8] {
 ///
 /// The resulting `build_id` is identical to what [`build_id_from_binary`]
 /// would produce for the same binary, making the two helpers interchangeable.
-pub fn build_id_from_hash_hex(hex_hash: &str) -> [u8; 8] {
-    // Take the first 16 hex chars → 8 bytes.
-    let bytes = hex::decode(hex_hash.get(..16).unwrap_or("")).unwrap_or_default();
+pub fn build_id_from_hash_hex(hex_hash: &str) -> Result<[u8; 8], BuildIdError> {
+    let prefix = hex_hash
+        .get(..16)
+        .ok_or(BuildIdError::TooShort(hex_hash.len()))?;
+    let bytes = hex::decode(prefix).map_err(|e| BuildIdError::InvalidHex(e.to_string()))?;
     let mut id = [0u8; 8];
-    let n = bytes.len().min(8);
-    id[..n].copy_from_slice(&bytes[..n]);
-    id
+    id.copy_from_slice(&bytes[..8]);
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -254,6 +268,32 @@ mod tests {
     fn build_id_from_hash_hex_matches_build_id_from_binary() {
         let bin = b"some binary bytes";
         let hex = hex::encode(Sha256::digest(bin));
-        assert_eq!(build_id_from_hash_hex(&hex), build_id_from_binary(bin));
+        assert_eq!(
+            build_id_from_hash_hex(&hex).expect("known-good SHA-256 hex"),
+            build_id_from_binary(bin)
+        );
+    }
+
+    #[test]
+    fn build_id_from_hash_hex_rejects_short_input() {
+        assert_eq!(
+            build_id_from_hash_hex("abcd"),
+            Err(BuildIdError::TooShort(4))
+        );
+    }
+
+    #[test]
+    fn build_id_from_hash_hex_rejects_invalid_hex() {
+        let err = build_id_from_hash_hex("zzzzzzzzzzzzzzzz").unwrap_err();
+        assert!(matches!(err, BuildIdError::InvalidHex(_)));
+    }
+
+    #[test]
+    fn build_id_from_hash_hex_uses_first_16_chars_only() {
+        let hex = "0011223344556677deadbeefcafebabe";
+        assert_eq!(
+            build_id_from_hash_hex(hex).expect("known-good prefix"),
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]
+        );
     }
 }

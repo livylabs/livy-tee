@@ -80,7 +80,7 @@ async fn sha512_reportdata_matches_nonce_plus_runtime_data() {
     let bin_hash = binary_hash().unwrap();
     let rd = ReportData::new(
         payload,
-        build_id_from_hash_hex(&bin_hash),
+        build_id_from_hash_hex(&bin_hash).expect("binary_hash returns valid SHA-256 hex"),
         REPORT_DATA_VERSION,
         0,
         1001,

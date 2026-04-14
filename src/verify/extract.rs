@@ -15,10 +15,9 @@
 //!  [568..632] REPORTDATA   64 bytes — our embedded user_data
 //! ```
 
-use crate::evidence::Evidence;
+use crate::evidence::{Evidence, QUOTE_MIN_LEN};
 use thiserror::Error;
 
-const QUOTE_MIN_LEN: usize = 632;
 const OFFSET_VERSION: usize = 0;
 const OFFSET_TEE_TYPE: usize = 4;
 const OFFSET_MRTD: usize = 184;
@@ -30,6 +29,9 @@ const TEE_TYPE_TDX: u32 = 0x81;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ExtractError {
+    /// Base64 decoding failed while parsing a textual quote/runtime input.
+    #[error("base64 decode failed: {0}")]
+    Base64(String),
     /// Quote buffer is too short to contain the required DCAP fields.
     #[error("quote too short: need at least {QUOTE_MIN_LEN} bytes, got {0}")]
     TooShort(usize),

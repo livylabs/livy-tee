@@ -19,10 +19,10 @@ use crate::{
         VerifyError,
     },
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Policy for full [`Attestation`] verification.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestationVerificationPolicy {
     /// Intel Trust Authority JWKS endpoint used to verify the token signature.
     pub jwks_url: String,
@@ -52,7 +52,7 @@ impl Default for AttestationVerificationPolicy {
 }
 
 /// Result of full [`Attestation`] verification.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[must_use = "verification is diagnostic until you check all_passed() or require_success()"]
 pub struct AttestationVerification {
     /// The ITA JWT signature and registered time claims passed validation.
@@ -256,7 +256,8 @@ impl<'a> AttestBuilder<'a> {
         let payload_hash = self.public_values.commitment_hash();
 
         let binary_hash_hex = binary_hash().map_err(AttestError::Generate)?;
-        let build_id = build_id_from_hash_hex(&binary_hash_hex);
+        let build_id = build_id_from_hash_hex(&binary_hash_hex)
+            .expect("binary_hash must return a valid 64-char SHA-256 hex string");
         let rd = ReportData::new(payload_hash, build_id, REPORT_DATA_VERSION, 0, self.nonce);
         let rd_bytes = rd.to_bytes();
 
@@ -318,7 +319,7 @@ impl<'a> AttestBuilder<'a> {
 /// buffer bytes to recompute `SHA-256(buffer)` — they do NOT need to
 /// re-serialize values.  The buffer travels alongside the attestation as
 /// an opaque byte sequence.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attestation {
     /// ITA-signed JWT.
     pub ita_token: String,
@@ -445,6 +446,13 @@ impl Attestation {
         &self,
         policy: &AttestationVerificationPolicy,
     ) -> Result<AttestationVerification, VerifyError> {
+        Ok(self.verify_with_policy_context(policy).await?.report)
+    }
+
+    async fn verify_with_policy_context(
+        &self,
+        policy: &AttestationVerificationPolicy,
+    ) -> Result<VerificationContext, VerifyError> {
         let token = verify_attestation_token(
             &self.ita_token,
             &policy.jwks_url,
@@ -490,7 +498,7 @@ impl Attestation {
             })
             .or_else(|| token.is_none().then_some(offline_quote_report_data_matches));
 
-        Ok(AttestationVerification {
+        let report = AttestationVerification {
             jwt_signature_and_expiry_valid: jwt_valid,
             token_report_data_matches: token
                 .as_ref()
@@ -525,6 +533,11 @@ impl Attestation {
                 .expected_nonce
                 .map(|expected| parsed_report.nonce == expected),
             bundled_evidence_authenticated: None,
+        };
+
+        Ok(VerificationContext {
+            report,
+            runtime_data,
         })
     }
 
@@ -539,9 +552,10 @@ impl Attestation {
     ) -> Result<AttestationVerification, VerifyError> {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
-        let mut report = self.verify_with_policy(policy).await?;
-        let runtime_data = decode_standard_base64_array_64("runtime_data", &self.runtime_data)
-            .map_err(VerifyError::JwtParse)?;
+        let VerificationContext {
+            mut report,
+            runtime_data,
+        } = self.verify_with_policy_context(policy).await?;
         let evidence = self.stored_evidence()?;
         let nonce = self.stored_nonce()?;
         let fresh = verify_evidence(&evidence, config, &runtime_data, &nonce).await?;
@@ -605,4 +619,9 @@ impl Attestation {
             signature_b64: self.verifier_nonce_signature.clone(),
         })
     }
+}
+
+struct VerificationContext {
+    report: AttestationVerification,
+    runtime_data: [u8; 64],
 }

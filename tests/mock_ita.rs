@@ -7,8 +7,9 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use livy_tee::{
     binary_hash, build_id_from_hash_hex, extract_report_data, generate_and_attest,
-    generate_evidence, report_data_hash_from_token, verify_quote_with_public_values,
-    AttestationVerificationPolicy, ItaConfig, Livy, PublicValues, ReportData, REPORT_DATA_VERSION,
+    generate_evidence, report_data_hash_from_token, verify_quote_with_public_values, Attestation,
+    AttestationVerificationPolicy, ExtractError, ItaConfig, Livy, PublicValues, ReportData,
+    REPORT_DATA_VERSION,
 };
 use sha2::{Digest, Sha512};
 
@@ -17,7 +18,7 @@ use sha2::{Digest, Sha512};
 // ---------------------------------------------------------------------------
 
 fn sample_build_id() -> [u8; 8] {
-    build_id_from_hash_hex(&binary_hash().unwrap())
+    build_id_from_hash_hex(&binary_hash().unwrap()).expect("binary_hash returns valid SHA-256 hex")
 }
 
 fn default_config() -> ItaConfig {
@@ -430,6 +431,12 @@ async fn proof_payload_hash_hex_mock() {
     assert_eq!(hex_str, hex::encode(pv.commitment_hash()));
 }
 
+#[test]
+fn verify_quote_reports_invalid_base64_input() {
+    let err = livy_tee::verify_quote("not-base64", "", "", "", &[0u8; 32]).unwrap_err();
+    assert!(matches!(err, ExtractError::Base64(_)));
+}
+
 #[tokio::test]
 async fn verify_quote_binding_chain_mock() {
     let livy = Livy::new("mock-key");
@@ -460,4 +467,47 @@ async fn verify_quote_binding_chain_mock() {
     )
     .expect("should not error");
     assert!(!ok2, "tampered values should fail binding verification");
+}
+
+#[tokio::test]
+async fn attestation_json_roundtrip_preserves_public_artifact_and_resets_cursor() {
+    let livy = Livy::new("mock-key");
+    let mut builder = livy.attest();
+    builder.commit(&"serde-input");
+    builder.commit_hashed(&vec![1u8, 2, 3, 4]);
+    builder.nonce(42);
+
+    let att = builder.finalize().await.unwrap();
+
+    let first_value: String = att.public_values.read();
+    assert_eq!(first_value, "serde-input");
+
+    let encoded = serde_json::to_string(&att).expect("attestation should serialize");
+    let decoded: Attestation =
+        serde_json::from_str(&encoded).expect("attestation should deserialize");
+
+    assert_eq!(decoded.ita_token, att.ita_token);
+    assert_eq!(decoded.jwks_url, att.jwks_url);
+    assert_eq!(decoded.mrtd, att.mrtd);
+    assert_eq!(decoded.tcb_status, att.tcb_status);
+    assert_eq!(decoded.tcb_date, att.tcb_date);
+    assert_eq!(decoded.evidence, att.evidence);
+    assert_eq!(decoded.raw_quote, att.raw_quote);
+    assert_eq!(decoded.runtime_data, att.runtime_data);
+    assert_eq!(decoded.verifier_nonce_val, att.verifier_nonce_val);
+    assert_eq!(decoded.verifier_nonce_iat, att.verifier_nonce_iat);
+    assert_eq!(
+        decoded.verifier_nonce_signature,
+        att.verifier_nonce_signature
+    );
+    assert_eq!(decoded.report_data, att.report_data);
+
+    let roundtrip_first: String = decoded.public_values.read();
+    assert_eq!(roundtrip_first, "serde-input");
+    let roundtrip_hashed = decoded.public_values.read_raw().unwrap();
+    assert_eq!(roundtrip_hashed.len(), 32);
+    assert_eq!(
+        decoded.public_values.entries_raw(),
+        att.public_values.entries_raw()
+    );
 }

@@ -313,7 +313,7 @@ To authenticate the bundled Azure evidence artifact itself, use
 5. Parse `runtime_data` bytes: `ReportData::from_bytes(&bytes)`.
 6. Recompute `SHA-256(public_values buffer)` from the raw public values bytes.
 7. Assert `rd.verify_payload(&expected_hash)`.
-8. Assert `rd.build_id == build_id_from_hash_hex(&tee_binary_hash)` — confirms which binary ran.
+8. Assert `rd.build_id == build_id_from_hash_hex(&tee_binary_hash)?` — confirms which binary ran.
 9. Assert `rd.nonce == expected_nonce` — replay protection.
 10. For signed-token policy, verify the ITA JWT signature, expiry, TCB status, MRTD/build identity, and application nonce. Intel's JWKS endpoint is `https://portal.trustauthority.intel.com/certs`.
 11. For Azure TDX VMs, or whenever you want to authenticate the bundled evidence artifact itself, reappraise `attestation.evidence` with ITA using the stored verifier nonce fields. `Attestation::verify_fresh()` does this for you.
@@ -360,7 +360,7 @@ use livy_tee::{binary_hash, report::{build_id_from_hash_hex, ReportData, REPORT_
 
 let rd = ReportData::new(
     payload_hash,                           // [u8; 32] — your hash
-    build_id_from_hash_hex(&binary_hash()?), // [u8; 8]
+    build_id_from_hash_hex(&binary_hash()?)?, // [u8; 8]
     REPORT_DATA_VERSION,                    // u32 — currently 1
     0,                                      // build_number (0 in dev)
     nonce,                                  // u64 — monotonic counter

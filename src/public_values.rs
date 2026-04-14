@@ -6,7 +6,7 @@
 //! The full buffer is public and can be independently parsed and hashed.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
 
@@ -16,6 +16,28 @@ pub struct PublicValues {
     buffer: Vec<u8>,
     /// Read cursor with interior mutability so reads work on `&self`.
     read_cursor: Cell<usize>,
+}
+
+impl Serialize for PublicValues {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_base64())
+    }
+}
+
+impl<'de> Deserialize<'de> for PublicValues {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let bytes = BASE64
+            .decode(encoded.trim())
+            .map_err(serde::de::Error::custom)?;
+        Self::try_from_bytes(bytes).map_err(serde::de::Error::custom)
+    }
 }
 
 impl PublicValues {
