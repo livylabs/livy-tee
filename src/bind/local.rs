@@ -9,6 +9,32 @@ use crate::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
+#[derive(Debug)]
+pub(crate) enum QuoteBindingDecodeError {
+    Base64(base64::DecodeError),
+}
+
+pub(crate) fn verify_quote_report_data_binding(
+    raw_quote_b64: &str,
+    runtime_data: &[u8; 64],
+    nonce_val: &[u8],
+    nonce_iat: &[u8],
+) -> Result<bool, QuoteBindingDecodeError> {
+    let raw = BASE64
+        .decode(raw_quote_b64.trim())
+        .map_err(QuoteBindingDecodeError::Base64)?;
+    let evidence = match Evidence::from_bytes(raw) {
+        Ok(evidence) => evidence,
+        Err(_) => return Ok(false),
+    };
+    let quote_rd_bytes = match extract_report_data(&evidence) {
+        Ok(report_data) => report_data,
+        Err(_) => return Ok(false),
+    };
+
+    Ok(quote_rd_bytes == nonce_and_runtime_hash(nonce_val, nonce_iat, runtime_data))
+}
+
 /// Verify a raw DCAP quote's ITA nonce binding and an expected `payload_hash`.
 ///
 /// **No TDX hardware. No network.** Pure software — anyone can call this.

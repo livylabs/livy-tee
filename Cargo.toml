@@ -38,3 +38,7 @@ default    = []
 mock-tee   = []
 # ita-verify: Intel Trust Authority REST API verification
 ita-verify = ["dep:reqwest", "dep:jsonwebtoken"]
+
+[[example]]
+name = "ita_cli_cross_verify"
+required-features = ["ita-verify"]

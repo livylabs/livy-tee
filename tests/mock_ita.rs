@@ -311,6 +311,7 @@ async fn proof_verify_mock_reports_jwt_failure() {
         !report.jwt_signature_and_expiry_valid,
         "mock has no real JWT"
     );
+    assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(
         !report.all_passed(),
         "all_passed should be false without valid JWT"
@@ -318,6 +319,7 @@ async fn proof_verify_mock_reports_jwt_failure() {
     // Local checks that don't depend on the token should still pass.
     assert!(report.runtime_data_matches_report);
     assert!(report.public_values_bound);
+    assert!(report.require_success().is_err());
 }
 
 #[tokio::test]
@@ -343,6 +345,7 @@ async fn proof_verify_with_policy_reports_token_failures_but_keeps_local_checks(
         "mock has no real JWT"
     );
     assert!(!report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(!report.mrtd_matches_token);
     assert!(!report.tcb_status_matches_token);
     assert!(!report.tcb_date_matches_token);
@@ -357,6 +360,56 @@ async fn proof_verify_with_policy_reports_token_failures_but_keeps_local_checks(
         !report.all_passed(),
         "all_passed should be false without valid JWT"
     );
+    assert!(report.require_success().is_err());
+}
+
+#[tokio::test]
+async fn proof_verify_reports_empty_raw_quote_as_quote_binding_failure() {
+    let livy = Livy::new("mock-key");
+    let mut builder = livy.attest();
+    builder.commit(&"correct-data");
+    let mut att = builder.finalize().await.unwrap();
+    att.raw_quote.clear();
+
+    let report = att
+        .verify()
+        .await
+        .expect("verify should return a report, not Err");
+
+    assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(!report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, Some(false));
+    assert!(report.runtime_data_matches_report);
+    assert!(report.public_values_bound);
+    assert!(report.require_success().is_err());
+    assert!(!report.all_passed());
+}
+
+#[tokio::test]
+async fn proof_verify_reports_tampered_raw_quote_as_quote_binding_failure() {
+    let livy = Livy::new("mock-key");
+    let mut builder = livy.attest();
+    builder.commit(&"correct-data");
+    let mut att = builder.finalize().await.unwrap();
+
+    let mut quote = BASE64
+        .decode(att.raw_quote.as_bytes())
+        .expect("mock raw quote should be valid base64");
+    quote[568] ^= 0xff;
+    att.raw_quote = BASE64.encode(quote);
+
+    let report = att
+        .verify()
+        .await
+        .expect("verify should return a report, not Err");
+
+    assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(!report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, Some(false));
+    assert!(report.runtime_data_matches_report);
+    assert!(report.public_values_bound);
+    assert!(report.require_success().is_err());
+    assert!(!report.all_passed());
 }
 
 #[tokio::test]

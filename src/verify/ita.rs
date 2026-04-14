@@ -38,7 +38,6 @@
 //! }
 //! ```
 
-use crate::cloud::{detect_cloud_provider, log_detected_provider, CloudProvider};
 use crate::evidence::Evidence;
 use crate::verify::codec::{decode_claim_array_64, decode_standard_base64_array_64};
 use crate::verify::VerifyError;
@@ -58,6 +57,14 @@ pub struct ItaConfig {
     pub request_timeout_secs: u64,
 }
 
+impl ItaConfig {
+    /// Derive the default Intel Trust Authority JWKS URL for this API region.
+    #[must_use]
+    pub fn default_jwks_url(&self) -> String {
+        default_jwks_url_for_api_url(&self.api_url)
+    }
+}
+
 impl Default for ItaConfig {
     fn default() -> Self {
         Self {
@@ -66,6 +73,41 @@ impl Default for ItaConfig {
             request_timeout_secs: 30,
         }
     }
+}
+
+/// Derive the default Intel Trust Authority JWKS URL from an ITA API base URL.
+///
+/// Official regional hosts map `api...trustauthority.intel.com` to the matching
+/// `portal...trustauthority.intel.com/certs` endpoint. Unknown hosts fall back
+/// to the global default.
+#[must_use]
+pub fn default_jwks_url_for_api_url(api_url: &str) -> String {
+    reqwest::Url::parse(api_url)
+        .ok()
+        .and_then(default_jwks_url_from_api_url)
+        .unwrap_or_else(|| DEFAULT_JWKS_URL.to_string())
+}
+
+fn default_jwks_url_from_api_url(api_url: reqwest::Url) -> Option<String> {
+    let host = api_url.host_str()?;
+    let portal_host = if let Some(rest) = host.strip_prefix("api.") {
+        if rest.ends_with(".trustauthority.intel.com") {
+            format!("portal.{rest}")
+        } else {
+            return None;
+        }
+    } else if host.starts_with("portal.") && host.ends_with(".trustauthority.intel.com") {
+        host.to_string()
+    } else {
+        return None;
+    };
+
+    let mut portal_url = api_url;
+    portal_url.set_host(Some(&portal_host)).ok()?;
+    portal_url.set_path("/certs");
+    portal_url.set_query(None);
+    portal_url.set_fragment(None);
+    Some(portal_url.to_string())
 }
 
 /// ITA verifier nonce — anti-replay token fetched from GET /appraisal/v2/nonce.
@@ -140,6 +182,10 @@ impl VerifiedTokenClaims {
                 user_data_hash,
             } => held_data == runtime_data && user_data_hash == expected_runtime_hash,
         }
+    }
+
+    pub(crate) fn supports_offline_quote_report_data_binding(&self) -> bool {
+        matches!(self.binding, VerifiedTokenBinding::StandardReportData)
     }
 }
 
@@ -333,9 +379,8 @@ pub(crate) async fn verify_attestation_token(
     parse_verified_claims(claims)
 }
 
-fn attest_path() -> &'static str {
-    if detect_cloud_provider() == Some(CloudProvider::Azure) {
-        log_detected_provider(CloudProvider::Azure);
+fn attest_path_for_evidence(evidence: &Evidence) -> &'static str {
+    if evidence.azure_runtime_data().is_some() {
         "/appraisal/v2/attest/azure"
     } else {
         "/appraisal/v2/attest"
@@ -426,7 +471,7 @@ pub async fn verify_evidence(
         return Err(VerifyError::ItaApi("ITA API key is empty".to_string()));
     }
 
-    let path = attest_path();
+    let path = attest_path_for_evidence(evidence);
     let body = if path.ends_with("/azure") {
         let runtime_json = evidence.azure_runtime_data().ok_or_else(|| {
             VerifyError::ItaApi(
@@ -605,7 +650,10 @@ fn decode_jwt_claims(jwt: &str) -> Result<ItaClaims, VerifyError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_verified_claims, VerifiedTokenBinding};
+    use super::{
+        default_jwks_url_for_api_url, parse_verified_claims, ItaConfig, VerifiedTokenBinding,
+        DEFAULT_JWKS_URL,
+    };
     use crate::verify::VerifyError;
     use base64::Engine;
     use serde_json::json;
@@ -678,5 +726,28 @@ mod tests {
             matches!(err, VerifyError::ItaApi(ref message) if message.contains("attester_runtime_data.user-data")),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn default_jwks_url_maps_us_and_eu_regions() {
+        assert_eq!(
+            default_jwks_url_for_api_url("https://api.trustauthority.intel.com"),
+            DEFAULT_JWKS_URL
+        );
+        assert_eq!(
+            default_jwks_url_for_api_url("https://api.eu.trustauthority.intel.com/appraisal/v2"),
+            "https://portal.eu.trustauthority.intel.com/certs"
+        );
+    }
+
+    #[test]
+    fn ita_config_default_jwks_url_falls_back_for_unknown_hosts() {
+        let config = ItaConfig {
+            api_key: String::new(),
+            api_url: "http://127.0.0.1:8080".to_string(),
+            request_timeout_secs: 30,
+        };
+
+        assert_eq!(config.default_jwks_url(), DEFAULT_JWKS_URL);
     }
 }

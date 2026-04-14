@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 use base64::Engine;
 use livy_tee::{
-    binary_hash, build_id_from_hash_hex, extract_report_data, generate_evidence, Evidence,
-    EvidenceError, ReportData, REPORT_DATA_VERSION,
+    binary_hash, build_id_from_hash_hex, Evidence, EvidenceError, ReportData, REPORT_DATA_VERSION,
 };
+#[cfg(feature = "mock-tee")]
+use livy_tee::{extract_report_data, generate_evidence};
 use sha2::{Digest, Sha256};
 
 fn sample_payload() -> [u8; 32] {
@@ -81,18 +82,21 @@ fn verify_payload_helper_works() {
     assert!(!rd.verify_payload(&[0u8; 32]));
 }
 
+#[cfg(feature = "mock-tee")]
 #[test]
 fn generate_evidence_succeeds_in_mock_mode() {
     let evidence = generate_evidence(&sample_report().to_bytes()).unwrap();
     assert!(!evidence.raw().is_empty());
 }
 
+#[cfg(feature = "mock-tee")]
 #[test]
 fn mock_evidence_is_exactly_632_bytes() {
     let evidence = generate_evidence(&[0u8; 64]).unwrap();
     assert_eq!(evidence.raw().len(), 632);
 }
 
+#[cfg(feature = "mock-tee")]
 #[test]
 fn generated_evidence_encodes_to_valid_base64() {
     let evidence = generate_evidence(&sample_report().to_bytes()).unwrap();
@@ -103,6 +107,7 @@ fn generated_evidence_encodes_to_valid_base64() {
         .expect("evidence.to_base64() must be valid standard base64");
 }
 
+#[cfg(feature = "mock-tee")]
 #[test]
 fn evidence_base64_roundtrip() {
     let evidence = generate_evidence(&[42u8; 64]).unwrap();
@@ -116,6 +121,7 @@ fn binary_hash_returns_nonempty_string() {
     assert!(!binary_hash().unwrap().is_empty());
 }
 
+#[cfg(feature = "mock-tee")]
 #[test]
 fn extract_report_data_roundtrip() {
     let user_data = sample_report().to_bytes();
@@ -130,6 +136,7 @@ fn evidence_from_bytes_rejects_short_buffer() {
     assert!(matches!(result, Err(EvidenceError::TooShort(100))));
 }
 
+#[cfg(feature = "mock-tee")]
 #[test]
 fn different_user_data_produces_different_extracted_report_data() {
     let e1 = generate_evidence(&[1u8; 64]).unwrap();

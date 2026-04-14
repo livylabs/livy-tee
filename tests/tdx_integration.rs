@@ -44,7 +44,7 @@ fn assert_real_tdx_evidence(quote_len: usize) {
 }
 
 fn is_azure_runtime() -> bool {
-    std::path::Path::new("/var/lib/waagent").exists()
+    livy_tee::detect_cloud_provider() == Some(livy_tee::CloudProvider::Azure)
 }
 
 #[test]
@@ -213,6 +213,10 @@ async fn proof_verify_correct_and_tampered() {
     let att = builder.finalize().await.expect("finalize failed");
 
     let report = att.verify().await.expect("verify should not error");
+    let strict_report = att
+        .verify_fresh(&ita_config())
+        .await
+        .expect("verify_fresh should not error");
     assert!(report.jwt_signature_and_expiry_valid);
     assert!(report.token_report_data_matches);
     assert!(report.runtime_data_matches_report);
@@ -220,11 +224,19 @@ async fn proof_verify_correct_and_tampered() {
     assert!(report.mrtd_matches_token);
     assert!(report.tcb_status_matches_token);
     if is_azure_runtime() {
-        assert!(
-            report.all_passed(),
-            "Azure verification report: {report:#?}"
-        );
+        assert_eq!(report.quote_report_data_matches, None);
+    } else {
+        assert_eq!(report.quote_report_data_matches, Some(true));
     }
+    assert_eq!(
+        strict_report.bundled_evidence_authenticated,
+        Some(true),
+        "strict verification report: {strict_report:#?}"
+    );
+    assert!(
+        strict_report.all_passed(),
+        "strict verification report: {strict_report:#?}"
+    );
     assert_eq!(
         report.tcb_status_allowed,
         report.tcb_status.eq_ignore_ascii_case("UpToDate")

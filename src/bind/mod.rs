@@ -32,8 +32,9 @@
 //! let binding: [u8;32] = attestation.public_values.read();
 //!
 //! assert_eq!(hash, sha256(&original_photo));
-//! // Full attestation check: ITA JWT, TCB policy, and public-value binding.
-//! let report = attestation.verify().await?;
+//! // Strict attestation check: JWT/JWKS, TCB policy, public-value binding,
+//! // and fresh ITA appraisal of the bundled evidence artifact.
+//! let report = attestation.verify_fresh(&config).await?;
 //! assert!(report.all_passed());
 //! ```
 //!

@@ -33,7 +33,8 @@ mod attest;
 mod bind;
 
 // ── Core types ─────────────────────────────────────────────────────────────
-pub use evidence::{Evidence, EvidenceError, QUOTE_MIN_LEN};
+pub use cloud::{detect_cloud_provider, CloudProvider};
+pub use evidence::{Evidence, EvidenceError, PortableEvidence, QUOTE_MIN_LEN};
 pub use parser::parse;
 pub use public_values::{entry_hash, PublicValues, PublicValuesError};
 pub use report::{build_id_from_binary, build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION};
@@ -46,7 +47,10 @@ pub use generate::{binary_hash, generate_evidence, GenerateError};
 pub use verify::extract::{extract_mrtd, extract_report_data, ExtractError};
 
 #[cfg(feature = "ita-verify")]
-pub use verify::ita::{get_nonce, verify_evidence, ItaConfig, VerifiedClaims, VerifierNonce};
+pub use verify::ita::{
+    default_jwks_url_for_api_url, get_nonce, verify_evidence, ItaConfig, VerifiedClaims,
+    VerifierNonce,
+};
 #[cfg(feature = "ita-verify")]
 pub use verify::VerifyError;
 

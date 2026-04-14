@@ -7,8 +7,8 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use livy_tee::{
-    Attestation, AttestationVerification, AttestationVerificationPolicy, PublicValues, ReportData,
-    REPORT_DATA_VERSION,
+    Attestation, AttestationVerification, AttestationVerificationPolicy, Evidence, ItaConfig,
+    PublicValues, ReportData, REPORT_DATA_VERSION,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha512};
@@ -107,6 +107,53 @@ impl JwksServer {
     }
 }
 
+struct AppraisalServer {
+    url: String,
+    task: JoinHandle<()>,
+}
+
+impl AppraisalServer {
+    async fn spawn(expected_path: &'static str, token: String) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local appraisal server");
+        let addr = listener
+            .local_addr()
+            .expect("local appraisal listener address");
+        let body = json!({ "token": token }).to_string();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept appraisal request");
+            let mut request = vec![0u8; 8192];
+            let len = stream
+                .read(&mut request)
+                .await
+                .expect("read appraisal request");
+            let request = String::from_utf8_lossy(&request[..len]);
+            assert!(
+                request.contains(expected_path),
+                "expected request path {expected_path}, got {request}"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write appraisal response");
+        });
+        Self {
+            url: format!("http://{addr}"),
+            task,
+        }
+    }
+
+    async fn finish(self) {
+        self.task.await.expect("join appraisal server task");
+    }
+}
+
 fn sample_mrtd() -> String {
     "11".repeat(48)
 }
@@ -126,6 +173,14 @@ fn runtime_hash(nonce_val: &[u8], nonce_iat: &[u8], runtime_data: &[u8; 64]) -> 
     h.finalize().into()
 }
 
+fn quote_with_report_data(report_data: [u8; 64]) -> String {
+    let mut quote = vec![0u8; 632];
+    quote[0..2].copy_from_slice(&4u16.to_le_bytes());
+    quote[4..8].copy_from_slice(&0x81u32.to_le_bytes());
+    quote[568..632].copy_from_slice(&report_data);
+    BASE64.encode(quote)
+}
+
 fn verification_fixture(tcb_status: &str) -> VerificationFixture {
     let mut public_values = PublicValues::new();
     public_values.commit(&"input");
@@ -141,7 +196,9 @@ fn verification_fixture(tcb_status: &str) -> VerificationFixture {
     let runtime_data = report_data.to_bytes();
     let nonce_val = [0x31u8; 32];
     let nonce_iat = [0x52u8; 32];
+    let nonce_signature = [0x73u8; 32];
     let mrtd = sample_mrtd();
+    let raw_quote = quote_with_report_data(runtime_hash(&nonce_val, &nonce_iat, &runtime_data));
 
     VerificationFixture {
         runtime_hash: runtime_hash(&nonce_val, &nonce_iat, &runtime_data),
@@ -149,13 +206,16 @@ fn verification_fixture(tcb_status: &str) -> VerificationFixture {
         mrtd: mrtd.clone(),
         attestation: Attestation {
             ita_token: String::new(),
+            jwks_url: String::new(),
             mrtd,
             tcb_status: tcb_status.to_string(),
             tcb_date: Some(TEST_TCB_DATE.to_string()),
-            raw_quote: String::new(),
+            evidence: raw_quote.clone(),
+            raw_quote,
             runtime_data: BASE64.encode(runtime_data),
             verifier_nonce_val: BASE64.encode(nonce_val),
             verifier_nonce_iat: BASE64.encode(nonce_iat),
+            verifier_nonce_signature: BASE64.encode(nonce_signature),
             report_data,
             public_values,
         },
@@ -165,6 +225,10 @@ fn verification_fixture(tcb_status: &str) -> VerificationFixture {
 fn sign_token(claims: Value) -> String {
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(TEST_JWK_KID.to_string());
+    sign_token_with_header(claims, header)
+}
+
+fn sign_token_with_header(claims: Value, header: Header) -> String {
     jsonwebtoken::encode(
         &header,
         &claims,
@@ -258,6 +322,7 @@ async fn verify_with_policy_accepts_signed_standard_token() {
 
     assert!(report.jwt_signature_and_expiry_valid);
     assert!(report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(report.runtime_data_matches_report);
     assert!(report.public_values_bound);
     assert!(report.mrtd_matches_token);
@@ -267,6 +332,7 @@ async fn verify_with_policy_accepts_signed_standard_token() {
     assert_eq!(report.expected_mrtd_matches, Some(true));
     assert_eq!(report.expected_build_id_matches, Some(true));
     assert_eq!(report.expected_nonce_matches, Some(true));
+    assert!(report.require_success().is_ok());
     assert!(report.all_passed());
 }
 
@@ -284,6 +350,7 @@ async fn verify_with_policy_accepts_signed_azure_token() {
 
     assert!(report.jwt_signature_and_expiry_valid);
     assert!(report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, None);
     assert!(report.runtime_data_matches_report);
     assert!(report.public_values_bound);
     assert!(report.mrtd_matches_token);
@@ -302,10 +369,12 @@ async fn verify_with_policy_reports_standard_report_data_mismatch() {
 
     assert!(report.jwt_signature_and_expiry_valid);
     assert!(!report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(report.runtime_data_matches_report);
     assert!(report.public_values_bound);
     assert!(report.mrtd_matches_token);
     assert!(report.tcb_status_allowed);
+    assert!(report.require_success().is_err());
     assert!(!report.all_passed());
 }
 
@@ -318,6 +387,7 @@ async fn verify_with_policy_reports_azure_held_data_mismatch() {
 
     assert!(report.jwt_signature_and_expiry_valid);
     assert!(!report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, None);
     assert!(report.runtime_data_matches_report);
     assert!(report.public_values_bound);
     assert!(report.mrtd_matches_token);
@@ -334,6 +404,7 @@ async fn verify_with_policy_reports_azure_user_data_hash_mismatch() {
 
     assert!(report.jwt_signature_and_expiry_valid);
     assert!(!report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, None);
     assert!(report.runtime_data_matches_report);
     assert!(report.public_values_bound);
     assert!(report.mrtd_matches_token);
@@ -350,6 +421,7 @@ async fn verify_with_policy_rejects_out_of_date_tcb_by_default() {
 
     assert!(report.jwt_signature_and_expiry_valid);
     assert!(report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(report.tcb_status_matches_token);
     assert!(!report.tcb_status_allowed);
     assert_eq!(report.tcb_status, "OutOfDate");
@@ -366,6 +438,7 @@ async fn verify_with_policy_can_allow_out_of_date_tcb() {
 
     assert!(report.jwt_signature_and_expiry_valid);
     assert!(report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(report.tcb_status_matches_token);
     assert!(report.tcb_status_allowed);
     assert!(report.all_passed());
@@ -383,6 +456,7 @@ async fn verify_with_policy_reports_expected_identity_mismatches() {
 
     assert!(report.jwt_signature_and_expiry_valid);
     assert!(report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, Some(true));
     assert_eq!(report.expected_mrtd_matches, Some(false));
     assert_eq!(report.expected_build_id_matches, Some(false));
     assert_eq!(report.expected_nonce_matches, Some(false));
@@ -410,6 +484,7 @@ async fn verify_with_policy_treats_malformed_signed_azure_claims_as_token_failur
 
     assert!(!report.jwt_signature_and_expiry_valid);
     assert!(!report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(!report.mrtd_matches_token);
     assert!(!report.tcb_status_matches_token);
     assert!(!report.tcb_date_matches_token);
@@ -420,4 +495,245 @@ async fn verify_with_policy_treats_malformed_signed_azure_claims_as_token_failur
     assert_eq!(report.expected_build_id_matches, Some(true));
     assert_eq!(report.expected_nonce_matches, Some(true));
     assert!(!report.all_passed());
+}
+
+#[tokio::test]
+async fn verify_with_policy_reports_empty_raw_quote_without_full_pass() {
+    let mut fixture = verification_fixture("UpToDate");
+    fixture.attestation.raw_quote.clear();
+    let claims = standard_claims(&fixture, fixture.runtime_hash, "UpToDate");
+    let policy = default_policy(&fixture);
+    let report = verify_fixture(fixture, claims, policy).await;
+
+    assert!(report.jwt_signature_and_expiry_valid);
+    assert!(report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, Some(false));
+    assert!(report.runtime_data_matches_report);
+    assert!(report.public_values_bound);
+    assert!(report.require_success().is_err());
+    assert!(!report.all_passed());
+}
+
+#[tokio::test]
+async fn verify_with_policy_reports_tampered_raw_quote_without_full_pass() {
+    let mut fixture = verification_fixture("UpToDate");
+    fixture.attestation.raw_quote = quote_with_report_data([0x77; 64]);
+    let claims = standard_claims(&fixture, fixture.runtime_hash, "UpToDate");
+    let policy = default_policy(&fixture);
+    let report = verify_fixture(fixture, claims, policy).await;
+
+    assert!(report.jwt_signature_and_expiry_valid);
+    assert!(report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, Some(false));
+    assert!(report.runtime_data_matches_report);
+    assert!(report.public_values_bound);
+    assert!(report.require_success().is_err());
+    assert!(!report.all_passed());
+}
+
+#[tokio::test]
+async fn verify_with_policy_reports_empty_jwt_but_keeps_local_quote_checks() {
+    let fixture = verification_fixture("UpToDate");
+    let report = fixture
+        .attestation
+        .verify_with_policy(&default_policy(&fixture))
+        .await
+        .expect("verification should return a report");
+
+    assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(!report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, Some(true));
+    assert!(report.runtime_data_matches_report);
+    assert!(report.public_values_bound);
+    assert!(report.require_success().is_err());
+    assert!(!report.all_passed());
+}
+
+#[tokio::test]
+async fn verify_fresh_authenticates_stored_azure_evidence() {
+    let mut fixture = verification_fixture("UpToDate");
+    let raw_quote = BASE64
+        .decode(fixture.attestation.raw_quote.as_bytes())
+        .expect("fixture raw quote should decode");
+    let evidence =
+        Evidence::from_bytes_with_azure_runtime(raw_quote, br#"{"user-data":"cafebabe"}"#.to_vec())
+            .expect("fixture Azure evidence should be valid");
+    fixture.attestation.evidence = evidence.to_transport_string();
+
+    let claims = azure_claims(
+        &fixture,
+        fixture.runtime_data,
+        fixture.runtime_hash,
+        "UpToDate",
+    );
+    let stored_token = sign_token(claims.clone());
+    let appraisal = AppraisalServer::spawn("/appraisal/v2/attest/azure", sign_token(claims)).await;
+    let jwks = JwksServer::spawn().await;
+    let mut policy = default_policy(&fixture);
+    policy.jwks_url = jwks.url.clone();
+    fixture.attestation.ita_token = stored_token;
+
+    let report = fixture
+        .attestation
+        .verify_fresh_with_policy(
+            &ItaConfig {
+                api_key: "test-key".to_string(),
+                api_url: appraisal.url.clone(),
+                request_timeout_secs: 30,
+            },
+            &policy,
+        )
+        .await
+        .expect("fresh verification should succeed");
+
+    appraisal.finish().await;
+    jwks.finish().await;
+
+    assert_eq!(report.quote_report_data_matches, None);
+    assert_eq!(report.bundled_evidence_authenticated, Some(true));
+    assert!(report.all_passed());
+}
+
+#[tokio::test]
+async fn verify_fresh_rejects_tampered_raw_quote_against_stored_azure_evidence() {
+    let mut fixture = verification_fixture("UpToDate");
+    let original_raw_quote = BASE64
+        .decode(fixture.attestation.raw_quote.as_bytes())
+        .expect("fixture raw quote should decode");
+    let evidence = Evidence::from_bytes_with_azure_runtime(
+        original_raw_quote,
+        br#"{"user-data":"cafebabe"}"#.to_vec(),
+    )
+    .expect("fixture Azure evidence should be valid");
+    fixture.attestation.evidence = evidence.to_transport_string();
+    fixture.attestation.raw_quote = quote_with_report_data([0x44; 64]);
+
+    let claims = azure_claims(
+        &fixture,
+        fixture.runtime_data,
+        fixture.runtime_hash,
+        "UpToDate",
+    );
+    let stored_token = sign_token(claims.clone());
+    let appraisal = AppraisalServer::spawn("/appraisal/v2/attest/azure", sign_token(claims)).await;
+    let jwks = JwksServer::spawn().await;
+    let mut policy = default_policy(&fixture);
+    policy.jwks_url = jwks.url.clone();
+    fixture.attestation.ita_token = stored_token;
+
+    let report = fixture
+        .attestation
+        .verify_fresh_with_policy(
+            &ItaConfig {
+                api_key: "test-key".to_string(),
+                api_url: appraisal.url.clone(),
+                request_timeout_secs: 30,
+            },
+            &policy,
+        )
+        .await
+        .expect("fresh verification should return a report");
+
+    appraisal.finish().await;
+    jwks.finish().await;
+
+    assert_eq!(report.quote_report_data_matches, None);
+    assert_eq!(report.bundled_evidence_authenticated, Some(false));
+    assert!(!report.all_passed());
+}
+
+#[tokio::test]
+async fn verify_with_policy_reports_expired_jwt() {
+    let fixture = verification_fixture("UpToDate");
+    let mut claims = standard_claims(&fixture, fixture.runtime_hash, "UpToDate");
+    let now = now_unix_secs();
+    let object = claims.as_object_mut().expect("claims object");
+    object.insert("iat".to_string(), json!(now - 3600));
+    object.insert("nbf".to_string(), json!(now - 3600));
+    object.insert("exp".to_string(), json!(now - 3600));
+    let policy = default_policy(&fixture);
+    let report = verify_fixture(fixture, claims, policy).await;
+
+    assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(!report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, Some(true));
+    assert!(report.runtime_data_matches_report);
+    assert!(report.public_values_bound);
+    assert!(report.require_success().is_err());
+}
+
+#[tokio::test]
+async fn verify_with_policy_reports_future_nbf_jwt() {
+    let fixture = verification_fixture("UpToDate");
+    let mut claims = standard_claims(&fixture, fixture.runtime_hash, "UpToDate");
+    let now = now_unix_secs();
+    let object = claims.as_object_mut().expect("claims object");
+    object.insert("iat".to_string(), json!(now));
+    object.insert("nbf".to_string(), json!(now + 3600));
+    object.insert("exp".to_string(), json!(now + 7200));
+    let policy = default_policy(&fixture);
+
+    let report = verify_fixture(fixture, claims, policy).await;
+
+    assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(!report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, Some(true));
+    assert!(report.runtime_data_matches_report);
+    assert!(report.public_values_bound);
+    assert!(report.require_success().is_err());
+}
+
+#[tokio::test]
+async fn verify_with_policy_reports_unknown_kid_jwt() {
+    let mut fixture = verification_fixture("UpToDate");
+    let claims = standard_claims(&fixture, fixture.runtime_hash, "UpToDate");
+    let server = JwksServer::spawn().await;
+    let mut policy = default_policy(&fixture);
+    policy.jwks_url = server.url.clone();
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("wrong-kid".to_string());
+    fixture.attestation.ita_token = sign_token_with_header(claims, header);
+
+    let report = fixture
+        .attestation
+        .verify_with_policy(&policy)
+        .await
+        .expect("verification should return a report");
+    server.finish().await;
+
+    assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(!report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, Some(true));
+    assert!(report.runtime_data_matches_report);
+    assert!(report.public_values_bound);
+    assert!(report.require_success().is_err());
+}
+
+#[tokio::test]
+async fn verify_with_policy_reports_unsupported_algorithm_jwt() {
+    let mut fixture = verification_fixture("UpToDate");
+    let claims = standard_claims(&fixture, fixture.runtime_hash, "UpToDate");
+    let mut policy = default_policy(&fixture);
+    policy.jwks_url = "http://127.0.0.1:1/jwks.json".to_string();
+    let mut header = Header::new(Algorithm::HS256);
+    header.kid = Some(TEST_JWK_KID.to_string());
+    fixture.attestation.ita_token = jsonwebtoken::encode(
+        &header,
+        &claims,
+        &EncodingKey::from_secret(b"not-an-ita-rsa-key"),
+    )
+    .expect("sign HS256 JWT");
+
+    let report = fixture
+        .attestation
+        .verify_with_policy(&policy)
+        .await
+        .expect("verification should return a report");
+
+    assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(!report.token_report_data_matches);
+    assert_eq!(report.quote_report_data_matches, Some(true));
+    assert!(report.runtime_data_matches_report);
+    assert!(report.public_values_bound);
+    assert!(report.require_success().is_err());
 }

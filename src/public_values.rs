@@ -29,6 +29,15 @@ impl PublicValues {
     }
 
     /// Reconstruct from a raw byte buffer.
+    ///
+    /// This constructor preserves the bytes exactly as provided and does not
+    /// validate that the buffer is a complete sequence of
+    /// `[u32 little-endian length][payload]` entries. Use this for buffers
+    /// created locally via [`commit`](Self::commit) / [`commit_raw`](Self::commit_raw).
+    ///
+    /// For malformed or otherwise untrusted input, prefer
+    /// [`try_from_bytes`](Self::try_from_bytes) or call [`validate`](Self::validate)
+    /// before consuming entries.
     #[must_use]
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
         Self {
@@ -37,7 +46,18 @@ impl PublicValues {
         }
     }
 
+    /// Reconstruct from raw bytes after validating the full entry framing.
+    pub fn try_from_bytes(bytes: Vec<u8>) -> Result<Self, PublicValuesError> {
+        let values = Self::from_bytes(bytes);
+        values.validate()?;
+        Ok(values)
+    }
+
     /// Reconstruct from a base64-encoded buffer.
+    ///
+    /// This decodes base64 only. It does not validate the decoded entry
+    /// framing; call [`validate`](Self::validate) after decoding when the
+    /// source is untrusted.
     pub fn from_base64(b64: &str) -> Result<Self, base64::DecodeError> {
         Ok(Self::from_bytes(BASE64.decode(b64.trim())?))
     }
@@ -63,18 +83,26 @@ impl PublicValues {
         self.buffer.extend_from_slice(bytes);
     }
 
-    /// Read the next committed value.
+    /// Read the next JSON-serialized entry.
     ///
     /// # Panics
     ///
-    /// Panics if the buffer is exhausted or deserialization fails.
-    /// Use [`try_read`](Self::try_read) for a fallible version.
+    /// Panics if the buffer is exhausted, malformed, or the next payload is not
+    /// valid JSON for `T`.
+    ///
+    /// Use [`try_read`](Self::try_read) in verifier-facing code. Entries written
+    /// with [`commit_raw`](Self::commit_raw) or higher-level hashed/raw helpers
+    /// should be consumed with [`read_raw`](Self::read_raw), not `read::<T>()`.
     pub fn read<T: DeserializeOwned>(&self) -> T {
         self.try_read()
             .expect("PublicValues::read: failed to read next value")
     }
 
-    /// Try to read the next committed value.
+    /// Try to read the next JSON-serialized entry as `T`.
+    ///
+    /// Use this for entries created with [`commit`](Self::commit). Raw entries
+    /// created with [`commit_raw`](Self::commit_raw) are not deserialized and
+    /// should be consumed with [`read_raw`](Self::read_raw).
     pub fn try_read<T: DeserializeOwned>(&self) -> Result<T, PublicValuesError> {
         let (start, end) = self.next_entry_bounds()?;
         let value = serde_json::from_slice(&self.buffer[start..end])
@@ -83,12 +111,28 @@ impl PublicValues {
         Ok(value)
     }
 
-    /// Read the raw bytes for the next entry payload (without deserializing).
+    /// Read the exact payload bytes for the next entry without deserializing.
+    ///
+    /// Use this for raw entries, including hash bytes stored by higher-level
+    /// helpers such as `commit_hashed`.
     pub fn read_raw(&self) -> Result<Vec<u8>, PublicValuesError> {
         let (start, end) = self.next_entry_bounds()?;
         let bytes = self.buffer[start..end].to_vec();
         self.read_cursor.set(end);
         Ok(bytes)
+    }
+
+    /// Validate that the buffer is a complete sequence of framed entries.
+    ///
+    /// This checks entry framing only: every entry must have a full 4-byte
+    /// length prefix and enough payload bytes to satisfy that prefix. It does
+    /// not deserialize payloads, so raw/hash entries remain valid.
+    pub fn validate(&self) -> Result<(), PublicValuesError> {
+        let mut offset = 0usize;
+        while let Some(end) = checked_entry_end(&self.buffer, offset)? {
+            offset = end;
+        }
+        Ok(())
     }
 
     /// Reset the read cursor to the beginning.
@@ -100,6 +144,10 @@ impl PublicValues {
     ///
     /// `wire_bytes` includes both the 4-byte length prefix and payload bytes.
     /// This helper does not advance the sequential read cursor.
+    ///
+    /// This method enumerates only the valid prefix of the buffer. Call
+    /// [`validate`](Self::validate) first when a trailing malformed tail should
+    /// be treated as an error.
     #[must_use]
     pub fn entries_raw(&self) -> Vec<(u32, Vec<u8>)> {
         let mut entries = Vec::new();
@@ -118,7 +166,10 @@ impl PublicValues {
         entries
     }
 
-    /// Count the number of committed entries in the buffer.
+    /// Count the number of complete entries in the buffer.
+    ///
+    /// This counts only the valid prefix. Call [`validate`](Self::validate)
+    /// first when the buffer came from an untrusted source.
     #[must_use]
     pub fn entry_count(&self) -> u32 {
         let mut count = 0u32;
@@ -135,7 +186,11 @@ impl PublicValues {
         count
     }
 
-    /// Compute `SHA-256(buffer)` — the 32-byte commitment hash.
+    /// Compute `SHA-256(buffer)` over the exact on-wire bytes.
+    ///
+    /// The hash covers every 4-byte entry length prefix and payload byte in
+    /// order. For the high-level attestation API, this exact digest is stored
+    /// in `ReportData.payload_hash`.
     #[must_use]
     pub fn commitment_hash(&self) -> [u8; 32] {
         Sha256::digest(&self.buffer).into()
@@ -179,7 +234,8 @@ impl PublicValues {
 
     fn next_entry_bounds(&self) -> Result<(usize, usize), PublicValuesError> {
         let cursor = self.read_cursor.get();
-        let end = entry_end(&self.buffer, cursor).ok_or(PublicValuesError::BufferExhausted)?;
+        let end =
+            checked_entry_end(&self.buffer, cursor)?.ok_or(PublicValuesError::BufferExhausted)?;
         Ok((cursor + 4, end))
     }
 }
@@ -190,32 +246,83 @@ impl Default for PublicValues {
     }
 }
 
-/// Compute the SHA-256 hash of a raw entry wire payload.
+/// Compute the SHA-256 hash of raw entry wire bytes.
+///
+/// `wire_bytes` should include the 4-byte length prefix followed by the entry
+/// payload, such as the values returned by [`PublicValues::entries_raw`].
 #[must_use]
 pub fn entry_hash(wire_bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(wire_bytes).into()
 }
 
 fn entry_end(buffer: &[u8], offset: usize) -> Option<usize> {
-    if offset + 4 > buffer.len() {
-        return None;
+    checked_entry_end(buffer, offset).ok().flatten()
+}
+
+fn checked_entry_end(buffer: &[u8], offset: usize) -> Result<Option<usize>, PublicValuesError> {
+    if offset >= buffer.len() {
+        return Ok(None);
     }
 
-    let len = u32::from_le_bytes(buffer[offset..offset + 4].try_into().ok()?) as usize;
-    let end = offset + 4 + len;
+    let remaining = buffer.len() - offset;
+    if remaining < 4 {
+        return Err(PublicValuesError::TruncatedLengthPrefix { offset, remaining });
+    }
+
+    let len = u32::from_le_bytes(
+        buffer[offset..offset + 4]
+            .try_into()
+            .expect("length prefix is exactly 4 bytes"),
+    ) as usize;
+    let payload_start = offset + 4;
+    let payload_remaining = buffer.len() - payload_start;
+    let end = payload_start
+        .checked_add(len)
+        .ok_or(PublicValuesError::TruncatedEntryPayload {
+            offset,
+            declared_len: len,
+            remaining: payload_remaining,
+        })?;
+
     if end > buffer.len() {
-        return None;
+        return Err(PublicValuesError::TruncatedEntryPayload {
+            offset,
+            declared_len: len,
+            remaining: payload_remaining,
+        });
     }
 
-    Some(end)
+    Ok(Some(end))
 }
 
 /// Errors when reading from [`PublicValues`].
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PublicValuesError {
     /// The buffer has no more complete entries to read.
     #[error("public values buffer exhausted — no more entries to read")]
     BufferExhausted,
+    /// A trailing fragment does not contain a full 4-byte length prefix.
+    #[error(
+        "public values buffer has {remaining} trailing byte(s) at offset {offset}; expected a 4-byte length prefix"
+    )]
+    TruncatedLengthPrefix {
+        /// Byte offset where the incomplete length prefix starts.
+        offset: usize,
+        /// Number of bytes remaining from that offset to the end of the buffer.
+        remaining: usize,
+    },
+    /// An entry declares more payload bytes than remain in the buffer.
+    #[error(
+        "public values entry at offset {offset} declares {declared_len} payload byte(s), but only {remaining} remain"
+    )]
+    TruncatedEntryPayload {
+        /// Byte offset where the entry's 4-byte length prefix starts.
+        offset: usize,
+        /// Payload length declared by the entry's length prefix.
+        declared_len: usize,
+        /// Payload bytes still available after the 4-byte length prefix.
+        remaining: usize,
+    },
     /// A value could not be deserialized from the buffer.
     #[error("failed to deserialize public value: {0}")]
     Deserialize(String),
@@ -224,6 +331,29 @@ pub enum PublicValuesError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn malformed_with_truncated_payload_tail() -> (PublicValues, usize) {
+        let mut prefix = PublicValues::new();
+        prefix.commit(&"ok");
+
+        let tail_offset = prefix.len();
+        let mut bytes = prefix.into_bytes();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.push(b'x');
+
+        (PublicValues::from_bytes(bytes), tail_offset)
+    }
+
+    fn malformed_with_truncated_length_prefix_tail() -> (PublicValues, usize) {
+        let mut prefix = PublicValues::new();
+        prefix.commit(&"ok");
+
+        let tail_offset = prefix.len();
+        let mut bytes = prefix.into_bytes();
+        bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+
+        (PublicValues::from_bytes(bytes), tail_offset)
+    }
 
     #[test]
     fn commit_and_read_roundtrip() {
@@ -436,6 +566,102 @@ mod tests {
 
         assert_eq!(values.entry_count(), 0);
         assert!(values.entries_raw().is_empty());
-        assert!(values.try_read::<String>().is_err());
+        assert_eq!(
+            values.try_read::<String>(),
+            Err(PublicValuesError::TruncatedEntryPayload {
+                offset: 0,
+                declared_len: 5,
+                remaining: 1,
+            })
+        );
+        assert_eq!(
+            values.validate(),
+            Err(PublicValuesError::TruncatedEntryPayload {
+                offset: 0,
+                declared_len: 5,
+                remaining: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_raw_and_typed_entries() {
+        let mut values = PublicValues::new();
+        values.commit(&"alpha");
+        values.commit_raw(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        values.commit(&42u32);
+
+        assert!(values.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_truncated_payload_tail_after_valid_prefix() {
+        let (values, tail_offset) = malformed_with_truncated_payload_tail();
+
+        assert_eq!(values.entry_count(), 1);
+        assert_eq!(values.entries_raw().len(), 1);
+        assert_eq!(
+            values.validate(),
+            Err(PublicValuesError::TruncatedEntryPayload {
+                offset: tail_offset,
+                declared_len: 3,
+                remaining: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_truncated_length_prefix_tail_after_valid_prefix() {
+        let (values, tail_offset) = malformed_with_truncated_length_prefix_tail();
+
+        assert_eq!(values.entry_count(), 1);
+        assert_eq!(values.entries_raw().len(), 1);
+        assert_eq!(
+            values.validate(),
+            Err(PublicValuesError::TruncatedLengthPrefix {
+                offset: tail_offset,
+                remaining: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn try_from_bytes_rejects_malformed_tail() {
+        let (values, tail_offset) = malformed_with_truncated_payload_tail();
+
+        assert_eq!(
+            PublicValues::try_from_bytes(values.into_bytes()).unwrap_err(),
+            PublicValuesError::TruncatedEntryPayload {
+                offset: tail_offset,
+                declared_len: 3,
+                remaining: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn try_read_and_read_raw_report_malformed_tail_instead_of_exhaustion() {
+        let (values, tail_offset) = malformed_with_truncated_payload_tail();
+
+        assert_eq!(values.try_read::<String>().unwrap(), "ok");
+        assert_eq!(
+            values.try_read::<String>(),
+            Err(PublicValuesError::TruncatedEntryPayload {
+                offset: tail_offset,
+                declared_len: 3,
+                remaining: 1,
+            })
+        );
+
+        values.reset_cursor();
+        assert_eq!(values.try_read::<String>().unwrap(), "ok");
+        assert_eq!(
+            values.read_raw(),
+            Err(PublicValuesError::TruncatedEntryPayload {
+                offset: tail_offset,
+                declared_len: 3,
+                remaining: 1,
+            })
+        );
     }
 }

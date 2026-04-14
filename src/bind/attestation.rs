@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 //! High-level attestation builder and verifier API.
 
-use super::local::{nonce_and_runtime_hash, verify_quote_with_public_values};
+use super::local::{
+    nonce_and_runtime_hash, verify_quote_report_data_binding, verify_quote_with_public_values,
+    QuoteBindingDecodeError,
+};
 use crate::{
     attest::AttestError,
+    evidence::Evidence,
     generate::binary_hash,
     public_values::PublicValues,
     report::{build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION},
     verify::{
         codec::{decode_standard_base64, decode_standard_base64_array_64},
-        ita::{verify_attestation_token, ItaConfig, DEFAULT_JWKS_URL},
+        ita::{
+            verify_attestation_token, verify_evidence, ItaConfig, VerifierNonce, DEFAULT_JWKS_URL,
+        },
         VerifyError,
     },
 };
@@ -47,6 +53,7 @@ impl Default for AttestationVerificationPolicy {
 
 /// Result of full [`Attestation`] verification.
 #[derive(Debug, Clone)]
+#[must_use = "verification is diagnostic until you check all_passed() or require_success()"]
 pub struct AttestationVerification {
     /// The ITA JWT signature and registered time claims passed validation.
     pub jwt_signature_and_expiry_valid: bool,
@@ -58,6 +65,16 @@ pub struct AttestationVerification {
     /// claims: `attester_held_data == runtime_data` and
     /// `attester_runtime_data.user-data == SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data)`.
     pub token_report_data_matches: bool,
+    /// Whether the raw quote's REPORTDATA matched the expected binding hash.
+    ///
+    /// `Some(true)` means the quote bytes locally proved
+    /// `REPORTDATA == SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data)`.
+    /// `Some(false)` means the quote bytes were present but did not match.
+    /// `None` means this attestation provider does not expose a portable local
+    /// REPORTDATA binding check through the attestation artifact. Today that is
+    /// the Azure `/attest/azure` path, where the authoritative binding lives in
+    /// Intel Trust Authority's Azure-specific token claims instead.
+    pub quote_report_data_matches: Option<bool>,
     /// The attestation's `runtime_data` decodes to exactly `report_data`.
     pub runtime_data_matches_report: bool,
     /// The public-values commitment matches the payload hash in `report_data`.
@@ -82,6 +99,14 @@ pub struct AttestationVerification {
     pub expected_build_id_matches: Option<bool>,
     /// Result of comparing the report nonce to the policy's expected nonce.
     pub expected_nonce_matches: Option<bool>,
+    /// Result of fresh ITA appraisal of the bundled evidence, when performed.
+    ///
+    /// `None` means verification was done without reappraising the stored
+    /// evidence. `Some(true)` means the bundled evidence was successfully
+    /// reappraised by ITA and the resulting MRTD/TCB matched the attestation's
+    /// public fields. `Some(false)` means the fresh appraisal completed but did
+    /// not match the attestation object.
+    pub bundled_evidence_authenticated: Option<bool>,
 }
 
 impl AttestationVerification {
@@ -90,6 +115,7 @@ impl AttestationVerification {
     pub fn all_passed(&self) -> bool {
         self.jwt_signature_and_expiry_valid
             && self.token_report_data_matches
+            && self.quote_report_data_matches.unwrap_or(true)
             && self.runtime_data_matches_report
             && self.public_values_bound
             && self.mrtd_matches_token
@@ -99,6 +125,16 @@ impl AttestationVerification {
             && self.expected_mrtd_matches.unwrap_or(true)
             && self.expected_build_id_matches.unwrap_or(true)
             && self.expected_nonce_matches.unwrap_or(true)
+            && self.bundled_evidence_authenticated.unwrap_or(true)
+    }
+
+    /// Enforce the strict verification contract while preserving diagnostics.
+    pub fn require_success(&self) -> Result<(), &Self> {
+        if self.all_passed() {
+            Ok(())
+        } else {
+            Err(self)
+        }
     }
 }
 
@@ -228,13 +264,16 @@ impl<'a> AttestBuilder<'a> {
 
         Ok(Attestation {
             ita_token: attested.ita_token,
+            jwks_url: self.config.default_jwks_url(),
             mrtd: attested.mrtd,
             tcb_status: attested.tcb_status,
             tcb_date: attested.tcb_date,
+            evidence: attested.evidence.to_transport_string(),
             raw_quote: BASE64.encode(attested.evidence.raw()),
             runtime_data: BASE64.encode(attested.runtime_data),
             verifier_nonce_val: BASE64.encode(&attested.nonce_val),
             verifier_nonce_iat: BASE64.encode(&attested.nonce_iat),
+            verifier_nonce_signature: BASE64.encode(&attested.nonce_signature),
             report_data: rd,
             public_values: self.public_values,
         })
@@ -246,7 +285,12 @@ impl<'a> AttestBuilder<'a> {
 /// This is a hardware attestation backed by Intel TDX — not a cryptographic
 /// proof.  Security relies on trusting the TDX hardware and Intel's signing
 /// keys.  The public values buffer is committed into `REPORTDATA[0..32]`
-/// via `SHA-256(buffer)` and can be verified by anyone with the raw quote.
+/// via `SHA-256(buffer)`.
+///
+/// On non-Azure TDX guests, anyone with the raw quote can reconstruct the
+/// local REPORTDATA binding offline. On Azure, the portable `evidence`
+/// artifact plus a fresh Intel Trust Authority appraisal is the authoritative
+/// way to authenticate the bundled evidence.
 ///
 /// **Privacy:** all committed values are stored in plain text inside
 /// `public_values`. Do not commit sensitive data — use
@@ -256,11 +300,14 @@ impl<'a> AttestBuilder<'a> {
 ///
 /// ```rust,ignore
 /// // 1. Read and constrain individual values.
-/// let hash: [u8; 32] = attestation.public_values.read();
+/// // Raw/hash entries should be consumed with read_raw() or try_read().
+/// let hash_bytes = attestation.public_values.read_raw()?;
+/// let hash: [u8; 32] = hash_bytes.as_slice().try_into()?;
 /// assert_eq!(hash, expected);
 ///
-/// // 2. Full check: verify ITA JWT, TCB policy, and public-value binding.
-/// let report = attestation.verify().await?;
+/// // 2. Strict check: verify ITA JWT, TCB policy, public-value binding,
+/// //    and reappraise the bundled evidence.
+/// let report = attestation.verify_fresh(&config).await?;
 /// assert!(report.all_passed());
 /// ```
 ///
@@ -275,12 +322,20 @@ impl<'a> AttestBuilder<'a> {
 pub struct Attestation {
     /// ITA-signed JWT.
     pub ita_token: String,
+    /// JWKS endpoint that matches the ITA region used to mint `ita_token`.
+    pub jwks_url: String,
     /// Hex-encoded MRTD (96 chars = 48 bytes).
     pub mrtd: String,
     /// TCB status from Intel Trust Authority.
     pub tcb_status: String,
     /// Optional TCB assessment date from Intel Trust Authority claims.
     pub tcb_date: Option<String>,
+    /// Portable low-level evidence artifact.
+    ///
+    /// This is the self-contained evidence transport string produced by
+    /// `Evidence::to_transport_string()`. On Azure it includes the runtime JSON
+    /// needed to reappraise the bundled evidence with ITA.
+    pub evidence: String,
     /// Base64-encoded raw DCAP quote.
     pub raw_quote: String,
     /// Base64-encoded original 64-byte ReportData struct.
@@ -289,6 +344,8 @@ pub struct Attestation {
     pub verifier_nonce_val: String,
     /// Base64-encoded verifier nonce issued-at bytes.
     pub verifier_nonce_iat: String,
+    /// Base64-encoded verifier nonce signature bytes.
+    pub verifier_nonce_signature: String,
     /// Structured REPORTDATA parsed from `runtime_data`.
     pub report_data: ReportData,
     /// The committed public values — read with `.public_values.read::<T>()`.
@@ -328,27 +385,62 @@ impl Attestation {
         )
     }
 
-    /// Verify the full attestation chain against the default policy.
+    /// Verify the signed ITA token and local bindings against the default policy.
     ///
     /// This verifies the ITA JWT signature and expiry using Intel Trust
     /// Authority's JWKS, checks that the signed token's report-data claim
-    /// covers this attestation's verifier nonce and runtime data, checks that
-    /// public values are bound into `ReportData.payload_hash`, and enforces the
-    /// default TCB policy (`UpToDate` only). On Azure TDX VMs, the binding check
-    /// uses Intel Trust Authority's Azure-specific `attester_held_data` and
-    /// `attester_runtime_data.user-data` claims.
+    /// covers this attestation's verifier nonce and runtime data, checks local
+    /// quote/runtime binding when that is provider-portable, checks that public
+    /// values are bound into `ReportData.payload_hash`, and enforces the
+    /// default TCB policy (`UpToDate` only). On Azure TDX VMs, the token-side
+    /// binding check uses Intel Trust Authority's Azure-specific
+    /// `attester_held_data` and `attester_runtime_data.user-data` claims.
+    ///
+    /// This method does not reappraise the bundled `evidence` artifact. Use
+    /// [`verify_fresh`](Self::verify_fresh) when you need to authenticate the
+    /// stored evidence itself, especially on Azure.
+    ///
+    /// `Ok(report)` is diagnostic. Call [`AttestationVerification::all_passed`]
+    /// or [`AttestationVerification::require_success`] before trusting it.
     pub async fn verify(&self) -> Result<AttestationVerification, VerifyError> {
-        self.verify_with_policy(&AttestationVerificationPolicy::default())
-            .await
+        let mut policy = AttestationVerificationPolicy::default();
+        if !self.jwks_url.is_empty() {
+            policy.jwks_url = self.jwks_url.clone();
+        }
+        self.verify_with_policy(&policy).await
     }
 
-    /// Verify the full attestation chain against an explicit policy.
+    /// Verify the full attestation chain and reappraise the bundled evidence via ITA.
+    ///
+    /// This is the stricter path for authenticating the stored evidence
+    /// artifact itself, including Azure portable evidence. It requires an ITA
+    /// API key because it performs a fresh appraisal of the bundled evidence.
+    pub async fn verify_fresh(
+        &self,
+        config: &ItaConfig,
+    ) -> Result<AttestationVerification, VerifyError> {
+        let mut policy = AttestationVerificationPolicy::default();
+        if !self.jwks_url.is_empty() {
+            policy.jwks_url = self.jwks_url.clone();
+        }
+        self.verify_fresh_with_policy(config, &policy).await
+    }
+
+    /// Verify the signed ITA token and local bindings against an explicit policy.
     ///
     /// JWT signature verification is non-fatal: if it fails the report's
     /// `jwt_signature_and_expiry_valid` field is `false` and all
     /// token-derived checks (`*_matches_token`, `tcb_status_allowed`,
-    /// `expected_mrtd_matches`) are also `false`.  Structural errors in the
+    /// `expected_mrtd_matches`) are also `false`. Structural errors in the
     /// attestation's own fields (malformed base64) still return `Err`.
+    /// Quote-byte mismatches stay diagnostic via `quote_report_data_matches`.
+    /// Azure attestations report `None` there because their portable artifact
+    /// does not expose the same offline REPORTDATA check as the standard TDX
+    /// quote path.
+    ///
+    /// `Ok(report)` is not a success verdict by itself. Call
+    /// [`AttestationVerification::all_passed`] or
+    /// [`AttestationVerification::require_success`] explicitly.
     pub async fn verify_with_policy(
         &self,
         policy: &AttestationVerificationPolicy,
@@ -370,6 +462,17 @@ impl Attestation {
             .map_err(VerifyError::JwtParse)?;
         let expected_token_report_data =
             nonce_and_runtime_hash(&nonce_val, &nonce_iat, &runtime_data);
+        let offline_quote_report_data_matches = verify_quote_report_data_binding(
+            &self.raw_quote,
+            &runtime_data,
+            &nonce_val,
+            &nonce_iat,
+        )
+        .map_err(|err| match err {
+            QuoteBindingDecodeError::Base64(err) => {
+                VerifyError::JwtParse(format!("raw_quote base64: {err}"))
+            }
+        })?;
 
         let parsed_report = ReportData::from_bytes(&runtime_data);
         let tcb_status_allowed = token.as_ref().is_some_and(|t| {
@@ -379,11 +482,20 @@ impl Attestation {
                 .any(|status| status.eq_ignore_ascii_case(&t.tcb_status))
         });
 
+        let quote_report_data_matches = token
+            .as_ref()
+            .and_then(|t| {
+                t.supports_offline_quote_report_data_binding()
+                    .then_some(offline_quote_report_data_matches)
+            })
+            .or_else(|| token.is_none().then_some(offline_quote_report_data_matches));
+
         Ok(AttestationVerification {
             jwt_signature_and_expiry_valid: jwt_valid,
             token_report_data_matches: token
                 .as_ref()
                 .is_some_and(|t| t.binding_matches(&runtime_data, &expected_token_report_data)),
+            quote_report_data_matches,
             runtime_data_matches_report: parsed_report == self.report_data,
             public_values_bound: self
                 .public_values
@@ -412,7 +524,37 @@ impl Attestation {
             expected_nonce_matches: policy
                 .expected_nonce
                 .map(|expected| parsed_report.nonce == expected),
+            bundled_evidence_authenticated: None,
         })
+    }
+
+    /// Verify with an explicit policy and reappraise the bundled evidence via ITA.
+    ///
+    /// This is the strict path that sets
+    /// [`bundled_evidence_authenticated`](AttestationVerification::bundled_evidence_authenticated).
+    pub async fn verify_fresh_with_policy(
+        &self,
+        config: &ItaConfig,
+        policy: &AttestationVerificationPolicy,
+    ) -> Result<AttestationVerification, VerifyError> {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+        let mut report = self.verify_with_policy(policy).await?;
+        let runtime_data = decode_standard_base64_array_64("runtime_data", &self.runtime_data)
+            .map_err(VerifyError::JwtParse)?;
+        let evidence = self.stored_evidence()?;
+        let nonce = self.stored_nonce()?;
+        let fresh = verify_evidence(&evidence, config, &runtime_data, &nonce).await?;
+        let raw_quote_matches_evidence = BASE64.encode(evidence.raw()) == self.raw_quote.trim();
+
+        report.bundled_evidence_authenticated = Some(
+            raw_quote_matches_evidence
+                && fresh.mrtd.eq_ignore_ascii_case(&self.mrtd)
+                && fresh.tcb_status == self.tcb_status
+                && fresh.tcb_date == self.tcb_date,
+        );
+
+        Ok(report)
     }
 
     /// Check that `SHA-256(public_values)` matches `report_data.payload_hash`.
@@ -432,5 +574,35 @@ impl Attestation {
     pub fn verify_public_values_commitment(&self) -> bool {
         self.public_values
             .verify_commitment(&self.report_data.payload_hash)
+    }
+
+    fn stored_evidence(&self) -> Result<Evidence, VerifyError> {
+        let encoded = if self.evidence.trim().is_empty() {
+            self.raw_quote.as_str()
+        } else {
+            self.evidence.as_str()
+        };
+
+        Evidence::from_transport_string(encoded)
+            .map_err(|err| VerifyError::JwtParse(format!("stored evidence: {err}")))
+    }
+
+    fn stored_nonce(&self) -> Result<VerifierNonce, VerifyError> {
+        let val = decode_standard_base64("verifier_nonce_val", &self.verifier_nonce_val)
+            .map_err(VerifyError::JwtParse)?;
+        let iat = decode_standard_base64("verifier_nonce_iat", &self.verifier_nonce_iat)
+            .map_err(VerifyError::JwtParse)?;
+        let signature =
+            decode_standard_base64("verifier_nonce_signature", &self.verifier_nonce_signature)
+                .map_err(VerifyError::JwtParse)?;
+
+        Ok(VerifierNonce {
+            val,
+            iat,
+            signature,
+            val_b64: self.verifier_nonce_val.clone(),
+            iat_b64: self.verifier_nonce_iat.clone(),
+            signature_b64: self.verifier_nonce_signature.clone(),
+        })
     }
 }

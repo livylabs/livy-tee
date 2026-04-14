@@ -3,17 +3,18 @@
 
 use crate::{Config, Evidence, EvidenceError};
 
-/// Parse a standard base64-encoded quote into [`Evidence`].
+/// Parse quote input into [`Evidence`].
 ///
-/// This is a convenience wrapper around [`Evidence::from_base64`] with
-/// optional input trimming controlled by [`Config`].
+/// Accepts either a standard base64-encoded raw quote or the portable JSON
+/// envelope produced by [`Evidence::to_transport_string`]. Surrounding
+/// whitespace is optionally trimmed according to [`Config`].
 pub fn parse(input: &str, config: Config) -> Result<Evidence, EvidenceError> {
     let normalized = if config.trim_input {
         input.trim()
     } else {
         input
     };
-    Evidence::from_base64(normalized)
+    Evidence::from_transport_string(normalized)
 }
 
 #[cfg(test)]
@@ -29,5 +30,19 @@ mod tests {
         let parsed = parse(&encoded, Config::default()).expect("parse should succeed");
 
         assert_eq!(parsed.raw().len(), 632);
+    }
+
+    #[test]
+    fn parse_accepts_portable_azure_evidence() {
+        let quote = vec![0xCD; 632];
+        let runtime_json = br#"{"user-data":"cafebabe"}"#.to_vec();
+        let evidence =
+            Evidence::from_bytes_with_azure_runtime(quote.clone(), runtime_json.clone()).unwrap();
+        let encoded = format!(" \n{}\n ", evidence.to_transport_string());
+
+        let parsed = parse(&encoded, Config::default()).expect("parse should succeed");
+
+        assert_eq!(parsed.raw(), quote.as_slice());
+        assert_eq!(parsed.azure_runtime_data(), Some(runtime_json.as_slice()));
     }
 }

@@ -87,9 +87,12 @@ pub fn extract_mrtd(evidence: &Evidence) -> Result<[u8; 48], ExtractError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "mock-tee")]
     use crate::generate::generate_evidence;
+    #[cfg(feature = "mock-tee")]
     use crate::report::ReportData;
 
+    #[cfg(feature = "mock-tee")]
     #[test]
     fn extract_roundtrip_mock() {
         let user_data = ReportData::new([1u8; 32], [2u8; 8], 1, 0, 99).to_bytes();
@@ -98,6 +101,7 @@ mod tests {
         assert_eq!(extracted, user_data);
     }
 
+    #[cfg(feature = "mock-tee")]
     #[test]
     fn extract_mrtd_is_zeros_in_mock() {
         let evidence = generate_evidence(&[0u8; 64]).unwrap();

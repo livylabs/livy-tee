@@ -3,14 +3,16 @@
 
 /// Cloud provider detected from the guest runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CloudProvider {
+pub enum CloudProvider {
     /// Azure confidential VM.
     Azure,
     /// Google Cloud VM.
     Gcp,
 }
 
-pub(crate) fn detect_cloud_provider() -> Option<CloudProvider> {
+/// Detect the current guest cloud provider from local runtime signals.
+#[must_use]
+pub fn detect_cloud_provider() -> Option<CloudProvider> {
     if std::path::Path::new("/var/lib/waagent").exists() {
         return Some(CloudProvider::Azure);
     }
@@ -41,6 +43,7 @@ pub(crate) fn detect_cloud_provider() -> Option<CloudProvider> {
     None
 }
 
+#[cfg(not(feature = "mock-tee"))]
 pub(crate) fn log_detected_provider(provider: CloudProvider) {
     if provider == CloudProvider::Azure {
         static AZURE_NOTICE: std::sync::Once = std::sync::Once::new();

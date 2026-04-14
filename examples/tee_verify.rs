@@ -12,7 +12,8 @@
 
 fn main() {
     println!("=== livy-tee TDX smoke test ===");
-    let is_azure_runtime = std::path::Path::new("/var/lib/waagent").exists();
+    let is_azure_runtime =
+        livy_tee::detect_cloud_provider() == Some(livy_tee::CloudProvider::Azure);
 
     #[cfg(feature = "ita-verify")]
     let ita_api_key = match std::env::var("ITA_API_KEY") {
@@ -106,7 +107,11 @@ fn main() {
 
     #[cfg(feature = "ita-verify")]
     {
-        let livy = livy_tee::Livy::new(ita_api_key);
+        let livy = livy_tee::Livy::new(&ita_api_key);
+        let verify_config = livy_tee::ItaConfig {
+            api_key: ita_api_key.to_string(),
+            ..livy_tee::ItaConfig::default()
+        };
         let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
 
         let mut builder = livy.attest();
@@ -120,7 +125,7 @@ fn main() {
                     std::process::exit(1);
                 }
 
-                let verification = match rt.block_on(att.verify()) {
+                let verification = match rt.block_on(att.verify_fresh(&verify_config)) {
                     Ok(report) => report,
                     Err(e) => {
                         eprintln!("  FAIL  attestation verification error: {e}");
@@ -139,7 +144,9 @@ fn main() {
                     att.ita_token.len(),
                 );
                 println!("  OK  payload_hash: {}...", &att.payload_hash_hex()[..12]);
-                println!("  OK  ITA JWT, TCB policy, and public-value binding verified");
+                println!(
+                    "  OK  ITA JWT, TCB policy, public-value binding, and bundled evidence verified"
+                );
 
                 // External verification
                 println!();

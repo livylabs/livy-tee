@@ -22,7 +22,7 @@ livy-tee provides **computation attestation**: cryptographic proof that a specif
 A TDX quote is signed by the CPU's hardware key. It binds three things together:
 
 1. **Binary identity** (MRTD) — the exact measurement of the code running in the TEE. Anyone who builds the same source gets the same MRTD. A different binary, even one bit off, produces a different measurement.
-2. **REPORTDATA** (64 bytes) — arbitrary data chosen by the code at attestation time. livy-tee fills this with a `ReportData` struct containing a `payload_hash` (SHA-256 of input+output hashes), a build fingerprint, a version code, and a monotonic nonce.
+2. **REPORTDATA** (64 bytes) — arbitrary data chosen by the code at attestation time. livy-tee fills this with a `ReportData` struct containing a `payload_hash` (`SHA-256(public_values buffer)`), a build fingerprint, a version code, and a monotonic nonce.
 3. **Intel signature chain** — the quote's ECDSA signature chains back to Intel's root CA via the platform's PCK certificate. Verifiable against Intel PCS without trusting anyone else.
 
 No software — including the host OS, hypervisor, or cloud provider — can forge or tamper with these three bindings once the quote is generated.
@@ -36,19 +36,19 @@ When you call `livy.attest()`, commit values, and call `.finalize().await`, the 
 3. Packs `payload_hash` + build metadata into a 64-byte `ReportData` struct
 4. Asks the TDX hardware to generate a quote binding that struct
 5. Sends the quote to Intel Trust Authority for verification
-6. Returns an `Attestation` containing the quote, the ITA JWT, and the public values
+6. Returns an `Attestation` containing the portable evidence artifact, the ITA JWT, and the public values
 
 ### Privacy and selective disclosure
 
 **Public values are not private.** Anything committed via `.commit()` is stored in plain text inside the `public_values` buffer and is readable by any party who receives the attestation. Only commit data that is intended to be public.
 
-For sensitive inputs that must be bound to the attestation without revealing them, use `.commit_hashed()` — this stores a SHA-256 hash of the value instead of the value itself:
+For sensitive inputs that must be bound to the attestation without revealing them, use `.commit_hashed()` — this stores the SHA-256 of the value's `serde_json` serialization instead of the value itself:
 
 ```rust
 // Binds the photo bytes to the attestation without revealing them.
 builder.commit_hashed(&raw_photo_bytes);
 
-// The verifier recomputes SHA-256(raw_photo_bytes) and checks it matches.
+// The verifier recomputes SHA-256(serde_json(raw_photo_bytes)) and checks it matches.
 ```
 
 A verifier who does not have the raw bytes can still confirm the attestation is genuine (Intel signed it) but cannot learn the original value. The user decides when and to whom they reveal the original data.
@@ -66,9 +66,8 @@ This is the key property: given the raw input and output, **any third party** ca
      │  shares: Proof + raw input/output  │
      │───────────────>│                   │
      │                │                   │
-     │                │ 1. SHA-256(input) → input_hash
-     │                │ 2. SHA-256(output) → output_hash
-     │                │ 3. SHA-256(input_hash ‖ output_hash) → payload_hash
+     │                │ 1. Rebuild the exact public_values buffer
+     │                │ 2. SHA-256(public_values buffer) → payload_hash
      │                │ 4. Extract REPORTDATA from TDX quote
      │                │ 5. Assert payload_hash == reportdata.payload_hash
      │                │ 6. Assert build_id matches expected binary
@@ -93,7 +92,7 @@ let livy = Livy::from_env()?;
 let input = raw_photo_bytes;              // original camera capture
 let output = provenance_record_bytes;     // the record the server created
 
-// Use commit_hashed for sensitive data — binds by SHA-256 hash, not plaintext.
+// Use commit_hashed for sensitive data — binds by SHA-256(serde_json(value)), not plaintext.
 // Use commit for public metadata that verifiers should be able to read directly.
 let mut builder = livy.attest();
 builder.commit_hashed(&input);                     // binds photo without revealing it
@@ -111,12 +110,19 @@ let attestation = builder.finalize().await?;
 // ── Any verifier, anywhere ─────────────────────────────────────────
 use sha2::{Digest, Sha256};
 
-// Read the public content_hash committed in plain text.
-let committed_hash: [u8; 32] = attestation.public_values.read(); // skip hashed entries
+// Hashed entries are raw 32-byte payloads, so consume them with read_raw().
+let _input_hash = attestation.public_values.read_raw()?;
+let _output_hash = attestation.public_values.read_raw()?;
+let committed_hash: [u8; 32] = attestation.public_values.try_read()?;
 assert_eq!(committed_hash, expected_content_hash);
 
-// Verify the full attestation: ITA JWT, TCB policy, and public-value binding.
-let report = attestation.verify().await?;
+// Strict verification: ITA JWT/JWKS, TCB policy, public-value binding,
+// and fresh ITA appraisal of the bundled evidence artifact.
+let verify_config = livy_tee::ItaConfig {
+    api_key: std::env::var("ITA_API_KEY")?,
+    ..livy_tee::ItaConfig::default()
+};
+let report = attestation.verify_fresh(&verify_config).await?;
 assert!(report.all_passed());
 
 // After this full verification check, the verifier knows:
@@ -189,7 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Commit values and generate a TDX attestation.
     //    commit()       — stores value in plain text (public, readable by anyone)
-    //    commit_hashed() — stores SHA-256(value) (binds without revealing)
+    //    commit_hashed() — stores SHA-256(serde_json(value)) (binds without revealing)
     let mut builder = livy.attest();
     builder.commit_hashed(input);   // bind input by hash — not revealed in attestation
     builder.commit_hashed(output);  // bind output by hash — not revealed in attestation
@@ -200,8 +206,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("tcb_status:   {}", attestation.tcb_status);
     println!("payload_hash: {}", attestation.payload_hash_hex());
 
-    // Verify the full attestation. This fetches ITA's JWKS to validate the JWT.
-    let report = attestation.verify().await?;
+    // Strict verification. This validates the ITA JWT against JWKS and
+    // reappraises the bundled evidence artifact with ITA.
+    let verify_config = livy_tee::ItaConfig {
+        api_key: std::env::var("ITA_API_KEY")?,
+        ..livy_tee::ItaConfig::default()
+    };
+    let report = attestation.verify_fresh(&verify_config).await?;
     assert!(report.all_passed());
     Ok(())
 }
@@ -221,15 +232,18 @@ ITA_API_KEY=<your-key> ./your-binary
 | Field | Description |
 |-------|-------------|
 | `ita_token` | ITA-signed JWT. Verifiable against Intel's JWKS endpoint. Contains MRTD, REPORTDATA (SHA-512 hash), and TCB status. |
+| `jwks_url` | JWKS endpoint that matches the ITA region used to mint `ita_token`. `Attestation::verify()` and `Attestation::verify_fresh()` use this by default. |
 | `mrtd` | Hex-encoded 48-byte measurement of the TEE binary. Anyone who builds the same binary can compute and compare this independently. |
 | `tcb_status` | `"UpToDate"` — fully patched. `"OutOfDate"` — firmware update available (quote still valid). `"Revoked"` — hardware revoked. |
 | `tcb_date` | Optional RFC3339 date from ITA token claims indicating the TCB assessment date. |
-| `raw_quote` | Base64-encoded raw DCAP quote (~8 KB). REPORTDATA = SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data). |
+| `evidence` | Portable evidence transport string. On Azure this preserves the Azure runtime JSON needed for fresh ITA reappraisal. |
+| `raw_quote` | Base64-encoded raw DCAP quote (~8 KB). Convenience field extracted from `evidence`. |
 | `runtime_data` | Base64-encoded original 64-byte ReportData struct (our structured payload sent to ITA). |
 | `verifier_nonce_val` | Base64-encoded verifier nonce value (from ITA GET /nonce, used in REPORTDATA computation). |
 | `verifier_nonce_iat` | Base64-encoded verifier nonce issued-at (from ITA GET /nonce, used in REPORTDATA computation). |
+| `verifier_nonce_signature` | Base64-encoded verifier nonce signature (from ITA GET /nonce, required to replay bundled evidence to ITA). |
 | `report_data` | Structured `ReportData` — parsed from `runtime_data` bytes. Contains `payload_hash`, `build_id`, etc. |
-| `public_values` | All values committed via `.commit()` / `.commit_hashed()`. **Plain-text** — readable by any party with the attestation. |
+| `public_values` | Ordered public-value buffer. `.commit()` entries are plaintext JSON. `.commit_hashed()` entries are raw 32-byte hash payloads. |
 
 ### Payload hash
 
@@ -239,13 +253,13 @@ The 32-byte `payload_hash` embedded in the `ReportData` struct (and stored in `r
 payload_hash = SHA-256(public_values buffer)
 ```
 
-The `public_values` buffer is the concatenation of all length-prefixed serialized entries committed via `.commit()` or `.commit_hashed()`. This is deterministic and reproducible — no Livy infrastructure needed.
+The `public_values` buffer is the concatenation of all length-prefixed wire entries. `.commit()` appends JSON payload bytes. `.commit_hashed()` appends a raw 32-byte SHA-256 digest payload. The commitment is deterministic and reproducible — no Livy infrastructure needed.
 
 ---
 
 ## External / independent verification
 
-Any third party who has the attestation and the `public_values` buffer can verify the binding without contacting Livy or Intel:
+Any third party who has the attestation and the `public_values` buffer can verify the non-Azure local binding without contacting Livy or Intel:
 
 ```rust
 use livy_tee::verify_quote_with_public_values;
@@ -262,9 +276,18 @@ let ok = verify_quote_with_public_values(
 )?;
 assert!(ok);
 
-// For full attestation verification, including ITA JWT signature, expiry, and
-// TCB policy, use the method form:
+// For signed-token verification (JWT/JWKS, TCB policy, public-value binding),
+// use the method form:
 let report = attestation.verify().await?;
+assert!(report.jwt_signature_and_expiry_valid);
+
+// For strict verification of the bundled evidence artifact itself, reappraise
+// it with ITA:
+let verify_config = livy_tee::ItaConfig {
+    api_key: std::env::var("ITA_API_KEY")?,
+    ..livy_tee::ItaConfig::default()
+};
+let report = attestation.verify_fresh(&verify_config).await?;
 assert!(report.all_passed());
 ```
 
@@ -278,6 +301,8 @@ TCB/MRTD claims. `Attestation::verify()` checks Azure's
 `attester_held_data == runtime_data` and
 `attester_runtime_data.user-data == SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data)`
 claims instead of treating raw quote `REPORTDATA` like the non-Azure path.
+To authenticate the bundled Azure evidence artifact itself, use
+`Attestation::verify_fresh()` so ITA reappraises `attestation.evidence`.
 
 ### Step-by-step manual verification recipe
 
@@ -290,7 +315,8 @@ claims instead of treating raw quote `REPORTDATA` like the non-Azure path.
 7. Assert `rd.verify_payload(&expected_hash)`.
 8. Assert `rd.build_id == build_id_from_hash_hex(&tee_binary_hash)` — confirms which binary ran.
 9. Assert `rd.nonce == expected_nonce` — replay protection.
-10. For full attestation policy, verify the ITA JWT signature, expiry, TCB status, MRTD/build identity, and application nonce. Intel's JWKS endpoint is `https://portal.trustauthority.intel.com/certs`. On Azure TDX VMs, use the ITA token's Azure binding claims rather than the raw quote `REPORTDATA` formula above.
+10. For signed-token policy, verify the ITA JWT signature, expiry, TCB status, MRTD/build identity, and application nonce. Intel's JWKS endpoint is `https://portal.trustauthority.intel.com/certs`.
+11. For Azure TDX VMs, or whenever you want to authenticate the bundled evidence artifact itself, reappraise `attestation.evidence` with ITA using the stored verifier nonce fields. `Attestation::verify_fresh()` does this for you.
 
 ---
 
@@ -309,7 +335,7 @@ runtime_data (64 bytes) — our ReportData struct:
 
 Bytes    Size  Field         Description
 ─────    ────  ─────         ───────────
-00..32    32   payload_hash  SHA-256( SHA-256(input) ‖ SHA-256(output) )
+00..32    32   payload_hash  SHA-256(public_values buffer)
 32..40     8   build_id      SHA-256(TEE binary)[0..8] — short build fingerprint
 40..44     4   version_code  u32 BE — schema version (increment on layout changes)
 44..48     4   build_number  u32 BE — CI build counter (0 in development)
@@ -317,7 +343,7 @@ Bytes    Size  Field         Description
 56..64     8   reserved      Zero-filled
 ```
 
-`payload_hash` is domain-agnostic — the struct has no opinion on what those 32 bytes represent. The formula above (`SHA-256(SHA-256(input) ‖ SHA-256(output))`) is what `Livy::attest()` uses. You can substitute your own deterministic encoding when using the low-level API directly.
+`payload_hash` is domain-agnostic — the struct has no opinion on what those 32 bytes represent. The high-level `Livy::attest()` path uses `SHA-256(public_values buffer)`. If you use the low-level API directly, you can substitute your own deterministic encoding.
 
 The two-level construction mirrors the Intel Go `trustauthority-cli`:
 - ITA verifies server-side: `SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data) == REPORTDATA in quote`
@@ -384,8 +410,8 @@ let attested = generate_and_attest(&rd.to_bytes(), &config).await?;
 
 ### Verifying a quote built with the low-level API
 
-If you computed your own `payload_hash` without `PublicValues` — for example,
-`SHA-256(SHA-256(input) ‖ SHA-256(output))` — use `verify_quote` directly:
+If you computed your own `payload_hash` without `PublicValues` — for example a
+digest over your own application-specific encoding — use `verify_quote` directly:
 
 ```rust
 use livy_tee::verify_quote;
@@ -402,10 +428,12 @@ let ok = verify_quote(
 assert!(ok);
 ```
 
-For the high-level commit/read model, use `verify_quote_with_public_values` or
-`Attestation::verify()` instead. `verify_quote_with_public_values` is the local
-offline binding helper; `Attestation::verify()` additionally validates the ITA JWT
-and TCB policy.
+For the high-level commit/read model, use `verify_quote_with_public_values`,
+`Attestation::verify()`, or `Attestation::verify_fresh()` instead.
+`verify_quote_with_public_values` is the local offline binding helper.
+`Attestation::verify()` adds ITA JWT/JWKS + TCB policy validation.
+`Attestation::verify_fresh()` additionally reappraises the bundled evidence
+artifact with ITA.
 
 ### Extracting the token REPORTDATA hash from an ITA JWT
 
@@ -449,7 +477,7 @@ from another machine will have a different REPORTDATA and be rejected.
 
 ### 2. Application nonce — anti-replay at the request level
 
-**Field:** `Proof.report_data.nonce` (bytes `[48..56]` of `runtime_data`, u64 big-endian)
+**Field:** `Attestation.report_data.nonce` (bytes `[48..56]` of `runtime_data`, u64 big-endian)
 **Issued by:** the developer's application via `.nonce(n)`
 **Scope:** prevents a valid proof from being reused across different requests
 

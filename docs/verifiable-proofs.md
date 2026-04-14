@@ -215,9 +215,10 @@ request body format, with endpoint selection matching provider (`/attest` vs
 `/attest/azure`). ITA's server-side verification passes for livy-tee quotes for the
 same reason it passes for Intel CLI quotes.
 
-The additional property livy-tee provides is **proof portability**: by storing the nonce
-and runtime_data in the `Attestation` struct, the local binding chain can be
-reconstructed offline by any party at any time.
+The additional property livy-tee provides is **proof portability**: by storing the nonce,
+runtime data, and portable evidence artifact in the `Attestation` struct, the local
+binding chain can be reconstructed offline on non-Azure guests and the bundled evidence
+can be reappraised later on any verifier that has ITA credentials.
 
 For Azure CVMs, Intel Trust Authority validates Azure runtime JSON via the
 `/appraisal/v2/attest/azure` path. The ITA token remains the source of truth for
@@ -228,13 +229,16 @@ TCB/MRTD claims in that provider flow.
 ```rust
 pub struct Attestation {
     pub ita_token:          String,     // ITA-signed JWT
+    pub jwks_url:           String,     // JWKS endpoint matching the ITA region
     pub mrtd:               String,     // hex MRTD (48 bytes)
     pub tcb_status:         String,     // "UpToDate" | "OutOfDate" | "Revoked"
     pub tcb_date:           Option<String>,
+    pub evidence:           String,     // portable evidence artifact; Azure keeps runtime JSON here
     pub raw_quote:          String,     // base64 raw DCAP quote (~8 KB)
     pub runtime_data:       String,     // base64 of our 64-byte ReportData struct
     pub verifier_nonce_val: String,     // base64 nonce.val bytes
     pub verifier_nonce_iat: String,     // base64 nonce.iat bytes
+    pub verifier_nonce_signature: String,
     pub report_data:        ReportData, // parsed structured payload
     pub public_values:      PublicValues,
 }
@@ -247,9 +251,7 @@ livy-tee implements a two-level cryptographic binding:
 ```
 Level 1 — Payload binding (SHA-256, application layer):
 
-  input bytes ──SHA-256──► H_in   ─┐
-                                   ├─SHA-256──► payload_hash  [ReportData bytes 0..32]
-  output bytes ──SHA-256──► H_out ─┘
+  public_values buffer ──SHA-256──► payload_hash  [ReportData bytes 0..32]
 
 
 Level 2 — ITA nonce binding (SHA-512, ITA protocol layer):
@@ -266,7 +268,7 @@ The ReportData struct's wire layout is:
 ```
 Bytes   Size  Field         Content
 ─────   ────  ─────         ───────
-00..32   32   payload_hash  SHA-256(SHA-256(input) ‖ SHA-256(output))
+00..32   32   payload_hash  SHA-256(public_values buffer)
 32..40    8   build_id      First 8 bytes of SHA-256(server binary) — build fingerprint
 40..44    4   version_code  Schema version (currently 1)
 44..48    4   build_number  CI build counter
@@ -277,7 +279,8 @@ Bytes   Size  Field         Content
 ### 4.3 Binding reconstruction by any third party
 
 Given an `Attestation` and the expected public values buffer, any party can reconstruct
-the local binding chain with nothing but standard cryptography libraries:
+the local binding chain with nothing but standard cryptography libraries on non-Azure
+guests:
 
 ```
 Step 1 — Recompute payload_hash from expected public values:
@@ -301,7 +304,7 @@ Step 5 — Extract and verify REPORTDATA in the raw quote:
   assert quote_rd == expected_rd
 
 Step 6 — Verify the ITA JWT signature and expiry:
-  fetch JWKS from https://portal.trustauthority.intel.com/certs
+  fetch JWKS from attestation.jwks_url
   verify attestation.ita_token against the JWKS
 
 Step 7 — Assert TCB and hardware identity policy:
@@ -318,9 +321,27 @@ developer, auditor, or end user can perform them with only:
 
 This is implemented in `livy_tee::verify_quote` and tested in
 `tests/tdx_integration.rs::external_verifier_reconstructs_report_data_from_raw_inputs`.
-`Attestation::verify()` performs the full ITA JWT, TCB policy, and public-value
-binding checks and returns a report whose `all_passed()` method summarizes the
-required checks.
+`Attestation::verify()` performs the signed-token, TCB policy, and public-value
+binding checks. `Attestation::verify_fresh()` performs the stricter path that
+reappraises `attestation.evidence` with ITA and authenticates the bundled
+evidence artifact itself.
+
+For Azure CVMs, step 5 is not a provider-portable local check. The authoritative
+path is:
+
+```
+Step A — Parse the portable evidence artifact:
+  evidence = Evidence::from_transport_string(attestation.evidence)
+
+Step B — Submit that evidence, runtime_data, and verifier nonce back to ITA:
+  verify_evidence(evidence, runtime_data, verifier_nonce)
+
+Step C — Assert the fresh ITA appraisal matches the attestation's public fields:
+  fresh.mrtd == attestation.mrtd
+  fresh.tcb_status == attestation.tcb_status
+  fresh.tcb_date == attestation.tcb_date
+  base64(evidence.raw_quote) == attestation.raw_quote
+```
 
 ### 4.4 What livy-tee adds beyond the Intel CLI
 
@@ -332,7 +353,8 @@ required checks.
 | Valid ITA JWT with MRTD + TCB claims    | ✅        | ✅       |
 | Stored runtime_data + nonce             | ❌        | ✅       |
 | Structured public-value payload binding | ❌        | ✅       |
-| Offline full-chain reconstruction       | ❌        | ✅       |
+| Offline non-Azure local binding reconstruction | ❌ | ✅ |
+| Fresh ITA reappraisal of bundled evidence     | ❌ | ✅ |
 | Application-level replay protection     | ❌        | ✅       |
 | Build identity in payload (build_id)    | ❌        | ✅       |
 

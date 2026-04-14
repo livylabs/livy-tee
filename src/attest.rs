@@ -62,6 +62,8 @@ pub struct AttestedEvidence {
     pub nonce_val: Vec<u8>,
     /// Decoded verifier nonce issued-at bytes. Zeroed in `mock-tee` mode.
     pub nonce_iat: Vec<u8>,
+    /// Decoded verifier nonce signature bytes. Zeroed in `mock-tee` mode.
+    pub nonce_signature: Vec<u8>,
 }
 
 /// Error type for [`generate_and_attest`].
@@ -93,12 +95,16 @@ pub async fn generate_and_attest(
     use sha2::{Digest, Sha512};
 
     #[cfg(feature = "mock-tee")]
-    let (nonce_val, nonce_iat) = (vec![0u8; 32], vec![0u8; 32]);
+    let (nonce_val, nonce_iat, nonce_signature) = (vec![0u8; 32], vec![0u8; 32], vec![]);
 
     #[cfg(not(feature = "mock-tee"))]
     let nonce = get_nonce(config).await?;
     #[cfg(not(feature = "mock-tee"))]
-    let (nonce_val, nonce_iat) = (nonce.val.clone(), nonce.iat.clone());
+    let (nonce_val, nonce_iat, nonce_signature) = (
+        nonce.val.clone(),
+        nonce.iat.clone(),
+        nonce.signature.clone(),
+    );
 
     let reportdata_for_quote: [u8; 64] = {
         let mut h = Sha512::new();
@@ -121,6 +127,7 @@ pub async fn generate_and_attest(
             runtime_data: *user_data,
             nonce_val,
             nonce_iat,
+            nonce_signature,
         })
     }
 
@@ -136,6 +143,7 @@ pub async fn generate_and_attest(
             runtime_data: *user_data,
             nonce_val,
             nonce_iat,
+            nonce_signature,
         })
     }
 }
