@@ -298,6 +298,51 @@ async fn proof_verify_binding_mock() {
 }
 
 #[tokio::test]
+async fn proof_verify_binding_rejects_invalid_raw_quote_base64() {
+    let livy = Livy::new("mock-key");
+    let mut builder = livy.attest();
+    builder.commit(&"correct-data");
+    let mut att = builder.finalize().await.unwrap();
+    att.raw_quote = "not-base64".to_string();
+
+    let err = att
+        .verify_binding()
+        .expect_err("invalid raw_quote should be a hard error");
+
+    assert!(matches!(err, ExtractError::Base64(_)));
+}
+
+#[tokio::test]
+async fn proof_verify_binding_rejects_invalid_runtime_data_base64() {
+    let livy = Livy::new("mock-key");
+    let mut builder = livy.attest();
+    builder.commit(&"correct-data");
+    let mut att = builder.finalize().await.unwrap();
+    att.runtime_data = "not-base64".to_string();
+
+    let err = att
+        .verify_binding()
+        .expect_err("invalid runtime_data should be a hard error");
+
+    assert!(matches!(err, ExtractError::Base64(_)));
+}
+
+#[tokio::test]
+async fn proof_verify_binding_rejects_truncated_raw_quote() {
+    let livy = Livy::new("mock-key");
+    let mut builder = livy.attest();
+    builder.commit(&"correct-data");
+    let mut att = builder.finalize().await.unwrap();
+    att.raw_quote = BASE64.encode(vec![0u8; 32]);
+
+    let err = att
+        .verify_binding()
+        .expect_err("truncated raw_quote should be a hard error");
+
+    assert!(matches!(err, ExtractError::TooShort(32)));
+}
+
+#[tokio::test]
 async fn proof_verify_mock_reports_jwt_failure() {
     let livy = Livy::new("mock-key");
     let mut builder = livy.attest();

@@ -35,7 +35,7 @@ impl<'de> Deserialize<'de> for PublicValues {
         let encoded = String::deserialize(deserializer)?;
         let bytes = BASE64
             .decode(encoded.trim())
-            .map_err(serde::de::Error::custom)?;
+            .map_err(|e| serde::de::Error::custom(PublicValuesError::Base64(e.to_string())))?;
         Self::try_from_bytes(bytes).map_err(serde::de::Error::custom)
     }
 }
@@ -75,13 +75,16 @@ impl PublicValues {
         Ok(values)
     }
 
-    /// Reconstruct from a base64-encoded buffer.
+    /// Reconstruct from a base64-encoded buffer after validating entry framing.
     ///
-    /// This decodes base64 only. It does not validate the decoded entry
-    /// framing; call [`validate`](Self::validate) after decoding when the
-    /// source is untrusted.
-    pub fn from_base64(b64: &str) -> Result<Self, base64::DecodeError> {
-        Ok(Self::from_bytes(BASE64.decode(b64.trim())?))
+    /// This is the validating transport constructor and matches the behavior of
+    /// `serde` deserialization. For unchecked local reconstruction from raw
+    /// bytes, use [`from_bytes`](Self::from_bytes).
+    pub fn from_base64(b64: &str) -> Result<Self, PublicValuesError> {
+        let bytes = BASE64
+            .decode(b64.trim())
+            .map_err(|e| PublicValuesError::Base64(e.to_string()))?;
+        Self::try_from_bytes(bytes)
     }
 
     /// Commit a value as a public output.
@@ -105,16 +108,20 @@ impl PublicValues {
         self.buffer.extend_from_slice(bytes);
     }
 
-    /// Read the next JSON-serialized entry.
+    /// Read the next JSON-serialized entry from a trusted, validated buffer.
     ///
     /// # Panics
     ///
     /// Panics if the buffer is exhausted, malformed, or the next payload is not
     /// valid JSON for `T`.
     ///
-    /// Use [`try_read`](Self::try_read) in verifier-facing code. Entries written
-    /// with [`commit_raw`](Self::commit_raw) or higher-level hashed/raw helpers
-    /// should be consumed with [`read_raw`](Self::read_raw), not `read::<T>()`.
+    /// Use [`try_read`](Self::try_read) in verifier-facing code and for any
+    /// buffer that did not come directly from local `commit` calls or a
+    /// validating constructor such as [`from_base64`](Self::from_base64),
+    /// [`try_from_bytes`](Self::try_from_bytes), or `serde` deserialization.
+    /// Entries written with [`commit_raw`](Self::commit_raw) or higher-level
+    /// hashed/raw helpers should be consumed with [`read_raw`](Self::read_raw),
+    /// not `read::<T>()`.
     pub fn read<T: DeserializeOwned>(&self) -> T {
         self.try_read()
             .expect("PublicValues::read: failed to read next value")
@@ -320,6 +327,9 @@ fn checked_entry_end(buffer: &[u8], offset: usize) -> Result<Option<usize>, Publ
 /// Errors when reading from [`PublicValues`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PublicValuesError {
+    /// Base64 decoding failed.
+    #[error("failed to decode public values base64: {0}")]
+    Base64(String),
     /// The buffer has no more complete entries to read.
     #[error("public values buffer exhausted — no more entries to read")]
     BufferExhausted,
@@ -580,6 +590,29 @@ mod tests {
 
         assert_eq!(decoded.as_bytes(), values.as_bytes());
         assert_eq!(decoded.entries_raw(), values.entries_raw());
+    }
+
+    #[test]
+    fn from_base64_rejects_invalid_base64() {
+        assert!(matches!(
+            PublicValues::from_base64("not-base64"),
+            Err(PublicValuesError::Base64(_))
+        ));
+    }
+
+    #[test]
+    fn from_base64_rejects_malformed_tail() {
+        let (values, tail_offset) = malformed_with_truncated_payload_tail();
+        let encoded = values.to_base64();
+
+        assert_eq!(
+            PublicValues::from_base64(&encoded).unwrap_err(),
+            PublicValuesError::TruncatedEntryPayload {
+                offset: tail_offset,
+                declared_len: 3,
+                remaining: 1,
+            }
+        );
     }
 
     #[test]

@@ -8,6 +8,13 @@ use livy_tee::Livy;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+#[derive(Serialize)]
+struct SampleStruct<'a> {
+    id: u32,
+    label: &'a str,
+    bytes: Vec<u8>,
+}
+
 async fn hashed_entry_for<T: Serialize>(value: &T) -> [u8; 32] {
     let livy = Livy::new("mock-key");
     let mut builder = livy.attest();
@@ -58,4 +65,17 @@ async fn commit_hashed_string_uses_json_string_encoding() {
 
     assert_eq!(observed, expected_hash(&value));
     assert_ne!(observed, raw_bytes_hash);
+}
+
+#[tokio::test]
+async fn commit_hashed_struct_uses_serde_json_object_encoding() {
+    let value = SampleStruct {
+        id: 7,
+        label: "proof",
+        bytes: vec![1, 2, 3],
+    };
+
+    let observed = hashed_entry_for(&value).await;
+
+    assert_eq!(observed, expected_hash(&value));
 }
