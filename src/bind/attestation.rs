@@ -558,7 +558,10 @@ impl Attestation {
         });
 
         let quote_report_data_matches = match token.as_ref() {
-            None => Some(offline_quote_report_data_matches),
+            None if self.supports_offline_quote_report_data_binding_hint() => {
+                Some(offline_quote_report_data_matches)
+            }
+            None => None,
             Some(token) if token.supports_offline_quote_report_data_binding() => {
                 Some(offline_quote_report_data_matches)
             }
@@ -718,6 +721,18 @@ impl Attestation {
             policy.jwks_url = self.jwks_url.clone();
         }
         policy
+    }
+
+    fn supports_offline_quote_report_data_binding_hint(&self) -> bool {
+        let encoded = if self.evidence.trim().is_empty() {
+            self.raw_quote.as_str()
+        } else {
+            self.evidence.as_str()
+        };
+
+        Evidence::from_transport_string(encoded)
+            .map(|evidence| evidence.azure_runtime_data().is_none())
+            .unwrap_or(true)
     }
 
     fn stored_nonce_with_parts(

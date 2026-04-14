@@ -333,8 +333,12 @@ path is:
 Step A — Parse the portable evidence artifact:
   evidence = Evidence::from_transport_string(attestation.evidence)
 
-Step B — Submit that evidence, runtime_data, and verifier nonce back to ITA:
-  appraise_evidence_unauthenticated(evidence, runtime_data, verifier_nonce)
+Step B — Reappraise that evidence with ITA and authenticate the returned token
+against `attestation.jwks_url`:
+  Attestation::verify_fresh()   // supported API
+  // or equivalent manual flow:
+  // 1. submit evidence + runtime_data + verifier_nonce to ITA
+  // 2. verify the returned JWT against JWKS before trusting claims
 
 Step C — Assert the fresh ITA appraisal matches the attestation's public fields:
   fresh.mrtd == attestation.mrtd

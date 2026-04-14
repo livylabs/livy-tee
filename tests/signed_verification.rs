@@ -713,7 +713,8 @@ async fn verify_with_policy_reports_public_advisory_id_mismatch() {
 
 #[tokio::test]
 async fn verify_with_policy_treats_malformed_signed_azure_claims_as_token_failure() {
-    let fixture = verification_fixture("UpToDate");
+    let mut fixture = verification_fixture("UpToDate");
+    attach_azure_runtime_evidence(&mut fixture);
     let claims = with_registered_claims(json!({
         "appraisal": { "method": "azure" },
         "tdx": {
@@ -736,7 +737,7 @@ async fn verify_with_policy_treats_malformed_signed_azure_claims_as_token_failur
         Some(VerifyError::InvalidTokenClaims(_))
     ));
     assert!(!report.token_report_data_matches);
-    assert_eq!(report.quote_report_data_matches, Some(true));
+    assert_eq!(report.quote_report_data_matches, None);
     assert!(!report.mrtd_matches_token);
     assert!(!report.tcb_status_matches_token);
     assert!(!report.tcb_date_matches_token);
