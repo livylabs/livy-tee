@@ -57,6 +57,14 @@ impl Default for AttestationVerificationPolicy {
 pub struct AttestationVerification {
     /// The ITA JWT signature and registered time claims passed validation.
     pub jwt_signature_and_expiry_valid: bool,
+    /// Non-fatal token verification failure, when the JWT/JWKS step did not validate.
+    ///
+    /// This is populated when [`verify_with_policy`](Attestation::verify_with_policy)
+    /// or [`verify`](Attestation::verify) can still return a diagnostic report,
+    /// but the ITA token could not be trusted. Typical values are
+    /// [`VerifyError::InvalidToken`], [`VerifyError::InvalidTokenClaims`],
+    /// [`VerifyError::Network`], or [`VerifyError::ItaApi`].
+    pub token_verification_error: Option<VerifyError>,
     /// The token's signed binding claims match this attestation's nonce and runtime data.
     ///
     /// For standard TDX quotes, this is
@@ -432,8 +440,10 @@ impl Attestation {
     /// JWT signature verification is non-fatal: if it fails the report's
     /// `jwt_signature_and_expiry_valid` field is `false` and all
     /// token-derived checks (`*_matches_token`, `tcb_status_allowed`,
-    /// `expected_mrtd_matches`) are also `false`. Structural errors in the
-    /// attestation's own fields (malformed base64) still return `Err`.
+    /// `expected_mrtd_matches`) are also `false`. The underlying cause is
+    /// preserved in [`AttestationVerification::token_verification_error`].
+    /// Structural errors in the attestation's own fields (malformed base64)
+    /// still return `Err`.
     /// Quote-byte mismatches stay diagnostic via `quote_report_data_matches`.
     /// Azure attestations report `None` there because their portable artifact
     /// does not expose the same offline REPORTDATA check as the standard TDX
@@ -453,21 +463,24 @@ impl Attestation {
         &self,
         policy: &AttestationVerificationPolicy,
     ) -> Result<VerificationContext, VerifyError> {
-        let token = verify_attestation_token(
+        let (token, token_verification_error) = match verify_attestation_token(
             &self.ita_token,
             &policy.jwks_url,
             policy.request_timeout_secs,
         )
         .await
-        .ok();
+        {
+            Ok(token) => (Some(token), None),
+            Err(err) => (None, Some(err)),
+        };
         let jwt_valid = token.is_some();
 
         let runtime_data = decode_standard_base64_array_64("runtime_data", &self.runtime_data)
-            .map_err(VerifyError::JwtParse)?;
+            .map_err(VerifyError::InvalidAttestation)?;
         let nonce_val = decode_standard_base64("verifier_nonce_val", &self.verifier_nonce_val)
-            .map_err(VerifyError::JwtParse)?;
+            .map_err(VerifyError::InvalidAttestation)?;
         let nonce_iat = decode_standard_base64("verifier_nonce_iat", &self.verifier_nonce_iat)
-            .map_err(VerifyError::JwtParse)?;
+            .map_err(VerifyError::InvalidAttestation)?;
         let expected_token_report_data =
             nonce_and_runtime_hash(&nonce_val, &nonce_iat, &runtime_data);
         let offline_quote_report_data_matches = verify_quote_report_data_binding(
@@ -478,7 +491,7 @@ impl Attestation {
         )
         .map_err(|err| match err {
             QuoteBindingDecodeError::Base64(err) => {
-                VerifyError::JwtParse(format!("raw_quote base64: {err}"))
+                VerifyError::InvalidAttestation(format!("raw_quote base64: {err}"))
             }
         })?;
 
@@ -500,6 +513,7 @@ impl Attestation {
 
         let report = AttestationVerification {
             jwt_signature_and_expiry_valid: jwt_valid,
+            token_verification_error,
             token_report_data_matches: token
                 .as_ref()
                 .is_some_and(|t| t.binding_matches(&runtime_data, &expected_token_report_data)),
@@ -538,6 +552,9 @@ impl Attestation {
         Ok(VerificationContext {
             report,
             runtime_data,
+            token_requires_azure_runtime_evidence: token
+                .as_ref()
+                .is_some_and(|t| !t.supports_offline_quote_report_data_binding()),
         })
     }
 
@@ -555,8 +572,15 @@ impl Attestation {
         let VerificationContext {
             mut report,
             runtime_data,
+            token_requires_azure_runtime_evidence,
         } = self.verify_with_policy_context(policy).await?;
         let evidence = self.stored_evidence()?;
+        if token_requires_azure_runtime_evidence && evidence.azure_runtime_data().is_none() {
+            return Err(VerifyError::InvalidStoredEvidence(
+                "stored Azure evidence is missing runtime_data required for verify_fresh"
+                    .to_string(),
+            ));
+        }
         let nonce = self.stored_nonce()?;
         let fresh = verify_evidence(&evidence, config, &runtime_data, &nonce).await?;
         let raw_quote_matches_evidence = BASE64.encode(evidence.raw()) == self.raw_quote.trim();
@@ -598,17 +622,17 @@ impl Attestation {
         };
 
         Evidence::from_transport_string(encoded)
-            .map_err(|err| VerifyError::JwtParse(format!("stored evidence: {err}")))
+            .map_err(|err| VerifyError::InvalidStoredEvidence(format!("stored evidence: {err}")))
     }
 
     fn stored_nonce(&self) -> Result<VerifierNonce, VerifyError> {
         let val = decode_standard_base64("verifier_nonce_val", &self.verifier_nonce_val)
-            .map_err(VerifyError::JwtParse)?;
+            .map_err(VerifyError::InvalidAttestation)?;
         let iat = decode_standard_base64("verifier_nonce_iat", &self.verifier_nonce_iat)
-            .map_err(VerifyError::JwtParse)?;
+            .map_err(VerifyError::InvalidAttestation)?;
         let signature =
             decode_standard_base64("verifier_nonce_signature", &self.verifier_nonce_signature)
-                .map_err(VerifyError::JwtParse)?;
+                .map_err(VerifyError::InvalidAttestation)?;
 
         Ok(VerifierNonce {
             val,
@@ -624,4 +648,5 @@ impl Attestation {
 struct VerificationContext {
     report: AttestationVerification,
     runtime_data: [u8; 64],
+    token_requires_azure_runtime_evidence: bool,
 }

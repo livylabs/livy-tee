@@ -502,9 +502,7 @@ mod tpm {
     impl TpmError {
         fn into_generate_error(self) -> GenerateError {
             match self {
-                Self::ResponseCode(code) => GenerateError::AzureCommand(format!(
-                    "TPM command failed with response code 0x{code:08x}"
-                )),
+                Self::ResponseCode(code) => GenerateError::AzureTpmResponseCode(code),
                 Self::Generate(err) => err,
             }
         }

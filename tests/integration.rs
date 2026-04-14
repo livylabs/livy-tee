@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 use base64::Engine;
+#[cfg(feature = "ita-verify")]
+use livy_tee::VerifyError;
 use livy_tee::{
-    binary_hash, build_id_from_hash_hex, Evidence, EvidenceError, ReportData, REPORT_DATA_VERSION,
+    binary_hash, build_id_from_hash_hex, Evidence, EvidenceError, GenerateError, ReportData,
+    REPORT_DATA_VERSION,
 };
 #[cfg(feature = "mock-tee")]
 use livy_tee::{extract_report_data, generate_evidence};
@@ -119,6 +122,35 @@ fn evidence_base64_roundtrip() {
 #[test]
 fn binary_hash_returns_nonempty_string() {
     assert!(!binary_hash().unwrap().is_empty());
+}
+
+#[test]
+fn generate_error_codes_are_stable() {
+    assert_eq!(
+        GenerateError::AzureRuntime("bad runtime".to_string()).code(),
+        "azure_runtime"
+    );
+    assert_eq!(
+        GenerateError::AzureQuoteResponse("bad response".to_string()).code(),
+        "azure_quote_response"
+    );
+    assert_eq!(
+        GenerateError::AzureTpmResponseCode(0x18b).code(),
+        "azure_tpm_response_code"
+    );
+}
+
+#[cfg(feature = "ita-verify")]
+#[test]
+fn verify_error_codes_are_stable() {
+    assert_eq!(
+        VerifyError::InvalidStoredEvidence("missing runtime json".to_string()).code(),
+        "invalid_stored_evidence"
+    );
+    assert_eq!(
+        VerifyError::InvalidTokenClaims("bad azure claims".to_string()).code(),
+        "invalid_token_claims"
+    );
 }
 
 #[cfg(feature = "mock-tee")]

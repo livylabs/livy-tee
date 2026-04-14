@@ -78,6 +78,17 @@ pub enum AttestError {
     Verify(#[from] VerifyError),
 }
 
+impl AttestError {
+    /// Stable machine-readable error code.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Generate(err) => err.code(),
+            Self::Verify(err) => err.code(),
+        }
+    }
+}
+
 /// Generate a TDX quote and verify it with Intel Trust Authority (Intel CLI-compatible).
 ///
 /// In production (no `mock-tee` feature):

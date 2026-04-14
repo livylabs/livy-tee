@@ -9,7 +9,7 @@ use livy_tee::{
     binary_hash, build_id_from_hash_hex, extract_report_data, generate_and_attest,
     generate_evidence, report_data_hash_from_token, verify_quote_with_public_values, Attestation,
     AttestationVerificationPolicy, ExtractError, ItaConfig, Livy, PublicValues, ReportData,
-    REPORT_DATA_VERSION,
+    VerifyError, REPORT_DATA_VERSION,
 };
 use sha2::{Digest, Sha512};
 
@@ -312,6 +312,10 @@ async fn proof_verify_mock_reports_jwt_failure() {
         !report.jwt_signature_and_expiry_valid,
         "mock has no real JWT"
     );
+    assert!(matches!(
+        report.token_verification_error,
+        Some(VerifyError::InvalidToken(_))
+    ));
     assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(
         !report.all_passed(),
@@ -345,6 +349,10 @@ async fn proof_verify_with_policy_reports_token_failures_but_keeps_local_checks(
         !report.jwt_signature_and_expiry_valid,
         "mock has no real JWT"
     );
+    assert!(matches!(
+        report.token_verification_error,
+        Some(VerifyError::InvalidToken(_))
+    ));
     assert!(!report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(!report.mrtd_matches_token);
@@ -378,6 +386,10 @@ async fn proof_verify_reports_empty_raw_quote_as_quote_binding_failure() {
         .expect("verify should return a report, not Err");
 
     assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(matches!(
+        report.token_verification_error,
+        Some(VerifyError::InvalidToken(_))
+    ));
     assert!(!report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, Some(false));
     assert!(report.runtime_data_matches_report);
@@ -405,6 +417,10 @@ async fn proof_verify_reports_tampered_raw_quote_as_quote_binding_failure() {
         .expect("verify should return a report, not Err");
 
     assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(matches!(
+        report.token_verification_error,
+        Some(VerifyError::InvalidToken(_))
+    ));
     assert!(!report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, Some(false));
     assert!(report.runtime_data_matches_report);
@@ -435,6 +451,22 @@ async fn proof_payload_hash_hex_mock() {
 fn verify_quote_reports_invalid_base64_input() {
     let err = livy_tee::verify_quote("not-base64", "", "", "", &[0u8; 32]).unwrap_err();
     assert!(matches!(err, ExtractError::Base64(_)));
+}
+
+#[tokio::test]
+async fn verify_rejects_malformed_attestation_runtime_data_as_hard_error() {
+    let livy = Livy::new("mock-key");
+    let mut builder = livy.attest();
+    builder.commit(&"correct-data");
+    let mut att = builder.finalize().await.unwrap();
+    att.runtime_data = "not-base64".to_string();
+
+    let err = att
+        .verify()
+        .await
+        .expect_err("malformed attestation fields should be hard errors");
+
+    assert!(matches!(err, VerifyError::InvalidAttestation(_)));
 }
 
 #[tokio::test]

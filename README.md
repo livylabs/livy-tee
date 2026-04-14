@@ -295,6 +295,63 @@ The default full-attestation policy requires `tcb_status == "UpToDate"`. Use
 `AttestationVerificationPolicy` to pin an expected MRTD, build ID, or application
 nonce, or to intentionally accept additional TCB statuses.
 
+```rust
+use livy_tee::{AttestationVerificationPolicy, binary_hash, build_id_from_hash_hex};
+
+let mut policy = AttestationVerificationPolicy::default();
+policy.accepted_tcb_statuses = vec!["UpToDate".to_string()];
+policy.expected_mrtd = Some(expected_mrtd_hex.to_string()); // 96 hex chars
+policy.expected_build_id = Some(build_id_from_hash_hex(&binary_hash()?)?);
+policy.expected_nonce = Some(expected_application_nonce);
+
+let report = attestation.verify_with_policy(&policy).await?;
+report.require_success().map_err(|report| {
+    format!(
+        "verification failed: token_error={:?} tcb_status={} bundled_evidence_authenticated={:?}",
+        report.token_verification_error,
+        report.tcb_status,
+        report.bundled_evidence_authenticated
+    )
+})?;
+```
+
+For Azure CVMs, `verify_fresh_with_policy()` is the stricter API because it
+reappraises the bundled evidence artifact instead of trusting only the stored
+ITA token:
+
+```rust
+let verify_config = livy_tee::ItaConfig {
+    api_key: std::env::var("ITA_API_KEY")?,
+    ..livy_tee::ItaConfig::default()
+};
+
+let report = attestation
+    .verify_fresh_with_policy(&verify_config, &policy)
+    .await?;
+report.require_success().map_err(|report| {
+    format!(
+        "strict verification failed: token_error={:?} bundled_evidence_authenticated={:?}",
+        report.token_verification_error,
+        report.bundled_evidence_authenticated
+    )
+})?;
+```
+
+Error handling contract:
+
+- `Err(VerifyError)` means a hard verifier failure: malformed attestation,
+  malformed stored evidence, invalid configuration, network failure, or an ITA
+  API failure.
+- `Ok(AttestationVerification)` with `token_verification_error = Some(...)`
+  means the verifier could still produce a diagnostic report, but the ITA token
+  itself was not trusted.
+- `VerifyError::code()` returns a stable machine-readable code such as
+  `invalid_attestation`, `invalid_stored_evidence`, `invalid_token`, or
+  `invalid_token_claims`.
+- `GenerateError::code()` and `AttestError::code()` expose stable codes for
+  Azure generation failures such as `azure_runtime`, `azure_quote_response`,
+  and `azure_tpm_response_code`.
+
 Note for Azure CVMs: Azure's `/attest/azure` flow is validated authoritatively by
 ITA using Azure runtime data; the ITA token is the source of truth for Azure
 TCB/MRTD claims. `Attestation::verify()` checks Azure's
@@ -402,10 +459,11 @@ let attested = generate_and_attest(&rd.to_bytes(), &config).await?;
 // attested.ita_token    — ITA JWT
 // attested.mrtd         — hex MRTD from JWT
 // attested.tcb_status   — "UpToDate" / "OutOfDate" / "Revoked"
-// attested.evidence     — raw DCAP quote (REPORTDATA = SHA-512 hash)
+// attested.evidence     — portable Evidence; raw DCAP quote plus Azure runtime JSON when present
 // attested.runtime_data — original 64-byte ReportData struct
 // attested.nonce_val    — decoded verifier nonce val bytes
 // attested.nonce_iat    — decoded verifier nonce iat bytes
+// attested.nonce_signature — decoded verifier nonce signature bytes
 ```
 
 ### Verifying a quote built with the low-level API
@@ -458,7 +516,7 @@ at different layers.
 
 ### 1. ITA verifier nonce — anti-relay at the quote level
 
-**Fields:** `Proof.verifier_nonce_val`, `Proof.verifier_nonce_iat`
+**Fields:** `Attestation.verifier_nonce_val`, `Attestation.verifier_nonce_iat`
 **Issued by:** Intel Trust Authority (`GET /appraisal/v2/nonce`)
 **Scope:** prevents a DCAP quote from being replayed to ITA from a different machine or session
 
@@ -466,7 +524,7 @@ Without this nonce, an attacker could capture a valid DCAP quote from any TDX ma
 and re-submit it to ITA on behalf of a different request — ITA would accept it because
 the PCK certificate chain is valid regardless of who submitted it.
 
-`commit()` fetches this nonce automatically before generating the quote and bakes it in:
+`builder.finalize()` fetches this nonce automatically before generating the quote and bakes it in:
 
 ```
 REPORTDATA = SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data)
@@ -563,9 +621,10 @@ livy-tee
 │   ├── attestation.rs  Livy, AttestBuilder, Attestation, policy verification
 │   └── local.rs     Local quote/public-values binding helpers
 ├── report.rs        ReportData wire format + build_id helpers
-├── evidence.rs      Evidence type (wraps raw DCAP quote bytes)
+├── evidence.rs      Evidence type + portable transport envelope for raw quote and Azure runtime JSON
 ├── generate/
 │   ├── mod.rs       generate_evidence, binary_hash
+│   ├── azure.rs     Azure vTPM/paravisor quote path
 │   ├── tsm.rs       TSM configfs implementation (real TDX)
 │   └── mock.rs      Mock quote stub (--features mock-tee)
 ├── attest.rs        generate_and_attest (generation + ITA in one call)

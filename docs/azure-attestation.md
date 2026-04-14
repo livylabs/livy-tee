@@ -153,6 +153,43 @@ and matched the public attestation fields
 
 then `verify_fresh()` is the method to call.
 
+### Policy configuration on Azure
+
+`AttestationVerificationPolicy` controls the identity and TCB assertions that
+run on top of Azure's token binding:
+
+- `accepted_tcb_statuses`
+  compared against the signed ITA token, case-insensitive
+- `expected_mrtd`
+  compared against the signed token MRTD
+- `expected_build_id`
+  compared against `attestation.report_data.build_id`
+- `expected_nonce`
+  compared against `attestation.report_data.nonce`
+
+Example:
+
+```rust
+use livy_tee::{AttestationVerificationPolicy, binary_hash, build_id_from_hash_hex};
+
+let mut policy = AttestationVerificationPolicy::default();
+policy.accepted_tcb_statuses = vec!["UpToDate".to_string()];
+policy.expected_mrtd = Some(expected_mrtd_hex.to_string());
+policy.expected_build_id = Some(build_id_from_hash_hex(&binary_hash()?)?);
+policy.expected_nonce = Some(expected_application_nonce);
+
+let report = attestation
+    .verify_fresh_with_policy(&verify_config, &policy)
+    .await?;
+report.require_success().map_err(|report| {
+    format!(
+        "azure verification failed: token_error={:?} bundled_evidence_authenticated={:?}",
+        report.token_verification_error,
+        report.bundled_evidence_authenticated
+    )
+})?;
+```
+
 ---
 
 ## Azure token binding semantics
@@ -193,6 +230,11 @@ This is important because an external verifier replaying Azure evidence is not
 running inside Azure. The verifier host environment must not decide the ITA
 endpoint.
 
+If the attestation token indicates Azure but the bundled `evidence` field does
+not contain Azure runtime JSON, `verify_fresh()` now returns a hard
+`VerifyError::InvalidStoredEvidence` instead of silently using the non-Azure
+path.
+
 ---
 
 ## Verification report fields that matter on Azure
@@ -225,6 +267,25 @@ On Azure, the strict authenticity signal is:
 - `bundled_evidence_authenticated == Some(true)`
 
 not `quote_report_data_matches == Some(true)`.
+
+Hard vs soft failures:
+
+- `Err(VerifyError)` means verification could not complete safely:
+  malformed attestation fields, malformed stored evidence, invalid verifier
+  configuration, network failure, or ITA API failure.
+- `Ok(AttestationVerification)` with
+  `token_verification_error = Some(...)` means the verifier still produced a
+  diagnostic report, but the stored ITA token was not trusted.
+- `VerifyError::code()` gives a stable machine-readable code such as
+  `invalid_attestation`, `invalid_stored_evidence`, `invalid_token`, or
+  `invalid_token_claims`.
+
+For Azure quote generation failures, `GenerateError::code()` gives stable codes
+such as:
+
+- `azure_runtime`
+- `azure_quote_response`
+- `azure_tpm_response_code`
 
 ---
 

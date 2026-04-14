@@ -42,3 +42,7 @@ ita-verify = ["dep:reqwest", "dep:jsonwebtoken"]
 [[example]]
 name = "ita_cli_cross_verify"
 required-features = ["ita-verify"]
+
+[[example]]
+name = "getting_started"
+required-features = ["ita-verify"]

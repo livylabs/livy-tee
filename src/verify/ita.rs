@@ -334,15 +334,15 @@ pub(crate) async fn verify_attestation_token(
     use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 
     if jwt.trim().is_empty() {
-        return Err(VerifyError::JwtParse("JWT is empty".to_string()));
+        return Err(VerifyError::InvalidToken("JWT is empty".to_string()));
     }
 
     let header =
-        decode_header(jwt).map_err(|e| VerifyError::JwtParse(format!("JWT header: {e}")))?;
+        decode_header(jwt).map_err(|e| VerifyError::InvalidToken(format!("JWT header: {e}")))?;
     let algorithm = match header.alg {
         Algorithm::PS384 | Algorithm::RS256 => header.alg,
         other => {
-            return Err(VerifyError::JwtParse(format!(
+            return Err(VerifyError::InvalidToken(format!(
                 "unsupported ITA token signing algorithm: {other:?}"
             )))
         }
@@ -350,7 +350,7 @@ pub(crate) async fn verify_attestation_token(
     let kid = header
         .kid
         .as_deref()
-        .ok_or_else(|| VerifyError::JwtParse("JWT header missing kid".to_string()))?;
+        .ok_or_else(|| VerifyError::InvalidToken("JWT header missing kid".to_string()))?;
 
     let client = http_client(request_timeout_secs)?;
     let response = client
@@ -372,14 +372,14 @@ pub(crate) async fn verify_attestation_token(
     }
 
     let jwks: JwkSet = serde_json::from_str(&body)
-        .map_err(|e| VerifyError::JwtParse(format!("JWKS JSON: {e}")))?;
+        .map_err(|e| VerifyError::InvalidToken(format!("JWKS JSON: {e}")))?;
     let jwk = jwks
         .keys
         .iter()
         .find(|jwk| jwk.common.key_id.as_deref() == Some(kid))
-        .ok_or_else(|| VerifyError::JwtParse(format!("JWKS has no key for kid {kid}")))?;
+        .ok_or_else(|| VerifyError::InvalidToken(format!("JWKS has no key for kid {kid}")))?;
     let key = DecodingKey::from_jwk(jwk)
-        .map_err(|e| VerifyError::JwtParse(format!("JWKS key for kid {kid}: {e}")))?;
+        .map_err(|e| VerifyError::InvalidToken(format!("JWKS key for kid {kid}: {e}")))?;
 
     let mut validation = Validation::new(algorithm);
     validation.validate_exp = true;
@@ -387,7 +387,7 @@ pub(crate) async fn verify_attestation_token(
     validation.validate_aud = false;
 
     let token = decode::<ItaClaims>(jwt, &key, &validation)
-        .map_err(|e| VerifyError::JwtParse(format!("JWT validation: {e}")))?;
+        .map_err(|e| VerifyError::InvalidToken(format!("JWT validation: {e}")))?;
     let claims = token.claims;
     parse_verified_claims(claims)
 }
@@ -408,7 +408,9 @@ pub async fn get_nonce(config: &ItaConfig) -> Result<VerifierNonce, VerifyError>
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
     if config.api_key.is_empty() {
-        return Err(VerifyError::ItaApi("ITA API key is empty".to_string()));
+        return Err(VerifyError::InvalidConfiguration(
+            "ITA API key is empty".to_string(),
+        ));
     }
 
     let url = format!("{}/appraisal/v2/nonce", config.api_url);
@@ -435,20 +437,20 @@ pub async fn get_nonce(config: &ItaConfig) -> Result<VerifierNonce, VerifyError>
     }
 
     let nonce_resp: NonceApiResponse = serde_json::from_str(&body)
-        .map_err(|e| VerifyError::JwtParse(format!("nonce response JSON: {e}")))?;
+        .map_err(|e| VerifyError::ItaApi(format!("nonce response JSON: {e}")))?;
 
     let val = BASE64
         .decode(&nonce_resp.val)
-        .map_err(|e| VerifyError::JwtParse(format!("nonce.val base64: {e}")))?;
+        .map_err(|e| VerifyError::ItaApi(format!("nonce.val base64: {e}")))?;
     let iat = BASE64
         .decode(&nonce_resp.iat)
-        .map_err(|e| VerifyError::JwtParse(format!("nonce.iat base64: {e}")))?;
+        .map_err(|e| VerifyError::ItaApi(format!("nonce.iat base64: {e}")))?;
     let signature = if nonce_resp.signature.is_empty() {
         vec![]
     } else {
         BASE64
             .decode(&nonce_resp.signature)
-            .map_err(|e| VerifyError::JwtParse(format!("nonce.signature base64: {e}")))?
+            .map_err(|e| VerifyError::ItaApi(format!("nonce.signature base64: {e}")))?
     };
 
     Ok(VerifierNonce {
@@ -478,13 +480,15 @@ pub async fn verify_evidence(
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
     if config.api_key.is_empty() {
-        return Err(VerifyError::ItaApi("ITA API key is empty".to_string()));
+        return Err(VerifyError::InvalidConfiguration(
+            "ITA API key is empty".to_string(),
+        ));
     }
 
     let path = attest_path_for_evidence(evidence);
     let body = if path.ends_with("/azure") {
         let runtime_json = evidence.azure_runtime_data().ok_or_else(|| {
-            VerifyError::ItaApi(
+            VerifyError::InvalidStoredEvidence(
                 "Azure provider selected but evidence has no Azure runtime_data".to_string(),
             )
         })?;
@@ -576,35 +580,35 @@ pub async fn verify_evidence(
 
 fn parse_verified_claims(claims: ItaClaims) -> Result<VerifiedTokenClaims, VerifyError> {
     if claims.tdx_mrtd().len() != 96 {
-        return Err(VerifyError::ItaApi(format!(
+        return Err(VerifyError::InvalidTokenClaims(format!(
             "MRTD has unexpected length: {} chars (expected 96)",
             claims.tdx_mrtd().len()
         )));
     }
     hex::decode(claims.tdx_mrtd())
-        .map_err(|_| VerifyError::ItaApi("MRTD is not valid hex".to_string()))?;
+        .map_err(|_| VerifyError::InvalidTokenClaims("MRTD is not valid hex".to_string()))?;
 
     if claims.tdx_report_data().is_empty() {
-        return Err(VerifyError::ItaApi(
+        return Err(VerifyError::InvalidTokenClaims(
             "ITA token is missing tdx_report_data".to_string(),
         ));
     }
     let report_data = decode_claim_array_64("tdx_report_data", claims.tdx_report_data())
-        .map_err(VerifyError::JwtParse)?;
+        .map_err(VerifyError::InvalidTokenClaims)?;
 
     let binding = if claims.is_azure_method() {
         let held_data =
             decode_standard_base64_array_64("attester_held_data", claims.attester_held_data())
-                .map_err(VerifyError::JwtParse)?;
+                .map_err(VerifyError::InvalidTokenClaims)?;
         let user_data_hash = decode_claim_array_64(
             "attester_runtime_data.user-data",
             claims.attester_runtime_user_data().ok_or_else(|| {
-                VerifyError::ItaApi(
+                VerifyError::InvalidTokenClaims(
                     "Azure ITA token is missing attester_runtime_data.user-data".to_string(),
                 )
             })?,
         )
-        .map_err(VerifyError::JwtParse)?;
+        .map_err(VerifyError::InvalidTokenClaims)?;
         VerifiedTokenBinding::AzureRuntime {
             held_data,
             user_data_hash,
@@ -637,22 +641,24 @@ pub fn report_data_hash_from_token(jwt: &str) -> Result<Option<[u8; 64]>, Verify
 
     decode_claim_array_64("tdx_report_data", claims.tdx_report_data())
         .map(Some)
-        .map_err(VerifyError::JwtParse)
+        .map_err(VerifyError::InvalidTokenClaims)
 }
 
 fn decode_jwt_claims(jwt: &str) -> Result<ItaClaims, VerifyError> {
     let parts: Vec<&str> = jwt.splitn(3, '.').collect();
     if parts.len() != 3 {
-        return Err(VerifyError::JwtParse("JWT must have 3 parts".to_string()));
+        return Err(VerifyError::InvalidToken(
+            "JWT must have 3 parts".to_string(),
+        ));
     }
 
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL, Engine};
     let payload_bytes = BASE64URL
         .decode(parts[1])
-        .map_err(|e| VerifyError::JwtParse(format!("JWT payload base64: {e}")))?;
+        .map_err(|e| VerifyError::InvalidToken(format!("JWT payload base64: {e}")))?;
 
     serde_json::from_slice::<ItaClaims>(&payload_bytes)
-        .map_err(|e| VerifyError::JwtParse(format!("JWT claims JSON: {e}")))
+        .map_err(|e| VerifyError::InvalidToken(format!("JWT claims JSON: {e}")))
 }
 
 #[cfg(test)]
@@ -730,7 +736,7 @@ mod tests {
 
         let err = parse_verified_claims(claims).unwrap_err();
         assert!(
-            matches!(err, VerifyError::ItaApi(ref message) if message.contains("attester_runtime_data.user-data")),
+            matches!(err, VerifyError::InvalidTokenClaims(ref message) if message.contains("attester_runtime_data.user-data")),
             "unexpected error: {err}"
         );
     }

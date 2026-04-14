@@ -8,7 +8,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use livy_tee::{
     Attestation, AttestationVerification, AttestationVerificationPolicy, Evidence, ItaConfig,
-    PublicValues, ReportData, REPORT_DATA_VERSION,
+    PublicValues, ReportData, VerifyError, REPORT_DATA_VERSION,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha512};
@@ -321,6 +321,7 @@ async fn verify_with_policy_accepts_signed_standard_token() {
     let report = verify_fixture(fixture, claims, policy).await;
 
     assert!(report.jwt_signature_and_expiry_valid);
+    assert_eq!(report.token_verification_error, None);
     assert!(report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(report.runtime_data_matches_report);
@@ -349,6 +350,7 @@ async fn verify_with_policy_accepts_signed_azure_token() {
     let report = verify_fixture(fixture, claims, policy).await;
 
     assert!(report.jwt_signature_and_expiry_valid);
+    assert_eq!(report.token_verification_error, None);
     assert!(report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, None);
     assert!(report.runtime_data_matches_report);
@@ -368,6 +370,7 @@ async fn verify_with_policy_reports_standard_report_data_mismatch() {
     let report = verify_fixture(fixture, claims, policy).await;
 
     assert!(report.jwt_signature_and_expiry_valid);
+    assert_eq!(report.token_verification_error, None);
     assert!(!report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(report.runtime_data_matches_report);
@@ -386,6 +389,7 @@ async fn verify_with_policy_reports_azure_held_data_mismatch() {
     let report = verify_fixture(fixture, claims, policy).await;
 
     assert!(report.jwt_signature_and_expiry_valid);
+    assert_eq!(report.token_verification_error, None);
     assert!(!report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, None);
     assert!(report.runtime_data_matches_report);
@@ -403,6 +407,7 @@ async fn verify_with_policy_reports_azure_user_data_hash_mismatch() {
     let report = verify_fixture(fixture, claims, policy).await;
 
     assert!(report.jwt_signature_and_expiry_valid);
+    assert_eq!(report.token_verification_error, None);
     assert!(!report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, None);
     assert!(report.runtime_data_matches_report);
@@ -420,6 +425,7 @@ async fn verify_with_policy_rejects_out_of_date_tcb_by_default() {
     let report = verify_fixture(fixture, claims, policy).await;
 
     assert!(report.jwt_signature_and_expiry_valid);
+    assert_eq!(report.token_verification_error, None);
     assert!(report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(report.tcb_status_matches_token);
@@ -437,6 +443,7 @@ async fn verify_with_policy_can_allow_out_of_date_tcb() {
     let report = verify_fixture(fixture, claims, policy).await;
 
     assert!(report.jwt_signature_and_expiry_valid);
+    assert_eq!(report.token_verification_error, None);
     assert!(report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(report.tcb_status_matches_token);
@@ -455,6 +462,7 @@ async fn verify_with_policy_reports_expected_identity_mismatches() {
     let report = verify_fixture(fixture, claims, policy).await;
 
     assert!(report.jwt_signature_and_expiry_valid);
+    assert_eq!(report.token_verification_error, None);
     assert!(report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, Some(true));
     assert_eq!(report.expected_mrtd_matches, Some(false));
@@ -483,6 +491,10 @@ async fn verify_with_policy_treats_malformed_signed_azure_claims_as_token_failur
     let report = verify_fixture(fixture, claims, policy).await;
 
     assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(matches!(
+        report.token_verification_error,
+        Some(VerifyError::InvalidTokenClaims(_))
+    ));
     assert!(!report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(!report.mrtd_matches_token);
@@ -506,6 +518,7 @@ async fn verify_with_policy_reports_empty_raw_quote_without_full_pass() {
     let report = verify_fixture(fixture, claims, policy).await;
 
     assert!(report.jwt_signature_and_expiry_valid);
+    assert_eq!(report.token_verification_error, None);
     assert!(report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, Some(false));
     assert!(report.runtime_data_matches_report);
@@ -523,6 +536,7 @@ async fn verify_with_policy_reports_tampered_raw_quote_without_full_pass() {
     let report = verify_fixture(fixture, claims, policy).await;
 
     assert!(report.jwt_signature_and_expiry_valid);
+    assert_eq!(report.token_verification_error, None);
     assert!(report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, Some(false));
     assert!(report.runtime_data_matches_report);
@@ -541,6 +555,10 @@ async fn verify_with_policy_reports_empty_jwt_but_keeps_local_quote_checks() {
         .expect("verification should return a report");
 
     assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(matches!(
+        report.token_verification_error,
+        Some(VerifyError::InvalidToken(_))
+    ));
     assert!(!report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(report.runtime_data_matches_report);
@@ -655,6 +673,10 @@ async fn verify_with_policy_reports_expired_jwt() {
     let report = verify_fixture(fixture, claims, policy).await;
 
     assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(matches!(
+        report.token_verification_error,
+        Some(VerifyError::InvalidToken(_))
+    ));
     assert!(!report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(report.runtime_data_matches_report);
@@ -676,6 +698,10 @@ async fn verify_with_policy_reports_future_nbf_jwt() {
     let report = verify_fixture(fixture, claims, policy).await;
 
     assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(matches!(
+        report.token_verification_error,
+        Some(VerifyError::InvalidToken(_))
+    ));
     assert!(!report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(report.runtime_data_matches_report);
@@ -702,6 +728,10 @@ async fn verify_with_policy_reports_unknown_kid_jwt() {
     server.finish().await;
 
     assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(matches!(
+        report.token_verification_error,
+        Some(VerifyError::InvalidToken(_))
+    ));
     assert!(!report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(report.runtime_data_matches_report);
@@ -731,9 +761,46 @@ async fn verify_with_policy_reports_unsupported_algorithm_jwt() {
         .expect("verification should return a report");
 
     assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(matches!(
+        report.token_verification_error,
+        Some(VerifyError::InvalidToken(_))
+    ));
     assert!(!report.token_report_data_matches);
     assert_eq!(report.quote_report_data_matches, Some(true));
     assert!(report.runtime_data_matches_report);
     assert!(report.public_values_bound);
     assert!(report.require_success().is_err());
+}
+
+#[tokio::test]
+async fn verify_fresh_rejects_missing_azure_runtime_json_as_invalid_stored_evidence() {
+    let mut fixture = verification_fixture("UpToDate");
+    let claims = azure_claims(
+        &fixture,
+        fixture.runtime_data,
+        fixture.runtime_hash,
+        "UpToDate",
+    );
+    let stored_token = sign_token(claims);
+    let jwks = JwksServer::spawn().await;
+    let mut policy = default_policy(&fixture);
+    policy.jwks_url = jwks.url.clone();
+    fixture.attestation.ita_token = stored_token;
+    fixture.attestation.evidence = fixture.attestation.raw_quote.clone();
+
+    let err = fixture
+        .attestation
+        .verify_fresh_with_policy(
+            &ItaConfig {
+                api_key: "test-key".to_string(),
+                api_url: "http://127.0.0.1:1".to_string(),
+                request_timeout_secs: 5,
+            },
+            &policy,
+        )
+        .await
+        .expect_err("missing Azure runtime JSON should be a hard error");
+    jwks.finish().await;
+
+    assert!(matches!(err, VerifyError::InvalidStoredEvidence(_)));
 }
