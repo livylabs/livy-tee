@@ -113,7 +113,13 @@ impl ReportData {
         build_number: u32,
         nonce: u64,
     ) -> Self {
-        Self { payload_hash, build_id, version_code, build_number, nonce }
+        Self {
+            payload_hash,
+            build_id,
+            version_code,
+            build_number,
+            nonce,
+        }
     }
 
     /// Serialise to the canonical 64-byte wire format.
@@ -138,10 +144,15 @@ impl ReportData {
 
         let version_code = u32::from_be_bytes([b[40], b[41], b[42], b[43]]);
         let build_number = u32::from_be_bytes([b[44], b[45], b[46], b[47]]);
-        let nonce =
-            u64::from_be_bytes([b[48], b[49], b[50], b[51], b[52], b[53], b[54], b[55]]);
+        let nonce = u64::from_be_bytes([b[48], b[49], b[50], b[51], b[52], b[53], b[54], b[55]]);
 
-        Self { payload_hash, build_id, version_code, build_number, nonce }
+        Self {
+            payload_hash,
+            build_id,
+            version_code,
+            build_number,
+            nonce,
+        }
     }
 
     /// Hex-encode the full 64 bytes (128 hex characters).

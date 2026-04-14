@@ -14,10 +14,11 @@
 //!
 //! | Feature      | Default | Description |
 //! |--------------|---------|-------------|
-//! | *(none)*     | yes     | TSM configfs generation — requires TDX hardware (kernel ≥ 6.7) |
+//! | *(none)*     | yes     | Runtime provider auto-detection: TSM configfs or Azure vTPM/paravisor |
 //! | `mock-tee`   | no      | Correctly-shaped 632-byte stub — no hardware required |
 //! | `ita-verify` | no      | Intel Trust Authority REST API verification |
 
+mod cloud;
 mod evidence;
 mod generate;
 mod parser;
@@ -35,9 +36,7 @@ mod bind;
 pub use evidence::{Evidence, EvidenceError, QUOTE_MIN_LEN};
 pub use parser::parse;
 pub use public_values::{entry_hash, PublicValues, PublicValuesError};
-pub use report::{
-    build_id_from_binary, build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION,
-};
+pub use report::{build_id_from_binary, build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION};
 pub use types::Config;
 
 // ── Generation ─────────────────────────────────────────────────────────────
@@ -52,10 +51,10 @@ pub use verify::ita::{get_nonce, verify_evidence, ItaConfig, VerifiedClaims, Ver
 pub use verify::VerifyError;
 
 #[cfg(feature = "ita-verify")]
-pub use attest::{generate_and_attest, AttestedEvidence, AttestError};
+pub use attest::{generate_and_attest, AttestError, AttestedEvidence};
 
 #[cfg(feature = "ita-verify")]
-pub use bind::{verify_quote, verify_quote_with_public_values, Attestation, AttestBuilder, Livy};
+pub use bind::{verify_quote, verify_quote_with_public_values, AttestBuilder, Attestation, Livy};
 
 #[cfg(feature = "ita-verify")]
 pub use verify::ita::report_data_from_token;

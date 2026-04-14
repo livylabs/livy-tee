@@ -82,31 +82,32 @@ pub fn verify_quote(
     nonce_iat_b64: &str,
     expected_payload_hash: &[u8; 32],
 ) -> Result<bool, crate::verify::extract::ExtractError> {
+    use crate::evidence::Evidence;
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
     use sha2::{Digest, Sha512};
-    use crate::evidence::Evidence;
 
     let raw = BASE64
         .decode(raw_quote_b64.trim())
         .map_err(|_| crate::verify::extract::ExtractError::TooShort(0))?;
-    let evidence = match Evidence::from_bytes(raw) {
-        Ok(e) => e,
-        Err(_) => return Ok(false),
-    };
+    let raw_len = raw.len();
+    let evidence = Evidence::from_bytes(raw)
+        .map_err(|_| crate::verify::extract::ExtractError::TooShort(raw_len))?;
     let quote_rd_bytes = crate::verify::extract::extract_report_data(&evidence)?;
 
-    let runtime_data_bytes = match BASE64.decode(runtime_data_b64.trim()) {
-        Ok(b) if b.len() >= 64 => b,
-        _ => return Ok(false),
-    };
-    let nonce_val = match BASE64.decode(nonce_val_b64.trim()) {
-        Ok(b) => b,
-        Err(_) => return Ok(false),
-    };
-    let nonce_iat = match BASE64.decode(nonce_iat_b64.trim()) {
-        Ok(b) => b,
-        Err(_) => return Ok(false),
-    };
+    let runtime_data_bytes = BASE64
+        .decode(runtime_data_b64.trim())
+        .map_err(|_| crate::verify::extract::ExtractError::TooShort(0))?;
+    if runtime_data_bytes.len() < 64 {
+        return Err(crate::verify::extract::ExtractError::TooShort(
+            runtime_data_bytes.len(),
+        ));
+    }
+    let nonce_val = BASE64
+        .decode(nonce_val_b64.trim())
+        .map_err(|_| crate::verify::extract::ExtractError::TooShort(0))?;
+    let nonce_iat = BASE64
+        .decode(nonce_iat_b64.trim())
+        .map_err(|_| crate::verify::extract::ExtractError::TooShort(0))?;
 
     let expected_rd: [u8; 64] = {
         let mut h = Sha512::new();
@@ -147,7 +148,13 @@ pub fn verify_quote_with_public_values(
     public_values: &PublicValues,
 ) -> Result<bool, crate::verify::extract::ExtractError> {
     let hash = public_values.commitment_hash();
-    verify_quote(raw_quote_b64, runtime_data_b64, nonce_val_b64, nonce_iat_b64, &hash)
+    verify_quote(
+        raw_quote_b64,
+        runtime_data_b64,
+        nonce_val_b64,
+        nonce_iat_b64,
+        &hash,
+    )
 }
 
 /// Livy client — the entry point for TDX-backed attestation.
@@ -234,8 +241,8 @@ impl<'a> AttestBuilder<'a> {
     /// back from `public_values`.
     pub fn commit_hashed<T: Serialize>(&mut self, value: &T) -> &mut Self {
         use sha2::{Digest, Sha256};
-        let encoded = serde_json::to_vec(value)
-            .expect("commit_hashed: serialization should not fail");
+        let encoded =
+            serde_json::to_vec(value).expect("commit_hashed: serialization should not fail");
         let hash: [u8; 32] = Sha256::digest(&encoded).into();
         self.public_values.commit_raw(&hash);
         self
@@ -278,6 +285,7 @@ impl<'a> AttestBuilder<'a> {
             ita_token: attested.ita_token,
             mrtd: attested.mrtd,
             tcb_status: attested.tcb_status,
+            tcb_date: attested.tcb_date,
             raw_quote: BASE64.encode(attested.evidence.raw()),
             runtime_data: BASE64.encode(attested.runtime_data),
             verifier_nonce_val: BASE64.encode(&attested.nonce_val),
@@ -327,6 +335,8 @@ pub struct Attestation {
     pub mrtd: String,
     /// TCB status from Intel Trust Authority.
     pub tcb_status: String,
+    /// Optional TCB assessment date from Intel Trust Authority claims.
+    pub tcb_date: Option<String>,
     /// Base64-encoded raw DCAP quote.
     pub raw_quote: String,
     /// Base64-encoded original 64-byte ReportData struct.
@@ -384,6 +394,7 @@ impl Attestation {
     /// Use [`verify`](Self::verify) for full chain verification.
     #[must_use]
     pub fn verify_public_values_commitment(&self) -> bool {
-        self.public_values.verify_commitment(&self.report_data.payload_hash)
+        self.public_values
+            .verify_commitment(&self.report_data.payload_hash)
     }
 }

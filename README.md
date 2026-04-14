@@ -143,9 +143,22 @@ livy-tee proves computation integrity — "this code processed this data inside 
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| *(none)* | yes | TSM configfs quote generation — requires TDX hardware (Linux kernel ≥ 6.7) |
+| *(none)* | yes | Runtime provider auto-detection: Linux TSM configfs by default, Azure vTPM/paravisor path on Azure CVMs |
 | `mock-tee` | no | Correctly-shaped DCAP quote stub — no hardware required, for development |
 | `ita-verify` | no | Intel Trust Authority REST API client + high-level `Livy` API |
+
+### Runtime provider selection
+
+No feature flag or environment variable is needed to switch cloud providers. livy-tee
+auto-detects Azure confidential VMs and uses the Azure vTPM/paravisor path there;
+other Linux TDX guests use TSM configfs. When Azure is detected, livy-tee prints a
+one-time runtime notice that it is using the Azure vTPM/paravisor attestation path.
+
+On Azure confidential VMs, the Azure adapter talks directly to `/dev/tpmrm0` and
+Azure's local quote endpoint. No `tpm2-tools` or `curl` installation is required, but
+the VM user must have TPM device access, usually via the `tss` group. Azure attestation
+uses Intel Trust Authority's `/appraisal/v2/attest/azure` flow, which expects Azure
+runtime JSON + user data. The ITA token is authoritative for TCB/MRTD on Azure.
 
 ---
 
@@ -208,6 +221,7 @@ ITA_API_KEY=<your-key> ./your-binary
 | `ita_token` | ITA-signed JWT. Verifiable against Intel's JWKS endpoint. Contains MRTD, REPORTDATA (SHA-512 hash), and TCB status. |
 | `mrtd` | Hex-encoded 48-byte measurement of the TEE binary. Anyone who builds the same binary can compute and compare this independently. |
 | `tcb_status` | `"UpToDate"` — fully patched. `"OutOfDate"` — firmware update available (quote still valid). `"Revoked"` — hardware revoked. |
+| `tcb_date` | Optional RFC3339 date from ITA token claims indicating the TCB assessment date. |
 | `raw_quote` | Base64-encoded raw DCAP quote (~8 KB). REPORTDATA = SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data). |
 | `runtime_data` | Base64-encoded original 64-byte ReportData struct (our structured payload sent to ITA). |
 | `verifier_nonce_val` | Base64-encoded verifier nonce value (from ITA GET /nonce, used in REPORTDATA computation). |
@@ -249,6 +263,9 @@ assert!(ok);
 // Or use the method form — identical check:
 assert!(attestation.verify().unwrap());
 ```
+
+Note for Azure CVMs: `attestation.verify()` performs native quote-byte binding checks.
+Azure's `/attest/azure` flow is validated authoritatively by ITA using Azure runtime data.
 
 ### Step-by-step manual verification recipe
 

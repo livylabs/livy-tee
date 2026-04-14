@@ -28,7 +28,10 @@ pub(crate) fn generate(user_data: &[u8; 64]) -> Result<Evidence, GenerateError> 
     if raw.len() < 632 {
         return Err(GenerateError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("TSM outblob too short: {} bytes (expected ≥ 632)", raw.len()),
+            format!(
+                "TSM outblob too short: {} bytes (expected ≥ 632)",
+                raw.len()
+            ),
         )));
     }
 

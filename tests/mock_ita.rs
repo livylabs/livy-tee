@@ -6,10 +6,9 @@
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use livy_tee::{
-    binary_hash, extract_report_data, generate_and_attest, generate_evidence,
-    report_data_from_token, verify_quote_with_public_values,
-    report::{build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION},
-    ItaConfig, Livy, PublicValues,
+    binary_hash, build_id_from_hash_hex, extract_report_data, generate_and_attest,
+    generate_evidence, report_data_from_token, verify_quote_with_public_values, ItaConfig, Livy,
+    PublicValues, ReportData, REPORT_DATA_VERSION,
 };
 use sha2::{Digest, Sha512};
 
@@ -117,10 +116,9 @@ fn verify_quote_accepts_correct_mock_binding() {
     pv.commit(&"world");
     let (quote_b64, rd_b64, nonce_val_b64, nonce_iat_b64) = mock_chain(&pv);
 
-    let ok = verify_quote_with_public_values(
-        &quote_b64, &rd_b64, &nonce_val_b64, &nonce_iat_b64, &pv,
-    )
-    .expect("verify should not error");
+    let ok =
+        verify_quote_with_public_values(&quote_b64, &rd_b64, &nonce_val_b64, &nonce_iat_b64, &pv)
+            .expect("verify should not error");
     assert!(ok, "should accept correct mock binding");
 }
 
@@ -136,7 +134,11 @@ fn verify_quote_rejects_tampered_values_mock() {
     tampered.commit(&"world");
 
     let ok = verify_quote_with_public_values(
-        &quote_b64, &rd_b64, &nonce_val_b64, &nonce_iat_b64, &tampered,
+        &quote_b64,
+        &rd_b64,
+        &nonce_val_b64,
+        &nonce_iat_b64,
+        &tampered,
     )
     .expect("should not error");
     assert!(!ok, "tampered values should be rejected");
@@ -149,19 +151,16 @@ fn verify_quote_rejects_wrong_nonce_mock() {
     let (quote_b64, rd_b64, _nonce_val_b64, nonce_iat_b64) = mock_chain(&pv);
 
     let wrong_nonce_val = BASE64.encode([0xffu8; 32]);
-    let ok = verify_quote_with_public_values(
-        &quote_b64, &rd_b64, &wrong_nonce_val, &nonce_iat_b64, &pv,
-    )
-    .expect("should not error");
+    let ok =
+        verify_quote_with_public_values(&quote_b64, &rd_b64, &wrong_nonce_val, &nonce_iat_b64, &pv)
+            .expect("should not error");
     assert!(!ok, "wrong nonce should be rejected");
 }
 
 #[test]
 fn verify_quote_rejects_invalid_base64() {
     let pv = PublicValues::new();
-    let result = verify_quote_with_public_values(
-        "!!!invalid!!!", "AAAA", "AAAA", "AAAA", &pv,
-    );
+    let result = verify_quote_with_public_values("!!!invalid!!!", "AAAA", "AAAA", "AAAA", &pv);
     assert!(result.is_err());
 }
 
