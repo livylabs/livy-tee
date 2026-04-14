@@ -154,9 +154,11 @@ auto-detects Azure confidential VMs and uses the Azure vTPM/paravisor path there
 other Linux TDX guests use TSM configfs. When Azure is detected, livy-tee prints a
 one-time runtime notice that it is using the Azure vTPM/paravisor attestation path.
 
-On Azure confidential VMs, the Azure adapter requires `tpm2-tools` and `curl` in `PATH`.
-Azure attestation uses Intel Trust Authority's `/appraisal/v2/attest/azure` flow, which
-expects Azure runtime JSON + user data. The ITA token is authoritative for TCB/MRTD on Azure.
+On Azure confidential VMs, the Azure adapter talks directly to `/dev/tpmrm0` and
+Azure's local quote endpoint. No `tpm2-tools` or `curl` installation is required, but
+the VM user must have TPM device access, usually via the `tss` group. Azure attestation
+uses Intel Trust Authority's `/appraisal/v2/attest/azure` flow, which expects Azure
+runtime JSON + user data. The ITA token is authoritative for TCB/MRTD on Azure.
 
 ---
 
@@ -206,11 +208,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Run inside a TDX VM:
 ```bash
 ITA_API_KEY=<your-key> ./your-binary
-```
-
-Azure CVM note:
-```bash
-sudo apt-get update && sudo apt-get install -y tpm2-tools curl
 ```
 
 ---
