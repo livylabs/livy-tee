@@ -33,11 +33,12 @@
 use crate::{
     evidence::Evidence,
     generate::{generate_evidence, GenerateError},
+    report::BuildIdError,
     verify::{ita::ItaConfig, VerifyError},
 };
 
 #[cfg(not(feature = "mock-tee"))]
-use crate::verify::ita::{get_nonce, verify_evidence};
+use crate::verify::ita::{appraise_evidence_unauthenticated, get_nonce};
 use thiserror::Error;
 
 /// Output of a combined TDX quote generation + ITA attestation call.
@@ -75,6 +76,9 @@ pub enum AttestError {
     /// Quote generation failed.
     #[error("quote generation failed: {0}")]
     Generate(#[from] GenerateError),
+    /// Deriving the REPORTDATA build ID failed.
+    #[error("failed to derive build ID: {0}")]
+    BuildId(#[from] BuildIdError),
     /// ITA verification call failed.
     #[error("ITA verification failed: {0}")]
     Verify(#[from] VerifyError),
@@ -86,6 +90,7 @@ impl AttestError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Generate(err) => err.code(),
+            Self::BuildId(_) => "build_id",
             Self::Verify(err) => err.code(),
         }
     }
@@ -147,7 +152,8 @@ pub async fn generate_and_attest(
 
     #[cfg(not(feature = "mock-tee"))]
     {
-        let claims = verify_evidence(&evidence, config, user_data, &nonce).await?;
+        let claims =
+            appraise_evidence_unauthenticated(&evidence, config, user_data, &nonce).await?;
         Ok(AttestedEvidence {
             evidence,
             ita_token: claims.raw_token,

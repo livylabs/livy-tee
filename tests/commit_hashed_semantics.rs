@@ -34,6 +34,13 @@ fn expected_hash<T: Serialize>(value: &T) -> [u8; 32] {
     Sha256::digest(encoded).into()
 }
 
+#[derive(Serialize)]
+struct SessionBinding<'a> {
+    user: &'a str,
+    sequence: u64,
+    scopes: &'a [&'a str],
+}
+
 #[tokio::test]
 async fn commit_hashed_vec_u8_uses_serde_json_bytes() {
     let value = vec![1u8, 2, 3, 255];
@@ -65,6 +72,18 @@ async fn commit_hashed_string_uses_json_string_encoding() {
 
     assert_eq!(observed, expected_hash(&value));
     assert_ne!(observed, raw_bytes_hash);
+}
+
+#[tokio::test]
+async fn commit_hashed_struct_uses_json_object_encoding() {
+    let value = SessionBinding {
+        user: "alice",
+        sequence: 17,
+        scopes: &["quote:read", "quote:verify"],
+    };
+    let observed = hashed_entry_for(&value).await;
+
+    assert_eq!(observed, expected_hash(&value));
 }
 
 #[tokio::test]

@@ -87,7 +87,7 @@ This is the key property: given the raw input and output, **any third party** ca
 
 ```rust
 // ── On the TEE server ──────────────────────────────────────────────
-let livy = Livy::from_env()?;
+let livy = Livy::from_env()?;  // requires non-empty ITA_API_KEY
 
 let input = raw_photo_bytes;              // original camera capture
 let output = provenance_record_bytes;     // the record the server created
@@ -202,7 +202,7 @@ use livy_tee::Livy;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initialize — reads ITA_API_KEY from the environment.
+    // 1. Initialize — reads a non-empty ITA_API_KEY from the environment.
     let livy = Livy::from_env()?;
 
     // 2. Your program logic.
@@ -531,10 +531,10 @@ artifact with ITA.
 ### Extracting the token REPORTDATA hash from an ITA JWT
 
 ```rust
-use livy_tee::report_data_hash_from_token;
+use livy_tee::unauthenticated_report_data_hash_from_token;
 
 // No network, no TDX hardware.
-if let Some(report_data_hash) = report_data_hash_from_token(&ita_token)? {
+if let Some(report_data_hash) = unauthenticated_report_data_hash_from_token(&ita_token)? {
     println!("tdx_report_data: {}", hex::encode(report_data_hash));
 }
 ```
@@ -666,7 +666,7 @@ livy-tee
 └── verify/
     ├── extract.rs   extract_report_data, extract_mrtd (local, no network)
     ├── codec.rs     Shared token/runtime decoding helpers
-    └── ita.rs       Intel Trust Authority v2 REST client, report_data_hash_from_token
+    └── ita.rs       Intel Trust Authority v2 REST client, unauthenticated_report_data_hash_from_token
 ```
 
 The high-level `Livy` API in `bind/` is a thin layer over `attest.rs`, which combines `generate/` and `verify/ita.rs`. The low-level modules are independently usable.

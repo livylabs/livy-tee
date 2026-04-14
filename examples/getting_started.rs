@@ -95,8 +95,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let committed_input: u64 = attestation.public_values.read();
-    let committed_output: u64 = attestation.public_values.read();
+    let committed_input: u64 = attestation.public_values.read()?;
+    let committed_output: u64 = attestation.public_values.read()?;
 
     assert_eq!(committed_input, input);
     assert_eq!(committed_output, output);

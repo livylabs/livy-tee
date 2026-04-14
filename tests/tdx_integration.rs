@@ -243,7 +243,7 @@ async fn proof_verify_correct_and_tampered() {
     );
 
     // Read back and check.
-    let val: String = att.public_values.read();
+    let val: String = att.public_values.read().unwrap();
     assert_eq!(val, "verify-test");
 }
 

@@ -3,7 +3,6 @@
 
 use super::local::{
     nonce_and_runtime_hash, verify_quote_report_data_binding, verify_quote_with_public_values,
-    QuoteBindingDecodeError,
 };
 use crate::{
     attest::AttestError,
@@ -14,7 +13,8 @@ use crate::{
     verify::{
         codec::{decode_standard_base64, decode_standard_base64_array_64},
         ita::{
-            verify_attestation_token, verify_evidence, ItaConfig, VerifierNonce, DEFAULT_JWKS_URL,
+            appraise_evidence_unauthenticated, verify_attestation_token, ItaConfig, VerifierNonce,
+            DEFAULT_JWKS_URL,
         },
         VerifyError,
     },
@@ -24,6 +24,7 @@ use std::collections::BTreeSet;
 
 /// Policy for full [`Attestation`] verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AttestationVerificationPolicy {
     /// Intel Trust Authority JWKS endpoint used to verify the token signature.
     pub jwks_url: String,
@@ -60,6 +61,7 @@ impl Default for AttestationVerificationPolicy {
 /// Result of full [`Attestation`] verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[must_use = "verification is diagnostic until you check all_passed() or require_success()"]
+#[non_exhaustive]
 pub struct AttestationVerification {
     /// The ITA JWT signature and registered time claims passed validation.
     pub jwt_signature_and_expiry_valid: bool,
@@ -169,6 +171,18 @@ pub struct Livy {
     config: ItaConfig,
 }
 
+/// Errors returned by [`Livy::from_env`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[non_exhaustive]
+pub enum LivyEnvError {
+    /// `ITA_API_KEY` is not present in the environment.
+    #[error("ITA_API_KEY environment variable is not set")]
+    MissingApiKey,
+    /// `ITA_API_KEY` is present but empty after trimming whitespace.
+    #[error("ITA_API_KEY is empty")]
+    EmptyApiKey,
+}
+
 impl Livy {
     /// Create a Livy client from an explicit API key.
     pub fn new(api_key: impl Into<String>) -> Self {
@@ -186,11 +200,10 @@ impl Livy {
     }
 
     /// Create a Livy client by reading `ITA_API_KEY` from the environment.
-    pub fn from_env() -> Result<Self, String> {
-        let key = std::env::var("ITA_API_KEY")
-            .map_err(|_| "ITA_API_KEY environment variable is not set".to_string())?;
-        if key.is_empty() {
-            return Err("ITA_API_KEY is empty".to_string());
+    pub fn from_env() -> Result<Self, LivyEnvError> {
+        let key = std::env::var("ITA_API_KEY").map_err(|_| LivyEnvError::MissingApiKey)?;
+        if key.trim().is_empty() {
+            return Err(LivyEnvError::EmptyApiKey);
         }
         Ok(Self::new(key))
     }
@@ -222,7 +235,7 @@ impl<'a> AttestBuilder<'a> {
     /// Commit a typed value as a public output.
     ///
     /// Values are read back in commit order by the verifier via
-    /// `attestation.public_values.read::<T>()`.
+    /// `attestation.public_values.read::<T>()?`.
     ///
     /// **Privacy notice:** the committed value is stored in plain text and is
     /// readable by any party who receives the attestation. Only commit data that
@@ -278,8 +291,7 @@ impl<'a> AttestBuilder<'a> {
         let payload_hash = self.public_values.commitment_hash();
 
         let binary_hash_hex = binary_hash().map_err(AttestError::Generate)?;
-        let build_id = build_id_from_hash_hex(&binary_hash_hex)
-            .expect("binary_hash must return a valid 64-char SHA-256 hex string");
+        let build_id = build_id_from_hash_hex(&binary_hash_hex)?;
         let rd = ReportData::new(payload_hash, build_id, REPORT_DATA_VERSION, 0, self.nonce);
         let rd_bytes = rd.to_bytes();
 
@@ -324,7 +336,7 @@ impl<'a> AttestBuilder<'a> {
 ///
 /// ```rust,ignore
 /// // 1. Read and constrain individual values.
-/// // Raw/hash entries should be consumed with read_raw() or try_read().
+/// // Raw/hash entries should be consumed with read_raw() or read().
 /// let hash_bytes = attestation.public_values.read_raw()?;
 /// let hash: [u8; 32] = hash_bytes.as_slice().try_into()?;
 /// assert_eq!(hash, expected);
@@ -375,7 +387,7 @@ pub struct Attestation {
     pub verifier_nonce_signature: String,
     /// Structured REPORTDATA parsed from `runtime_data`.
     pub report_data: ReportData,
-    /// The committed public values — read with `.public_values.read::<T>()`.
+    /// The committed public values — read with `.public_values.read::<T>()?`.
     pub public_values: PublicValues,
 }
 
@@ -430,10 +442,7 @@ impl Attestation {
     /// `Ok(report)` is diagnostic. Call [`AttestationVerification::all_passed`]
     /// or [`AttestationVerification::require_success`] before trusting it.
     pub async fn verify(&self) -> Result<AttestationVerification, VerifyError> {
-        let mut policy = AttestationVerificationPolicy::default();
-        if !self.jwks_url.is_empty() {
-            policy.jwks_url = self.jwks_url.clone();
-        }
+        let policy = self.default_policy();
         self.verify_with_policy(&policy).await
     }
 
@@ -446,10 +455,7 @@ impl Attestation {
         &self,
         config: &ItaConfig,
     ) -> Result<AttestationVerification, VerifyError> {
-        let mut policy = AttestationVerificationPolicy::default();
-        if !self.jwks_url.is_empty() {
-            policy.jwks_url = self.jwks_url.clone();
-        }
+        let policy = self.default_policy();
         self.verify_fresh_with_policy(config, &policy).await
     }
 
@@ -501,17 +507,9 @@ impl Attestation {
             .map_err(VerifyError::InvalidAttestation)?;
         let expected_token_report_data =
             nonce_and_runtime_hash(&nonce_val, &nonce_iat, &runtime_data);
-        let offline_quote_report_data_matches = verify_quote_report_data_binding(
-            &self.raw_quote,
-            &runtime_data,
-            &nonce_val,
-            &nonce_iat,
-        )
-        .map_err(|err| match err {
-            QuoteBindingDecodeError::Base64(err) => {
-                VerifyError::InvalidAttestation(format!("raw_quote base64: {err}"))
-            }
-        })?;
+        let offline_quote_report_data_matches =
+            verify_quote_report_data_binding(&self.raw_quote, &expected_token_report_data)
+                .map_err(|err| VerifyError::InvalidAttestation(format!("raw_quote: {err}")))?;
 
         let parsed_report = ReportData::from_bytes(&runtime_data);
         let tcb_status_allowed = token.as_ref().is_some_and(|t| {
@@ -521,13 +519,13 @@ impl Attestation {
                 .any(|status| status.eq_ignore_ascii_case(&t.tcb_status))
         });
 
-        let quote_report_data_matches = token
-            .as_ref()
-            .and_then(|t| {
-                t.supports_offline_quote_report_data_binding()
-                    .then_some(offline_quote_report_data_matches)
-            })
-            .or_else(|| token.is_none().then_some(offline_quote_report_data_matches));
+        let quote_report_data_matches = match token.as_ref() {
+            None => Some(offline_quote_report_data_matches),
+            Some(token) if token.supports_offline_quote_report_data_binding() => {
+                Some(offline_quote_report_data_matches)
+            }
+            Some(_) => None,
+        };
 
         let report = AttestationVerification {
             jwt_signature_and_expiry_valid: jwt_valid,
@@ -581,6 +579,10 @@ impl Attestation {
         Ok(VerificationContext {
             report,
             runtime_data,
+            nonce: StoredVerifierNonce {
+                val: nonce_val,
+                iat: nonce_iat,
+            },
             token_requires_azure_runtime_evidence: token
                 .as_ref()
                 .is_some_and(|t| !t.supports_offline_quote_report_data_binding()),
@@ -601,6 +603,7 @@ impl Attestation {
         let VerificationContext {
             mut report,
             runtime_data,
+            nonce,
             token_requires_azure_runtime_evidence,
         } = self.verify_with_policy_context(policy).await?;
         let evidence = self.stored_evidence()?;
@@ -610,8 +613,9 @@ impl Attestation {
                     .to_string(),
             ));
         }
-        let nonce = self.stored_nonce()?;
-        let fresh = verify_evidence(&evidence, config, &runtime_data, &nonce).await?;
+        let nonce = self.stored_nonce_with_parts(nonce)?;
+        let fresh =
+            appraise_evidence_unauthenticated(&evidence, config, &runtime_data, &nonce).await?;
         let raw_quote_matches_evidence = BASE64.encode(evidence.raw()) == self.raw_quote.trim();
 
         report.bundled_evidence_authenticated = Some(
@@ -655,18 +659,25 @@ impl Attestation {
             .map_err(|err| VerifyError::InvalidStoredEvidence(format!("stored evidence: {err}")))
     }
 
-    fn stored_nonce(&self) -> Result<VerifierNonce, VerifyError> {
-        let val = decode_standard_base64("verifier_nonce_val", &self.verifier_nonce_val)
-            .map_err(VerifyError::InvalidAttestation)?;
-        let iat = decode_standard_base64("verifier_nonce_iat", &self.verifier_nonce_iat)
-            .map_err(VerifyError::InvalidAttestation)?;
+    fn default_policy(&self) -> AttestationVerificationPolicy {
+        let mut policy = AttestationVerificationPolicy::default();
+        if !self.jwks_url.is_empty() {
+            policy.jwks_url = self.jwks_url.clone();
+        }
+        policy
+    }
+
+    fn stored_nonce_with_parts(
+        &self,
+        decoded: StoredVerifierNonce,
+    ) -> Result<VerifierNonce, VerifyError> {
         let signature =
             decode_standard_base64("verifier_nonce_signature", &self.verifier_nonce_signature)
                 .map_err(VerifyError::InvalidAttestation)?;
 
         Ok(VerifierNonce {
-            val,
-            iat,
+            val: decoded.val,
+            iat: decoded.iat,
             signature,
             val_b64: self.verifier_nonce_val.clone(),
             iat_b64: self.verifier_nonce_iat.clone(),
@@ -678,7 +689,13 @@ impl Attestation {
 struct VerificationContext {
     report: AttestationVerification,
     runtime_data: [u8; 64],
+    nonce: StoredVerifierNonce,
     token_requires_azure_runtime_evidence: bool,
+}
+
+struct StoredVerifierNonce {
+    val: Vec<u8>,
+    iat: Vec<u8>,
 }
 
 fn advisory_id_sets_match(left: &[String], right: &[String]) -> bool {

@@ -9,30 +9,18 @@ use crate::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
-#[derive(Debug)]
-pub(crate) enum QuoteBindingDecodeError {
-    Base64(base64::DecodeError),
-}
-
 pub(crate) fn verify_quote_report_data_binding(
     raw_quote_b64: &str,
-    runtime_data: &[u8; 64],
-    nonce_val: &[u8],
-    nonce_iat: &[u8],
-) -> Result<bool, QuoteBindingDecodeError> {
+    expected_report_data: &[u8; 64],
+) -> Result<bool, ExtractError> {
     let raw = BASE64
         .decode(raw_quote_b64.trim())
-        .map_err(QuoteBindingDecodeError::Base64)?;
-    let evidence = match Evidence::from_bytes(raw) {
-        Ok(evidence) => evidence,
-        Err(_) => return Ok(false),
-    };
-    let quote_rd_bytes = match extract_report_data(&evidence) {
-        Ok(report_data) => report_data,
-        Err(_) => return Ok(false),
-    };
+        .map_err(|err| ExtractError::Base64(err.to_string()))?;
+    let raw_len = raw.len();
+    let evidence = Evidence::from_bytes(raw).map_err(|_| ExtractError::TooShort(raw_len))?;
+    let quote_rd_bytes = extract_report_data(&evidence)?;
 
-    Ok(quote_rd_bytes == nonce_and_runtime_hash(nonce_val, nonce_iat, runtime_data))
+    Ok(quote_rd_bytes == *expected_report_data)
 }
 
 /// Verify a raw DCAP quote's ITA nonce binding and an expected `payload_hash`.
@@ -74,8 +62,9 @@ pub fn verify_quote(
     let nonce_iat = BASE64
         .decode(nonce_iat_b64.trim())
         .map_err(|err| ExtractError::Base64(err.to_string()))?;
+    let expected_report_data = nonce_and_runtime_hash(&nonce_val, &nonce_iat, &runtime_data);
 
-    if quote_rd_bytes != nonce_and_runtime_hash(&nonce_val, &nonce_iat, &runtime_data) {
+    if quote_rd_bytes != expected_report_data {
         return Ok(false);
     }
 
@@ -123,4 +112,75 @@ pub(super) fn nonce_and_runtime_hash(
     h.update(nonce_iat);
     h.update(runtime_data);
     h.finalize().into()
+}
+
+#[cfg(all(test, feature = "mock-tee"))]
+mod tests {
+    use super::*;
+    use crate::generate::generate_evidence;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    fn mock_binding_inputs() -> (String, String, String, String, PublicValues) {
+        let mut public_values = PublicValues::new();
+        public_values.commit(&"binding-value");
+
+        let nonce_val = b"nonce-val".to_vec();
+        let nonce_iat = b"nonce-iat".to_vec();
+        let runtime_data = ReportData::new(public_values.commitment_hash(), [0u8; 8], 7, 0, 1);
+        let quote = generate_evidence(&nonce_and_runtime_hash(
+            &nonce_val,
+            &nonce_iat,
+            &runtime_data.to_bytes(),
+        ))
+        .expect("mock evidence should build");
+
+        (
+            BASE64.encode(quote.raw()),
+            BASE64.encode(runtime_data.to_bytes()),
+            BASE64.encode(&nonce_val),
+            BASE64.encode(&nonce_iat),
+            public_values,
+        )
+    }
+
+    #[test]
+    fn verify_quote_with_public_values_returns_false_for_mismatched_public_values() {
+        let (quote_b64, runtime_data_b64, nonce_val_b64, nonce_iat_b64, _) = mock_binding_inputs();
+        let mut tampered = PublicValues::new();
+        tampered.commit(&"tampered-value");
+
+        let ok = verify_quote_with_public_values(
+            &quote_b64,
+            &runtime_data_b64,
+            &nonce_val_b64,
+            &nonce_iat_b64,
+            &tampered,
+        )
+        .expect("structurally valid quote should verify cleanly");
+
+        assert!(!ok);
+    }
+
+    #[test]
+    fn verify_quote_report_data_binding_rejects_truncated_quotes_with_diagnostic() {
+        let (_, runtime_data_b64, nonce_val_b64, nonce_iat_b64, _) = mock_binding_inputs();
+        let runtime_data: [u8; 64] = BASE64
+            .decode(runtime_data_b64)
+            .expect("runtime data should decode")
+            .as_slice()
+            .try_into()
+            .expect("runtime data should be 64 bytes");
+        let nonce_val = BASE64
+            .decode(nonce_val_b64)
+            .expect("nonce value should decode");
+        let nonce_iat = BASE64
+            .decode(nonce_iat_b64)
+            .expect("nonce iat should decode");
+        let expected_report_data = nonce_and_runtime_hash(&nonce_val, &nonce_iat, &runtime_data);
+
+        assert!(matches!(
+            verify_quote_report_data_binding("", &expected_report_data),
+            Err(ExtractError::TooShort(0))
+        ));
+    }
 }

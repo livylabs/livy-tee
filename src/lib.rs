@@ -50,8 +50,8 @@ pub use verify::extract::{extract_mrtd, extract_report_data, ExtractError};
 
 #[cfg(feature = "ita-verify")]
 pub use verify::ita::{
-    appraise_evidence, default_jwks_url_for_api_url, get_nonce, verify_evidence, ItaConfig,
-    VerifiedClaims, VerifierNonce,
+    appraise_evidence_unauthenticated, default_jwks_url_for_api_url, get_nonce, ItaConfig,
+    UnauthenticatedAppraisalClaims, VerifierNonce,
 };
 #[cfg(feature = "ita-verify")]
 pub use verify::VerifyError;
@@ -62,8 +62,17 @@ pub use attest::{generate_and_attest, AttestError, AttestedEvidence};
 #[cfg(feature = "ita-verify")]
 pub use bind::{
     verify_quote, verify_quote_with_public_values, AttestBuilder, Attestation,
-    AttestationVerification, AttestationVerificationPolicy, Livy,
+    AttestationVerification, AttestationVerificationPolicy, Livy, LivyEnvError,
 };
 
 #[cfg(feature = "ita-verify")]
-pub use verify::ita::{report_data_hash_from_token, unauthenticated_report_data_hash_from_token};
+pub use verify::ita::unauthenticated_report_data_hash_from_token;
+
+/// Deprecated alias for [`unauthenticated_report_data_hash_from_token`].
+#[cfg(feature = "ita-verify")]
+#[deprecated(
+    note = "use unauthenticated_report_data_hash_from_token to make the unauthenticated trust boundary explicit"
+)]
+pub fn report_data_hash_from_token(jwt: &str) -> Result<Option<[u8; 64]>, VerifyError> {
+    verify::ita::unauthenticated_report_data_hash_from_token(jwt)
+}

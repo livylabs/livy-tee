@@ -218,7 +218,8 @@ Fresh evidence authentication on Azure requires:
 6. an `ItaConfig` with API key
 
 `verify_fresh()` reconstructs the stored `Evidence` from `attestation.evidence`,
-rebuilds the verifier nonce object, and calls `verify_evidence(...)`.
+rebuilds the verifier nonce object, and calls
+`appraise_evidence_unauthenticated(...)`.
 
 Provider routing for this fresh appraisal is based on the evidence artifact
 itself:

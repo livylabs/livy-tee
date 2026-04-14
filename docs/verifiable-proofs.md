@@ -334,7 +334,7 @@ Step A — Parse the portable evidence artifact:
   evidence = Evidence::from_transport_string(attestation.evidence)
 
 Step B — Submit that evidence, runtime_data, and verifier nonce back to ITA:
-  verify_evidence(evidence, runtime_data, verifier_nonce)
+  appraise_evidence_unauthenticated(evidence, runtime_data, verifier_nonce)
 
 Step C — Assert the fresh ITA appraisal matches the attestation's public fields:
   fresh.mrtd == attestation.mrtd

@@ -1,31 +1,59 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 use base64::Engine;
-#[cfg(feature = "ita-verify")]
-use livy_tee::VerifyError;
 use livy_tee::{
     binary_hash, build_id_from_hash_hex, Evidence, EvidenceError, GenerateError, ReportData,
     REPORT_DATA_VERSION,
 };
 #[cfg(feature = "mock-tee")]
 use livy_tee::{extract_report_data, generate_evidence};
+#[cfg(feature = "ita-verify")]
+use livy_tee::{Livy, LivyEnvError, VerifyError};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "ita-verify")]
+use std::sync::{Mutex, OnceLock};
 
 fn sample_payload() -> [u8; 32] {
     Sha256::digest(b"integration-test-payload").into()
 }
 
-fn sample_build_id() -> [u8; 8] {
-    build_id_from_hash_hex(&binary_hash().unwrap()).expect("binary_hash returns valid SHA-256 hex")
+fn sample_report_with(payload_hash: [u8; 32], nonce: u64) -> ReportData {
+    let build_id = build_id_from_hash_hex(&binary_hash().unwrap())
+        .expect("binary_hash returns valid SHA-256 hex");
+    ReportData::new(payload_hash, build_id, REPORT_DATA_VERSION, 0, nonce)
 }
 
 fn sample_report() -> ReportData {
-    ReportData::new(
-        sample_payload(),
-        sample_build_id(),
-        REPORT_DATA_VERSION,
-        0,
-        1,
-    )
+    sample_report_with(sample_payload(), 1)
+}
+
+#[cfg(feature = "ita-verify")]
+fn ita_api_key_env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(feature = "ita-verify")]
+struct ItaApiKeyEnvRestore(Option<String>);
+
+#[cfg(feature = "ita-verify")]
+impl Drop for ItaApiKeyEnvRestore {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(value) => std::env::set_var("ITA_API_KEY", value),
+            None => std::env::remove_var("ITA_API_KEY"),
+        }
+    }
+}
+
+#[cfg(feature = "ita-verify")]
+fn with_ita_api_key_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let _lock = ita_api_key_env_lock().lock().unwrap();
+    let _restore = ItaApiKeyEnvRestore(std::env::var("ITA_API_KEY").ok());
+    match value {
+        Some(value) => std::env::set_var("ITA_API_KEY", value),
+        None => std::env::remove_var("ITA_API_KEY"),
+    }
+    f()
 }
 
 #[test]
@@ -43,26 +71,14 @@ fn report_data_is_deterministic() {
 fn report_data_changes_with_different_payload() {
     let r1 = sample_report();
     let different_payload: [u8; 32] = Sha256::digest(b"different").into();
-    let r2 = ReportData::new(
-        different_payload,
-        sample_build_id(),
-        REPORT_DATA_VERSION,
-        0,
-        1,
-    );
+    let r2 = sample_report_with(different_payload, 1);
     assert_ne!(r1.to_bytes(), r2.to_bytes());
 }
 
 #[test]
 fn report_data_changes_with_nonce() {
     let r1 = sample_report();
-    let r2 = ReportData::new(
-        sample_payload(),
-        sample_build_id(),
-        REPORT_DATA_VERSION,
-        0,
-        2,
-    );
+    let r2 = sample_report_with(sample_payload(), 2);
     assert_ne!(r1.to_bytes(), r2.to_bytes());
 }
 
@@ -80,7 +96,7 @@ fn reserved_bytes_are_zero() {
 #[test]
 fn verify_payload_helper_works() {
     let payload = sample_payload();
-    let rd = ReportData::new(payload, sample_build_id(), REPORT_DATA_VERSION, 0, 1);
+    let rd = sample_report_with(payload, 1);
     assert!(rd.verify_payload(&payload));
     assert!(!rd.verify_payload(&[0u8; 32]));
 }
@@ -180,7 +196,7 @@ fn different_user_data_produces_different_extracted_report_data() {
 }
 
 #[test]
-fn atttest_builder_input_hash_precomputed() {
+fn attest_builder_input_hash_precomputed() {
     let input = b"hello";
     let output = b"world";
     let ih: [u8; 32] = Sha256::digest(input).into();
@@ -191,15 +207,26 @@ fn atttest_builder_input_hash_precomputed() {
         h.update(oh);
         h.finalize().into()
     };
-    let rd = ReportData::new(expected, sample_build_id(), REPORT_DATA_VERSION, 0, 0);
+    let rd = sample_report_with(expected, 0);
     assert!(rd.verify_payload(&expected));
 }
 
+#[cfg(feature = "ita-verify")]
 #[test]
-fn livy_from_env_fails_when_key_missing() {
-    std::env::remove_var("ITA_API_KEY");
-    let result = std::env::var("ITA_API_KEY");
-    assert!(result.is_err());
+fn livy_from_env_validates_and_reads_ita_api_key() {
+    with_ita_api_key_env(None, || {
+        let err = Livy::from_env().unwrap_err();
+        assert_eq!(err, LivyEnvError::MissingApiKey);
+    });
+
+    with_ita_api_key_env(Some(""), || {
+        let err = Livy::from_env().unwrap_err();
+        assert_eq!(err, LivyEnvError::EmptyApiKey);
+    });
+
+    with_ita_api_key_env(Some("test-key"), || {
+        assert!(Livy::from_env().is_ok());
+    });
 }
 
 // ---------------------------------------------------------------------------

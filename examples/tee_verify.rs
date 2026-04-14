@@ -185,8 +185,14 @@ fn main() {
                 }
 
                 // Read back public values.
-                let v1: String = att.public_values.read();
-                let v2: String = att.public_values.read();
+                let v1: String = att
+                    .public_values
+                    .read()
+                    .expect("public input should deserialize");
+                let v2: String = att
+                    .public_values
+                    .read()
+                    .expect("public output should deserialize");
                 println!("  OK  public_values[0]: {v1}");
                 println!("  OK  public_values[1]: {v2}");
             }

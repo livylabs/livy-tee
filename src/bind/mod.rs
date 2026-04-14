@@ -27,9 +27,9 @@
 //! let attestation = builder.finalize().await?;
 //!
 //! // ── Verifier side (anyone, anywhere) ──────────────────
-//! let hash: [u8; 32]  = attestation.public_values.read();
-//! let pubkey: String   = attestation.public_values.read();
-//! let binding: [u8;32] = attestation.public_values.read();
+//! let hash: [u8; 32]  = attestation.public_values.read()?;
+//! let pubkey: String   = attestation.public_values.read()?;
+//! let binding: [u8;32] = attestation.public_values.read()?;
 //!
 //! assert_eq!(hash, sha256(&original_photo));
 //! // Strict attestation check: JWT/JWKS, TCB policy, public-value binding,
@@ -60,5 +60,6 @@ mod local;
 
 pub use attestation::{
     AttestBuilder, Attestation, AttestationVerification, AttestationVerificationPolicy, Livy,
+    LivyEnvError,
 };
 pub use local::{verify_quote, verify_quote_with_public_values};

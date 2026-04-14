@@ -7,9 +7,9 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use livy_tee::{
-    unauthenticated_report_data_hash_from_token, Attestation, AttestationVerification,
-    AttestationVerificationPolicy, Evidence, ItaConfig, PublicValues, ReportData, VerifyError,
-    REPORT_DATA_VERSION,
+    appraise_evidence_unauthenticated, unauthenticated_report_data_hash_from_token, Attestation,
+    AttestationVerification, AttestationVerificationPolicy, Evidence, ItaConfig, PublicValues,
+    ReportData, VerifierNonce, VerifyError, REPORT_DATA_VERSION,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha512};
@@ -230,6 +230,23 @@ fn verification_fixture(tcb_status: &str) -> VerificationFixture {
     }
 }
 
+fn verifier_nonce(fixture: &VerificationFixture) -> VerifierNonce {
+    VerifierNonce {
+        val: BASE64
+            .decode(fixture.attestation.verifier_nonce_val.as_bytes())
+            .expect("fixture nonce value should decode"),
+        iat: BASE64
+            .decode(fixture.attestation.verifier_nonce_iat.as_bytes())
+            .expect("fixture nonce iat should decode"),
+        signature: BASE64
+            .decode(fixture.attestation.verifier_nonce_signature.as_bytes())
+            .expect("fixture nonce signature should decode"),
+        val_b64: fixture.attestation.verifier_nonce_val.clone(),
+        iat_b64: fixture.attestation.verifier_nonce_iat.clone(),
+        signature_b64: fixture.attestation.verifier_nonce_signature.clone(),
+    }
+}
+
 fn sign_token(claims: Value) -> String {
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(TEST_JWK_KID.to_string());
@@ -306,6 +323,24 @@ fn default_policy(fixture: &VerificationFixture) -> AttestationVerificationPolic
     policy
 }
 
+fn verify_config(api_url: String) -> ItaConfig {
+    ItaConfig {
+        api_key: "test-key".to_string(),
+        api_url,
+        request_timeout_secs: 30,
+    }
+}
+
+fn attach_azure_runtime_evidence(fixture: &mut VerificationFixture) {
+    let raw_quote = BASE64
+        .decode(fixture.attestation.raw_quote.as_bytes())
+        .expect("fixture raw quote should decode");
+    let evidence =
+        Evidence::from_bytes_with_azure_runtime(raw_quote, br#"{"user-data":"cafebabe"}"#.to_vec())
+            .expect("fixture Azure evidence should be valid");
+    fixture.attestation.evidence = evidence.to_transport_string();
+}
+
 async fn verify_fixture(
     mut fixture: VerificationFixture,
     claims: Value,
@@ -322,6 +357,61 @@ async fn verify_fixture(
         .expect("verification should return a report");
     server.finish().await;
     report
+}
+
+async fn verify_fresh_fixture(
+    mut fixture: VerificationFixture,
+    claims: Value,
+    appraisal_path: &'static str,
+    policy: AttestationVerificationPolicy,
+) -> AttestationVerification {
+    let stored_token = sign_token(claims.clone());
+    let appraisal = AppraisalServer::spawn(appraisal_path, stored_token.clone()).await;
+    let jwks = JwksServer::spawn().await;
+    let mut policy = policy;
+    policy.jwks_url = jwks.url.clone();
+    fixture.attestation.ita_token = stored_token;
+
+    let report = fixture
+        .attestation
+        .verify_fresh_with_policy(&verify_config(appraisal.url.clone()), &policy)
+        .await
+        .expect("fresh verification should succeed");
+
+    appraisal.finish().await;
+    jwks.finish().await;
+    report
+}
+
+#[tokio::test]
+async fn appraise_evidence_unauthenticated_returns_trimmed_token_claims() {
+    let fixture = verification_fixture("UpToDate");
+    let evidence = Evidence::from_transport_string(&fixture.attestation.evidence)
+        .expect("fixture evidence should decode");
+    let nonce = verifier_nonce(&fixture);
+    let token = sign_token(standard_claims(&fixture, fixture.runtime_hash, "UpToDate"));
+    let appraisal = AppraisalServer::spawn("/appraisal/v2/attest", format!(" \n{token}\t ")).await;
+
+    let claims = appraise_evidence_unauthenticated(
+        &evidence,
+        &ItaConfig {
+            api_key: "test-key".to_string(),
+            api_url: appraisal.url.clone(),
+            request_timeout_secs: 30,
+        },
+        &fixture.runtime_data,
+        &nonce,
+    )
+    .await
+    .expect("appraisal should return claims");
+
+    appraisal.finish().await;
+
+    assert_eq!(claims.raw_token, token);
+    assert_eq!(claims.mrtd, fixture.mrtd);
+    assert_eq!(claims.report_data, fixture.runtime_hash);
+    assert_eq!(claims.runtime_data, fixture.runtime_data);
+    assert_eq!(claims.tcb_status, "UpToDate");
 }
 
 #[tokio::test]
@@ -463,6 +553,20 @@ async fn verify_with_policy_can_allow_out_of_date_tcb() {
 }
 
 #[tokio::test]
+async fn verify_with_policy_accepts_any_configured_tcb_status_in_a_multi_entry_allowlist() {
+    let fixture = verification_fixture("OutOfDate");
+    let claims = standard_claims(&fixture, fixture.runtime_hash, "OutOfDate");
+    let mut policy = default_policy(&fixture);
+    policy.accepted_tcb_statuses = vec!["UpToDate".to_string(), "OutOfDate".to_string()];
+    let report = verify_fixture(fixture, claims, policy).await;
+
+    assert!(report.jwt_signature_and_expiry_valid);
+    assert!(report.tcb_status_allowed);
+    assert_eq!(report.tcb_status, "OutOfDate");
+    assert!(report.all_passed());
+}
+
+#[tokio::test]
 async fn verify_with_policy_can_allow_out_of_date_tcb_for_expected_advisory_set() {
     let mut fixture = verification_fixture("OutOfDate");
     fixture.attestation.advisory_ids = TEST_GCP_ADVISORY_IDS
@@ -536,6 +640,45 @@ async fn verify_with_policy_reports_expected_identity_mismatches() {
     assert_eq!(report.expected_mrtd_matches, Some(false));
     assert_eq!(report.expected_build_id_matches, Some(false));
     assert_eq!(report.expected_nonce_matches, Some(false));
+    assert!(!report.all_passed());
+}
+
+#[tokio::test]
+async fn verify_with_policy_leaves_expected_mrtd_unset_when_policy_does_not_pin_it() {
+    let fixture = verification_fixture("UpToDate");
+    let claims = standard_claims(&fixture, fixture.runtime_hash, "UpToDate");
+    let mut policy = default_policy(&fixture);
+    policy.expected_mrtd = None;
+    let report = verify_fixture(fixture, claims, policy).await;
+
+    assert!(report.jwt_signature_and_expiry_valid);
+    assert_eq!(report.expected_mrtd_matches, None);
+    assert!(report.all_passed());
+}
+
+#[tokio::test]
+async fn verify_with_policy_reports_public_tcb_date_mismatch() {
+    let mut fixture = verification_fixture("UpToDate");
+    fixture.attestation.tcb_date = Some("2030-01-01T00:00:00Z".to_string());
+    let claims = standard_claims(&fixture, fixture.runtime_hash, "UpToDate");
+    let policy = default_policy(&fixture);
+    let report = verify_fixture(fixture, claims, policy).await;
+
+    assert!(report.jwt_signature_and_expiry_valid);
+    assert!(!report.tcb_date_matches_token);
+    assert!(!report.all_passed());
+}
+
+#[tokio::test]
+async fn verify_with_policy_reports_public_advisory_id_mismatch() {
+    let mut fixture = verification_fixture("UpToDate");
+    fixture.attestation.advisory_ids = vec!["INTEL-SA-99999".to_string()];
+    let claims = standard_claims(&fixture, fixture.runtime_hash, "UpToDate");
+    let policy = default_policy(&fixture);
+    let report = verify_fixture(fixture, claims, policy).await;
+
+    assert!(report.jwt_signature_and_expiry_valid);
+    assert!(!report.advisory_ids_match_token);
     assert!(!report.all_passed());
 }
 
@@ -641,44 +784,29 @@ async fn verify_with_policy_reports_empty_jwt_but_keeps_local_quote_checks() {
 }
 
 #[tokio::test]
+async fn verify_fresh_authenticates_stored_standard_evidence() {
+    let fixture = verification_fixture("UpToDate");
+    let claims = standard_claims(&fixture, fixture.runtime_hash, "UpToDate");
+    let policy = default_policy(&fixture);
+    let report = verify_fresh_fixture(fixture, claims, "/appraisal/v2/attest", policy).await;
+
+    assert_eq!(report.quote_report_data_matches, Some(true));
+    assert_eq!(report.bundled_evidence_authenticated, Some(true));
+    assert!(report.all_passed());
+}
+
+#[tokio::test]
 async fn verify_fresh_authenticates_stored_azure_evidence() {
     let mut fixture = verification_fixture("UpToDate");
-    let raw_quote = BASE64
-        .decode(fixture.attestation.raw_quote.as_bytes())
-        .expect("fixture raw quote should decode");
-    let evidence =
-        Evidence::from_bytes_with_azure_runtime(raw_quote, br#"{"user-data":"cafebabe"}"#.to_vec())
-            .expect("fixture Azure evidence should be valid");
-    fixture.attestation.evidence = evidence.to_transport_string();
-
+    attach_azure_runtime_evidence(&mut fixture);
     let claims = azure_claims(
         &fixture,
         fixture.runtime_data,
         fixture.runtime_hash,
         "UpToDate",
     );
-    let stored_token = sign_token(claims.clone());
-    let appraisal = AppraisalServer::spawn("/appraisal/v2/attest/azure", sign_token(claims)).await;
-    let jwks = JwksServer::spawn().await;
-    let mut policy = default_policy(&fixture);
-    policy.jwks_url = jwks.url.clone();
-    fixture.attestation.ita_token = stored_token;
-
-    let report = fixture
-        .attestation
-        .verify_fresh_with_policy(
-            &ItaConfig {
-                api_key: "test-key".to_string(),
-                api_url: appraisal.url.clone(),
-                request_timeout_secs: 30,
-            },
-            &policy,
-        )
-        .await
-        .expect("fresh verification should succeed");
-
-    appraisal.finish().await;
-    jwks.finish().await;
+    let policy = default_policy(&fixture);
+    let report = verify_fresh_fixture(fixture, claims, "/appraisal/v2/attest/azure", policy).await;
 
     assert_eq!(report.quote_report_data_matches, None);
     assert_eq!(report.bundled_evidence_authenticated, Some(true));
@@ -688,15 +816,7 @@ async fn verify_fresh_authenticates_stored_azure_evidence() {
 #[tokio::test]
 async fn verify_fresh_rejects_tampered_raw_quote_against_stored_azure_evidence() {
     let mut fixture = verification_fixture("UpToDate");
-    let original_raw_quote = BASE64
-        .decode(fixture.attestation.raw_quote.as_bytes())
-        .expect("fixture raw quote should decode");
-    let evidence = Evidence::from_bytes_with_azure_runtime(
-        original_raw_quote,
-        br#"{"user-data":"cafebabe"}"#.to_vec(),
-    )
-    .expect("fixture Azure evidence should be valid");
-    fixture.attestation.evidence = evidence.to_transport_string();
+    attach_azure_runtime_evidence(&mut fixture);
     fixture.attestation.raw_quote = quote_with_report_data([0x44; 64]);
 
     let claims = azure_claims(
@@ -705,28 +825,8 @@ async fn verify_fresh_rejects_tampered_raw_quote_against_stored_azure_evidence()
         fixture.runtime_hash,
         "UpToDate",
     );
-    let stored_token = sign_token(claims.clone());
-    let appraisal = AppraisalServer::spawn("/appraisal/v2/attest/azure", sign_token(claims)).await;
-    let jwks = JwksServer::spawn().await;
-    let mut policy = default_policy(&fixture);
-    policy.jwks_url = jwks.url.clone();
-    fixture.attestation.ita_token = stored_token;
-
-    let report = fixture
-        .attestation
-        .verify_fresh_with_policy(
-            &ItaConfig {
-                api_key: "test-key".to_string(),
-                api_url: appraisal.url.clone(),
-                request_timeout_secs: 30,
-            },
-            &policy,
-        )
-        .await
-        .expect("fresh verification should return a report");
-
-    appraisal.finish().await;
-    jwks.finish().await;
+    let policy = default_policy(&fixture);
+    let report = verify_fresh_fixture(fixture, claims, "/appraisal/v2/attest/azure", policy).await;
 
     assert_eq!(report.quote_report_data_matches, None);
     assert_eq!(report.bundled_evidence_authenticated, Some(false));
@@ -900,14 +1000,7 @@ async fn verify_fresh_rejects_missing_azure_runtime_json_as_invalid_stored_evide
 
     let err = fixture
         .attestation
-        .verify_fresh_with_policy(
-            &ItaConfig {
-                api_key: "test-key".to_string(),
-                api_url: "http://127.0.0.1:1".to_string(),
-                request_timeout_secs: 5,
-            },
-            &policy,
-        )
+        .verify_fresh_with_policy(&verify_config("http://127.0.0.1:1".to_string()), &policy)
         .await
         .expect_err("missing Azure runtime JSON should be a hard error");
     jwks.finish().await;

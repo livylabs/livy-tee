@@ -7,9 +7,9 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use livy_tee::{
     binary_hash, build_id_from_hash_hex, extract_report_data, generate_and_attest,
-    generate_evidence, report_data_hash_from_token, verify_quote_with_public_values, Attestation,
-    AttestationVerificationPolicy, ExtractError, ItaConfig, Livy, PublicValues, ReportData,
-    VerifyError, REPORT_DATA_VERSION,
+    generate_evidence, unauthenticated_report_data_hash_from_token,
+    verify_quote_with_public_values, Attestation, AttestationVerificationPolicy, ExtractError,
+    ItaConfig, Livy, PublicValues, ReportData, VerifyError, REPORT_DATA_VERSION,
 };
 use sha2::{Digest, Sha512};
 
@@ -26,6 +26,15 @@ fn default_config() -> ItaConfig {
         api_key: "test-key".to_string(),
         ..ItaConfig::default()
     }
+}
+
+async fn build_mock_attestation(
+    configure: impl FnOnce(&mut livy_tee::AttestBuilder<'_>),
+) -> Attestation {
+    let livy = Livy::new("mock-key");
+    let mut builder = livy.attest();
+    configure(&mut builder);
+    builder.finalize().await.unwrap()
 }
 
 /// Build a minimal unsigned JWT: base64url(header).base64url(payload).fakesig
@@ -234,30 +243,30 @@ async fn generate_and_attest_mock_zeroes_nonces() {
 }
 
 // ===========================================================================
-// report_data_hash_from_token
+// unauthenticated_report_data_hash_from_token
 // ===========================================================================
 
 #[test]
-fn report_data_hash_from_token_invalid_jwt() {
-    let result = report_data_hash_from_token("not-a-jwt");
+fn unauthenticated_report_data_hash_from_token_invalid_jwt() {
+    let result = unauthenticated_report_data_hash_from_token("not-a-jwt");
     assert!(result.is_err());
 }
 
 #[test]
-fn report_data_hash_from_token_empty_report_data() {
+fn unauthenticated_report_data_hash_from_token_empty_report_data() {
     let jwt = fake_jwt(r#"{"tdx":{}}"#);
-    let result = report_data_hash_from_token(&jwt).unwrap();
+    let result = unauthenticated_report_data_hash_from_token(&jwt).unwrap();
     assert!(result.is_none());
 }
 
 #[test]
-fn report_data_hash_from_token_decodes_hex_claim() {
+fn unauthenticated_report_data_hash_from_token_decodes_hex_claim() {
     let expected = [0xabu8; 64];
     let jwt = fake_jwt(&format!(
         r#"{{"tdx":{{"tdx_report_data":"{}"}}}}"#,
         hex::encode(expected)
     ));
-    let result = report_data_hash_from_token(&jwt).unwrap();
+    let result = unauthenticated_report_data_hash_from_token(&jwt).unwrap();
     assert_eq!(result, Some(expected));
 }
 
@@ -267,29 +276,29 @@ fn report_data_hash_from_token_decodes_hex_claim() {
 
 #[tokio::test]
 async fn proof_via_attest_builder_mock() {
-    let livy = Livy::new("mock-key");
-    let mut builder = livy.attest();
-    builder.commit(&"test-input");
-    builder.commit(&"test-output");
-    builder.nonce(42);
-    let att = builder.finalize().await.unwrap();
+    let att = build_mock_attestation(|builder| {
+        builder.commit(&"test-input");
+        builder.commit(&"test-output");
+        builder.nonce(42);
+    })
+    .await;
 
     assert!(att.ita_token.is_empty());
     assert_eq!(att.report_data.nonce, 42);
 
     // Read back values.
-    let v1: String = att.public_values.read();
-    let v2: String = att.public_values.read();
+    let v1: String = att.public_values.read().unwrap();
+    let v2: String = att.public_values.read().unwrap();
     assert_eq!(v1, "test-input");
     assert_eq!(v2, "test-output");
 }
 
 #[tokio::test]
 async fn proof_verify_binding_mock() {
-    let livy = Livy::new("mock-key");
-    let mut builder = livy.attest();
-    builder.commit(&"correct-data");
-    let att = builder.finalize().await.unwrap();
+    let att = build_mock_attestation(|builder| {
+        builder.commit(&"correct-data");
+    })
+    .await;
 
     assert!(
         att.verify_binding().expect("verify should not error"),
@@ -299,10 +308,10 @@ async fn proof_verify_binding_mock() {
 
 #[tokio::test]
 async fn proof_verify_binding_rejects_invalid_raw_quote_base64() {
-    let livy = Livy::new("mock-key");
-    let mut builder = livy.attest();
-    builder.commit(&"correct-data");
-    let mut att = builder.finalize().await.unwrap();
+    let mut att = build_mock_attestation(|builder| {
+        builder.commit(&"correct-data");
+    })
+    .await;
     att.raw_quote = "not-base64".to_string();
 
     let err = att
@@ -314,10 +323,10 @@ async fn proof_verify_binding_rejects_invalid_raw_quote_base64() {
 
 #[tokio::test]
 async fn proof_verify_binding_rejects_invalid_runtime_data_base64() {
-    let livy = Livy::new("mock-key");
-    let mut builder = livy.attest();
-    builder.commit(&"correct-data");
-    let mut att = builder.finalize().await.unwrap();
+    let mut att = build_mock_attestation(|builder| {
+        builder.commit(&"correct-data");
+    })
+    .await;
     att.runtime_data = "not-base64".to_string();
 
     let err = att
@@ -329,10 +338,10 @@ async fn proof_verify_binding_rejects_invalid_runtime_data_base64() {
 
 #[tokio::test]
 async fn proof_verify_binding_rejects_truncated_raw_quote() {
-    let livy = Livy::new("mock-key");
-    let mut builder = livy.attest();
-    builder.commit(&"correct-data");
-    let mut att = builder.finalize().await.unwrap();
+    let mut att = build_mock_attestation(|builder| {
+        builder.commit(&"correct-data");
+    })
+    .await;
     att.raw_quote = BASE64.encode(vec![0u8; 32]);
 
     let err = att
@@ -344,10 +353,10 @@ async fn proof_verify_binding_rejects_truncated_raw_quote() {
 
 #[tokio::test]
 async fn proof_verify_mock_reports_jwt_failure() {
-    let livy = Livy::new("mock-key");
-    let mut builder = livy.attest();
-    builder.commit(&"correct-data");
-    let att = builder.finalize().await.unwrap();
+    let att = build_mock_attestation(|builder| {
+        builder.commit(&"correct-data");
+    })
+    .await;
 
     let report = att
         .verify()
@@ -374,18 +383,19 @@ async fn proof_verify_mock_reports_jwt_failure() {
 
 #[tokio::test]
 async fn proof_verify_with_policy_reports_token_failures_but_keeps_local_checks() {
-    let livy = Livy::new("mock-key");
-    let mut builder = livy.attest();
-    builder.commit(&"correct-data");
-    builder.nonce(42);
-    let att = builder.finalize().await.unwrap();
+    let att = build_mock_attestation(|builder| {
+        builder.commit(&"correct-data");
+        builder.nonce(42);
+    })
+    .await;
 
     let report = att
-        .verify_with_policy(&AttestationVerificationPolicy {
-            expected_mrtd: Some("00".repeat(48)),
-            expected_build_id: Some(att.report_data.build_id),
-            expected_nonce: Some(att.report_data.nonce),
-            ..AttestationVerificationPolicy::default()
+        .verify_with_policy(&{
+            let mut policy = AttestationVerificationPolicy::default();
+            policy.expected_mrtd = Some("00".repeat(48));
+            policy.expected_build_id = Some(att.report_data.build_id);
+            policy.expected_nonce = Some(att.report_data.nonce);
+            policy
         })
         .await
         .expect("verify_with_policy should return a report, not Err");
@@ -418,37 +428,29 @@ async fn proof_verify_with_policy_reports_token_failures_but_keeps_local_checks(
 }
 
 #[tokio::test]
-async fn proof_verify_reports_empty_raw_quote_as_quote_binding_failure() {
-    let livy = Livy::new("mock-key");
-    let mut builder = livy.attest();
-    builder.commit(&"correct-data");
-    let mut att = builder.finalize().await.unwrap();
+async fn proof_verify_rejects_empty_raw_quote_as_structurally_invalid() {
+    let mut att = build_mock_attestation(|builder| {
+        builder.commit(&"correct-data");
+    })
+    .await;
     att.raw_quote.clear();
 
-    let report = att
+    let err = att
         .verify()
         .await
-        .expect("verify should return a report, not Err");
+        .expect_err("empty raw quote should surface a structural error");
 
-    assert!(!report.jwt_signature_and_expiry_valid);
-    assert!(matches!(
-        report.token_verification_error,
-        Some(VerifyError::InvalidToken(_))
-    ));
-    assert!(!report.token_report_data_matches);
-    assert_eq!(report.quote_report_data_matches, Some(false));
-    assert!(report.runtime_data_matches_report);
-    assert!(report.public_values_bound);
-    assert!(report.require_success().is_err());
-    assert!(!report.all_passed());
+    assert!(
+        matches!(err, VerifyError::InvalidAttestation(message) if message.contains("raw_quote"))
+    );
 }
 
 #[tokio::test]
 async fn proof_verify_reports_tampered_raw_quote_as_quote_binding_failure() {
-    let livy = Livy::new("mock-key");
-    let mut builder = livy.attest();
-    builder.commit(&"correct-data");
-    let mut att = builder.finalize().await.unwrap();
+    let mut att = build_mock_attestation(|builder| {
+        builder.commit(&"correct-data");
+    })
+    .await;
 
     let mut quote = BASE64
         .decode(att.raw_quote.as_bytes())
@@ -476,11 +478,11 @@ async fn proof_verify_reports_tampered_raw_quote_as_quote_binding_failure() {
 
 #[tokio::test]
 async fn proof_payload_hash_hex_mock() {
-    let livy = Livy::new("mock-key");
-    let mut builder = livy.attest();
-    builder.commit(&"in");
-    builder.commit(&"out");
-    let att = builder.finalize().await.unwrap();
+    let att = build_mock_attestation(|builder| {
+        builder.commit(&"in");
+        builder.commit(&"out");
+    })
+    .await;
 
     let hex_str = att.payload_hash_hex();
     assert_eq!(hex_str.len(), 64);
@@ -500,10 +502,10 @@ fn verify_quote_reports_invalid_base64_input() {
 
 #[tokio::test]
 async fn verify_rejects_malformed_attestation_runtime_data_as_hard_error() {
-    let livy = Livy::new("mock-key");
-    let mut builder = livy.attest();
-    builder.commit(&"correct-data");
-    let mut att = builder.finalize().await.unwrap();
+    let mut att = build_mock_attestation(|builder| {
+        builder.commit(&"correct-data");
+    })
+    .await;
     att.runtime_data = "not-base64".to_string();
 
     let err = att
@@ -516,11 +518,11 @@ async fn verify_rejects_malformed_attestation_runtime_data_as_hard_error() {
 
 #[tokio::test]
 async fn verify_quote_binding_chain_mock() {
-    let livy = Livy::new("mock-key");
-    let mut builder = livy.attest();
-    builder.commit(&"chain-input");
-    builder.commit(&"chain-output");
-    let att = builder.finalize().await.unwrap();
+    let att = build_mock_attestation(|builder| {
+        builder.commit(&"chain-input");
+        builder.commit(&"chain-output");
+    })
+    .await;
 
     let ok = verify_quote_with_public_values(
         &att.raw_quote,
@@ -548,15 +550,14 @@ async fn verify_quote_binding_chain_mock() {
 
 #[tokio::test]
 async fn attestation_json_roundtrip_preserves_public_artifact_and_resets_cursor() {
-    let livy = Livy::new("mock-key");
-    let mut builder = livy.attest();
-    builder.commit(&"serde-input");
-    builder.commit_hashed(&vec![1u8, 2, 3, 4]);
-    builder.nonce(42);
+    let att = build_mock_attestation(|builder| {
+        builder.commit(&"serde-input");
+        builder.commit_hashed(&vec![1u8, 2, 3, 4]);
+        builder.nonce(42);
+    })
+    .await;
 
-    let att = builder.finalize().await.unwrap();
-
-    let first_value: String = att.public_values.read();
+    let first_value: String = att.public_values.read().unwrap();
     assert_eq!(first_value, "serde-input");
 
     let encoded = serde_json::to_string(&att).expect("attestation should serialize");
@@ -580,7 +581,7 @@ async fn attestation_json_roundtrip_preserves_public_artifact_and_resets_cursor(
     );
     assert_eq!(decoded.report_data, att.report_data);
 
-    let roundtrip_first: String = decoded.public_values.read();
+    let roundtrip_first: String = decoded.public_values.read().unwrap();
     assert_eq!(roundtrip_first, "serde-input");
     let roundtrip_hashed = decoded.public_values.read_raw().unwrap();
     assert_eq!(roundtrip_hashed.len(), 32);

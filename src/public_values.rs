@@ -33,10 +33,7 @@ impl<'de> Deserialize<'de> for PublicValues {
         D: Deserializer<'de>,
     {
         let encoded = String::deserialize(deserializer)?;
-        let bytes = BASE64
-            .decode(encoded.trim())
-            .map_err(|e| serde::de::Error::custom(PublicValuesError::Base64(e.to_string())))?;
-        Self::try_from_bytes(bytes).map_err(serde::de::Error::custom)
+        Self::from_base64(&encoded).map_err(serde::de::Error::custom)
     }
 }
 
@@ -108,36 +105,22 @@ impl PublicValues {
         self.buffer.extend_from_slice(bytes);
     }
 
-    /// Read the next JSON-serialized entry from a trusted, validated buffer.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer is exhausted, malformed, or the next payload is not
-    /// valid JSON for `T`.
-    ///
-    /// Use [`try_read`](Self::try_read) in verifier-facing code and for any
-    /// buffer that did not come directly from local `commit` calls or a
-    /// validating constructor such as [`from_base64`](Self::from_base64),
-    /// [`try_from_bytes`](Self::try_from_bytes), or `serde` deserialization.
-    /// Entries written with [`commit_raw`](Self::commit_raw) or higher-level
-    /// hashed/raw helpers should be consumed with [`read_raw`](Self::read_raw),
-    /// not `read::<T>()`.
-    pub fn read<T: DeserializeOwned>(&self) -> T {
-        self.try_read()
-            .expect("PublicValues::read: failed to read next value")
-    }
-
-    /// Try to read the next JSON-serialized entry as `T`.
+    /// Read the next JSON-serialized entry.
     ///
     /// Use this for entries created with [`commit`](Self::commit). Raw entries
     /// created with [`commit_raw`](Self::commit_raw) are not deserialized and
     /// should be consumed with [`read_raw`](Self::read_raw).
-    pub fn try_read<T: DeserializeOwned>(&self) -> Result<T, PublicValuesError> {
+    pub fn read<T: DeserializeOwned>(&self) -> Result<T, PublicValuesError> {
         let (start, end) = self.next_entry_bounds()?;
         let value = serde_json::from_slice(&self.buffer[start..end])
             .map_err(|e| PublicValuesError::Deserialize(e.to_string()))?;
         self.read_cursor.set(end);
         Ok(value)
+    }
+
+    /// Backward-compatible alias for [`read`](Self::read).
+    pub fn try_read<T: DeserializeOwned>(&self) -> Result<T, PublicValuesError> {
+        self.read()
     }
 
     /// Read the exact payload bytes for the next entry without deserializing.
@@ -395,9 +378,9 @@ mod tests {
         pv.commit(&[1u8, 2, 3, 4]);
 
         let reader = PublicValues::from_bytes(pv.into_bytes());
-        assert_eq!(reader.read::<u64>(), 42);
-        assert_eq!(reader.read::<String>(), "hello world");
-        assert_eq!(reader.read::<Vec<u8>>(), vec![1, 2, 3, 4]);
+        assert_eq!(reader.read::<u64>().unwrap(), 42);
+        assert_eq!(reader.read::<String>().unwrap(), "hello world");
+        assert_eq!(reader.read::<Vec<u8>>().unwrap(), vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -455,7 +438,7 @@ mod tests {
     #[test]
     fn read_exhausted_returns_error() {
         let pv = PublicValues::new();
-        assert!(pv.try_read::<u32>().is_err());
+        assert_eq!(pv.read::<u32>(), Err(PublicValuesError::BufferExhausted));
     }
 
     #[test]
@@ -466,8 +449,8 @@ mod tests {
 
         let b64 = pv.to_base64();
         let restored = PublicValues::from_base64(&b64).unwrap();
-        assert_eq!(restored.read::<u64>(), 99);
-        assert_eq!(restored.read::<String>(), "b64 test");
+        assert_eq!(restored.read::<u64>().unwrap(), 99);
+        assert_eq!(restored.read::<String>().unwrap(), "b64 test");
         assert_eq!(pv.commitment_hash(), restored.commitment_hash());
     }
 
@@ -487,11 +470,11 @@ mod tests {
         pv.commit(&7u32);
 
         let reader = PublicValues::from_bytes(pv.into_bytes());
-        assert_eq!(reader.read::<u32>(), 7);
+        assert_eq!(reader.read::<u32>().unwrap(), 7);
         assert!(reader.try_read::<u32>().is_err());
 
         reader.reset_cursor();
-        assert_eq!(reader.read::<u32>(), 7);
+        assert_eq!(reader.read::<u32>().unwrap(), 7);
     }
 
     #[test]
@@ -572,11 +555,23 @@ mod tests {
         values.commit(&"second");
 
         let _ = values.entries_raw();
-        let first: String = values.read();
-        let second: String = values.read();
+        let first: String = values.read().unwrap();
+        let second: String = values.read().unwrap();
 
         assert_eq!(first, "first");
         assert_eq!(second, "second");
+    }
+
+    #[test]
+    fn read_preserves_cursor_on_deserialize_error() {
+        let mut values = PublicValues::new();
+        values.commit(&7u32);
+
+        assert!(matches!(
+            values.read::<String>(),
+            Err(PublicValuesError::Deserialize(_))
+        ));
+        assert_eq!(values.read::<u32>().unwrap(), 7);
     }
 
     #[test]
@@ -604,15 +599,23 @@ mod tests {
     fn from_base64_rejects_malformed_tail() {
         let (values, tail_offset) = malformed_with_truncated_payload_tail();
         let encoded = values.to_base64();
+        let expected = PublicValuesError::TruncatedEntryPayload {
+            offset: tail_offset,
+            declared_len: 3,
+            remaining: 1,
+        };
 
+        assert_eq!(PublicValues::from_base64(&encoded).unwrap_err(), expected);
         assert_eq!(
-            PublicValues::from_base64(&encoded).unwrap_err(),
-            PublicValuesError::TruncatedEntryPayload {
-                offset: tail_offset,
-                declared_len: 3,
-                remaining: 1,
-            }
+            PublicValues::try_from_bytes(values.into_bytes()).unwrap_err(),
+            expected
         );
+
+        let deserialization_error =
+            serde_json::from_str::<PublicValues>(&format!("\"{encoded}\"")).unwrap_err();
+        assert!(deserialization_error
+            .to_string()
+            .contains("public values entry at offset"));
     }
 
     #[test]
@@ -695,12 +698,12 @@ mod tests {
     }
 
     #[test]
-    fn try_read_and_read_raw_report_malformed_tail_instead_of_exhaustion() {
+    fn read_and_read_raw_report_malformed_tail_instead_of_exhaustion() {
         let (values, tail_offset) = malformed_with_truncated_payload_tail();
 
-        assert_eq!(values.try_read::<String>().unwrap(), "ok");
+        assert_eq!(values.read::<String>().unwrap(), "ok");
         assert_eq!(
-            values.try_read::<String>(),
+            values.read::<String>(),
             Err(PublicValuesError::TruncatedEntryPayload {
                 offset: tail_offset,
                 declared_len: 3,
@@ -709,7 +712,7 @@ mod tests {
         );
 
         values.reset_cursor();
-        assert_eq!(values.try_read::<String>().unwrap(), "ok");
+        assert_eq!(values.read::<String>().unwrap(), "ok");
         assert_eq!(
             values.read_raw(),
             Err(PublicValuesError::TruncatedEntryPayload {
