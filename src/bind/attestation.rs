@@ -20,6 +20,7 @@ use crate::{
     },
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// Policy for full [`Attestation`] verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +31,10 @@ pub struct AttestationVerificationPolicy {
     pub request_timeout_secs: u64,
     /// Accepted ITA TCB status values. Defaults to only `"UpToDate"`.
     pub accepted_tcb_statuses: Vec<String>,
+    /// Optional exact advisory-ID set expected from the signed ITA token.
+    ///
+    /// Matching is case-insensitive and order-insensitive.
+    pub expected_advisory_ids: Option<Vec<String>>,
     /// Optional expected MRTD, as a 96-character hex string.
     pub expected_mrtd: Option<String>,
     /// Optional expected build ID from [`ReportData::build_id`].
@@ -44,6 +49,7 @@ impl Default for AttestationVerificationPolicy {
             jwks_url: DEFAULT_JWKS_URL.to_string(),
             request_timeout_secs: 30,
             accepted_tcb_statuses: vec!["UpToDate".to_string()],
+            expected_advisory_ids: None,
             expected_mrtd: None,
             expected_build_id: None,
             expected_nonce: None,
@@ -93,14 +99,20 @@ pub struct AttestationVerification {
     pub tcb_status_matches_token: bool,
     /// The public `tcb_date` field matches the signed token claim.
     pub tcb_date_matches_token: bool,
+    /// The public advisory-ID list matches the signed token claim.
+    pub advisory_ids_match_token: bool,
     /// The signed token TCB status is accepted by the verification policy.
     pub tcb_status_allowed: bool,
     /// The TCB status extracted from the verified token.
     pub tcb_status: String,
     /// The optional TCB date extracted from the verified token.
     pub tcb_date: Option<String>,
+    /// The advisory IDs extracted from the verified token.
+    pub advisory_ids: Vec<String>,
     /// The MRTD extracted from the verified token.
     pub mrtd: String,
+    /// Result of comparing the token advisory IDs to the policy's expected set.
+    pub expected_advisory_ids_matches: Option<bool>,
     /// Result of comparing the token MRTD to the policy's expected MRTD.
     pub expected_mrtd_matches: Option<bool>,
     /// Result of comparing the report build ID to the policy's expected build ID.
@@ -129,7 +141,9 @@ impl AttestationVerification {
             && self.mrtd_matches_token
             && self.tcb_status_matches_token
             && self.tcb_date_matches_token
+            && self.advisory_ids_match_token
             && self.tcb_status_allowed
+            && self.expected_advisory_ids_matches.unwrap_or(true)
             && self.expected_mrtd_matches.unwrap_or(true)
             && self.expected_build_id_matches.unwrap_or(true)
             && self.expected_nonce_matches.unwrap_or(true)
@@ -277,6 +291,7 @@ impl<'a> AttestBuilder<'a> {
             mrtd: attested.mrtd,
             tcb_status: attested.tcb_status,
             tcb_date: attested.tcb_date,
+            advisory_ids: attested.advisory_ids,
             evidence: attested.evidence.to_transport_string(),
             raw_quote: BASE64.encode(attested.evidence.raw()),
             runtime_data: BASE64.encode(attested.runtime_data),
@@ -339,6 +354,9 @@ pub struct Attestation {
     pub tcb_status: String,
     /// Optional TCB assessment date from Intel Trust Authority claims.
     pub tcb_date: Option<String>,
+    /// Advisory IDs reported by Intel Trust Authority.
+    #[serde(default)]
+    pub advisory_ids: Vec<String>,
     /// Portable low-level evidence artifact.
     ///
     /// This is the self-contained evidence transport string produced by
@@ -529,12 +547,23 @@ impl Attestation {
                 .as_ref()
                 .is_some_and(|t| self.tcb_status == t.tcb_status),
             tcb_date_matches_token: token.as_ref().is_some_and(|t| self.tcb_date == t.tcb_date),
+            advisory_ids_match_token: token
+                .as_ref()
+                .is_some_and(|t| advisory_id_sets_match(&self.advisory_ids, &t.advisory_ids)),
             tcb_status_allowed,
             tcb_status: token
                 .as_ref()
                 .map_or_else(String::new, |t| t.tcb_status.clone()),
             tcb_date: token.as_ref().and_then(|t| t.tcb_date.clone()),
+            advisory_ids: token
+                .as_ref()
+                .map_or_else(Vec::new, |t| t.advisory_ids.clone()),
             mrtd: token.as_ref().map_or_else(String::new, |t| t.mrtd.clone()),
+            expected_advisory_ids_matches: policy.expected_advisory_ids.as_ref().map(|expected| {
+                token
+                    .as_ref()
+                    .is_some_and(|t| advisory_id_sets_match(expected, &t.advisory_ids))
+            }),
             expected_mrtd_matches: policy.expected_mrtd.as_ref().map(|expected| {
                 token
                     .as_ref()
@@ -589,7 +618,8 @@ impl Attestation {
             raw_quote_matches_evidence
                 && fresh.mrtd.eq_ignore_ascii_case(&self.mrtd)
                 && fresh.tcb_status == self.tcb_status
-                && fresh.tcb_date == self.tcb_date,
+                && fresh.tcb_date == self.tcb_date
+                && advisory_id_sets_match(&fresh.advisory_ids, &self.advisory_ids),
         );
 
         Ok(report)
@@ -649,4 +679,16 @@ struct VerificationContext {
     report: AttestationVerification,
     runtime_data: [u8; 64],
     token_requires_azure_runtime_evidence: bool,
+}
+
+fn advisory_id_sets_match(left: &[String], right: &[String]) -> bool {
+    normalize_advisory_ids(left) == normalize_advisory_ids(right)
+}
+
+fn normalize_advisory_ids(values: &[String]) -> BTreeSet<String> {
+    values
+        .iter()
+        .map(|value| value.trim().to_ascii_uppercase())
+        .filter(|value| !value.is_empty())
+        .collect()
 }

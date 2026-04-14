@@ -56,6 +56,8 @@ pub struct AttestedEvidence {
     pub tcb_status: String,
     /// Optional TCB evaluation date (RFC3339 date-time from ITA token claims).
     pub tcb_date: Option<String>,
+    /// Advisory IDs reported by Intel Trust Authority. Empty in `mock-tee` mode.
+    pub advisory_ids: Vec<String>,
     /// The original 64-byte runtime_data (our ReportData struct).
     pub runtime_data: [u8; 64],
     /// Decoded verifier nonce value bytes. Zeroed in `mock-tee` mode.
@@ -135,6 +137,7 @@ pub async fn generate_and_attest(
             mrtd: String::new(),
             tcb_status: String::new(),
             tcb_date: None,
+            advisory_ids: Vec::new(),
             runtime_data: *user_data,
             nonce_val,
             nonce_iat,
@@ -151,6 +154,7 @@ pub async fn generate_and_attest(
             mrtd: claims.mrtd,
             tcb_status: claims.tcb_status,
             tcb_date: claims.tcb_date,
+            advisory_ids: claims.advisory_ids,
             runtime_data: *user_data,
             nonce_val,
             nonce_iat,

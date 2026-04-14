@@ -236,6 +236,7 @@ ITA_API_KEY=<your-key> ./your-binary
 | `mrtd` | Hex-encoded 48-byte measurement of the TEE binary. Anyone who builds the same binary can compute and compare this independently. |
 | `tcb_status` | `"UpToDate"` — fully patched. `"OutOfDate"` — firmware update available (quote still valid). `"Revoked"` — hardware revoked. |
 | `tcb_date` | Optional RFC3339 date from ITA token claims indicating the TCB assessment date. |
+| `advisory_ids` | Advisory IDs reported by Intel Trust Authority for this appraisal. Useful when an `OutOfDate` TCB state is temporarily accepted only for a known advisory set. |
 | `evidence` | Portable evidence transport string. On Azure this preserves the Azure runtime JSON needed for fresh ITA reappraisal. |
 | `raw_quote` | Base64-encoded raw DCAP quote (~8 KB). Convenience field extracted from `evidence`. |
 | `runtime_data` | Base64-encoded original 64-byte ReportData struct (our structured payload sent to ITA). |
@@ -292,8 +293,8 @@ assert!(report.all_passed());
 ```
 
 The default full-attestation policy requires `tcb_status == "UpToDate"`. Use
-`AttestationVerificationPolicy` to pin an expected MRTD, build ID, or application
-nonce, or to intentionally accept additional TCB statuses.
+`AttestationVerificationPolicy` to pin an expected MRTD, build ID, application
+nonce, or exact advisory-ID set, or to intentionally accept additional TCB statuses.
 
 ```rust
 use livy_tee::{AttestationVerificationPolicy, binary_hash, build_id_from_hash_hex};
@@ -313,6 +314,24 @@ report.require_success().map_err(|report| {
         report.bundled_evidence_authenticated
     )
 })?;
+```
+
+For GCP or any environment that currently appraises as `OutOfDate`, you can
+allow that state only for an exact known advisory-ID set:
+
+```rust
+let mut policy = AttestationVerificationPolicy::default();
+policy.accepted_tcb_statuses = vec!["OutOfDate".to_string()];
+policy.expected_advisory_ids = Some(vec![
+    "INTEL-SA-00828".to_string(),
+    "INTEL-SA-00950".to_string(),
+    "INTEL-SA-01046".to_string(),
+    "INTEL-SA-01073".to_string(),
+]);
+
+let report = attestation.verify_with_policy(&policy).await?;
+report.require_success()?;
+assert_eq!(report.advisory_ids, policy.expected_advisory_ids.clone().unwrap());
 ```
 
 For Azure CVMs, `verify_fresh_with_policy()` is the stricter API because it

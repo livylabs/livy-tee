@@ -152,6 +152,8 @@ pub struct VerifiedClaims {
     pub tcb_status: String,
     /// Optional TCB assessment date from ITA token claims.
     pub tcb_date: Option<String>,
+    /// Advisory IDs reported by Intel Trust Authority for this appraisal.
+    pub advisory_ids: Vec<String>,
     /// The full raw JWT for storage or further inspection.
     pub raw_token: String,
 }
@@ -169,6 +171,8 @@ pub(crate) struct VerifiedTokenClaims {
     pub tcb_status: String,
     /// Optional TCB assessment date from ITA token claims.
     pub tcb_date: Option<String>,
+    /// Advisory IDs reported by Intel Trust Authority for this appraisal.
+    pub advisory_ids: Vec<String>,
 }
 
 impl VerifiedTokenClaims {
@@ -211,6 +215,8 @@ struct TdxNestedClaims {
     #[serde(default)]
     attester_tcb_date: String,
     #[serde(default)]
+    attester_advisory_ids: Vec<String>,
+    #[serde(default)]
     attester_held_data: String,
     #[serde(default)]
     attester_runtime_data: serde_json::Value,
@@ -236,6 +242,8 @@ struct ItaClaims {
     attester_tcb_status: String,
     #[serde(default)]
     attester_tcb_date: String,
+    #[serde(default)]
+    attester_advisory_ids: Vec<String>,
     #[serde(default)]
     attester_held_data: String,
     #[serde(default)]
@@ -269,6 +277,14 @@ impl ItaClaims {
             None
         } else {
             Some(v)
+        }
+    }
+
+    fn attester_advisory_ids(&self) -> &[String] {
+        if !self.tdx.attester_advisory_ids.is_empty() {
+            &self.tdx.attester_advisory_ids
+        } else {
+            &self.attester_advisory_ids
         }
     }
 
@@ -574,6 +590,7 @@ pub async fn verify_evidence(
         runtime_data: *runtime_data,
         tcb_status: verified.tcb_status,
         tcb_date: verified.tcb_date,
+        advisory_ids: verified.advisory_ids,
         raw_token: jwt,
     })
 }
@@ -623,6 +640,7 @@ fn parse_verified_claims(claims: ItaClaims) -> Result<VerifiedTokenClaims, Verif
         binding,
         tcb_status: claims.attester_tcb_status().to_string(),
         tcb_date: claims.attester_tcb_date().map(ToOwned::to_owned),
+        advisory_ids: claims.attester_advisory_ids().to_vec(),
     })
 }
 

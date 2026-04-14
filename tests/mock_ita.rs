@@ -523,6 +523,7 @@ async fn attestation_json_roundtrip_preserves_public_artifact_and_resets_cursor(
     assert_eq!(decoded.mrtd, att.mrtd);
     assert_eq!(decoded.tcb_status, att.tcb_status);
     assert_eq!(decoded.tcb_date, att.tcb_date);
+    assert_eq!(decoded.advisory_ids, att.advisory_ids);
     assert_eq!(decoded.evidence, att.evidence);
     assert_eq!(decoded.raw_quote, att.raw_quote);
     assert_eq!(decoded.runtime_data, att.runtime_data);

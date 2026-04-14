@@ -23,6 +23,12 @@ const TEST_JWK_KID: &str = "livy-tee-test-rs256";
 const TEST_JWK_N: &str = "vpr_cZm-XbZoRuKrCLn9zUf-auv6PZlQFKn80upja-ylEknyPRo4hnDbQL8DdijlQM4XtNMghWhHa0Xgl2--I_7oLlGMNnOUsbVcdIkTAF_Jf0y-0dLMtxLlfrZ45uxpAOxvGxvuoS4D7E_5AfX2iQwt7Zboh38XoR7vcmXCDqVPe5f7MybVM7BKkb9golLDTdtXBVhz-k1s1GNFA2zMKTVw3s9Ubn2--Dety9jiIieBCNyDES7quPQCtVTM2q5CPZKLkGQstXs0IezG4c5jObRE5uwT_wWo5qP1XjQYa6twFqgN5a1Pz7QJawEImOPfW_-bcogCsOzg_cdhYHBqsQ";
 const TEST_JWK_E: &str = "AQAB";
 const TEST_TCB_DATE: &str = "2026-02-11T00:00:00Z";
+const TEST_GCP_ADVISORY_IDS: [&str; 4] = [
+    "INTEL-SA-00828",
+    "INTEL-SA-00950",
+    "INTEL-SA-01046",
+    "INTEL-SA-01073",
+];
 const TEST_RSA_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC+mv9xmb5dtmhG
 4qsIuf3NR/5q6/o9mVAUqfzS6mNr7KUSSfI9GjiGcNtAvwN2KOVAzhe00yCFaEdr
@@ -210,6 +216,7 @@ fn verification_fixture(tcb_status: &str) -> VerificationFixture {
             mrtd,
             tcb_status: tcb_status.to_string(),
             tcb_date: Some(TEST_TCB_DATE.to_string()),
+            advisory_ids: Vec::new(),
             evidence: raw_quote.clone(),
             raw_quote,
             runtime_data: BASE64.encode(runtime_data),
@@ -259,6 +266,7 @@ fn standard_claims(
             "tdx_report_data": hex::encode(report_data_claim),
             "attester_tcb_status": tcb_status,
             "attester_tcb_date": TEST_TCB_DATE,
+            "attester_advisory_ids": [],
         }
     }))
 }
@@ -276,6 +284,7 @@ fn azure_claims(
             "tdx_report_data": hex::encode([0xa5u8; 64]),
             "attester_tcb_status": tcb_status,
             "attester_tcb_date": TEST_TCB_DATE,
+            "attester_advisory_ids": [],
             "attester_held_data": BASE64.encode(held_data),
             "attester_runtime_data": {
                 "user-data": hex::encode(user_data_hash),
@@ -289,6 +298,7 @@ fn default_policy(fixture: &VerificationFixture) -> AttestationVerificationPolic
         jwks_url: String::new(),
         request_timeout_secs: 5,
         accepted_tcb_statuses: vec!["UpToDate".to_string()],
+        expected_advisory_ids: None,
         expected_mrtd: Some(fixture.mrtd.clone()),
         expected_build_id: Some(fixture.attestation.report_data.build_id),
         expected_nonce: Some(fixture.attestation.report_data.nonce),
@@ -449,6 +459,63 @@ async fn verify_with_policy_can_allow_out_of_date_tcb() {
     assert!(report.tcb_status_matches_token);
     assert!(report.tcb_status_allowed);
     assert!(report.all_passed());
+}
+
+#[tokio::test]
+async fn verify_with_policy_can_allow_out_of_date_tcb_for_expected_advisory_set() {
+    let mut fixture = verification_fixture("OutOfDate");
+    fixture.attestation.advisory_ids = TEST_GCP_ADVISORY_IDS
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+    let mut claims = standard_claims(&fixture, fixture.runtime_hash, "OutOfDate");
+    claims["tdx"]["attester_advisory_ids"] = json!(TEST_GCP_ADVISORY_IDS);
+    let mut policy = default_policy(&fixture);
+    policy.accepted_tcb_statuses = vec!["OutOfDate".to_string()];
+    policy.expected_advisory_ids = Some(vec![
+        "intel-sa-01073".to_string(),
+        "INTEL-SA-00950".to_string(),
+        "intel-sa-00828".to_string(),
+        "INTEL-SA-01046".to_string(),
+    ]);
+    let report = verify_fixture(fixture, claims, policy).await;
+
+    assert!(report.jwt_signature_and_expiry_valid);
+    assert!(report.tcb_status_allowed);
+    assert_eq!(
+        report.advisory_ids,
+        TEST_GCP_ADVISORY_IDS
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(report.expected_advisory_ids_matches, Some(true));
+    assert!(report.all_passed());
+}
+
+#[tokio::test]
+async fn verify_with_policy_rejects_out_of_date_tcb_when_advisory_set_differs() {
+    let mut fixture = verification_fixture("OutOfDate");
+    fixture.attestation.advisory_ids = TEST_GCP_ADVISORY_IDS
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+    let mut claims = standard_claims(&fixture, fixture.runtime_hash, "OutOfDate");
+    claims["tdx"]["attester_advisory_ids"] = json!(TEST_GCP_ADVISORY_IDS);
+    let mut policy = default_policy(&fixture);
+    policy.accepted_tcb_statuses = vec!["OutOfDate".to_string()];
+    policy.expected_advisory_ids = Some(vec![
+        "INTEL-SA-00828".to_string(),
+        "INTEL-SA-00950".to_string(),
+        "INTEL-SA-01046".to_string(),
+    ]);
+    let report = verify_fixture(fixture, claims, policy).await;
+
+    assert!(report.jwt_signature_and_expiry_valid);
+    assert!(report.advisory_ids_match_token);
+    assert!(report.tcb_status_allowed);
+    assert_eq!(report.expected_advisory_ids_matches, Some(false));
+    assert!(!report.all_passed());
 }
 
 #[tokio::test]
