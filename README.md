@@ -167,6 +167,22 @@ the VM user must have TPM device access, usually via the `tss` group. Azure atte
 uses Intel Trust Authority's `/appraisal/v2/attest/azure` flow, which expects Azure
 runtime JSON + user data. The ITA token is authoritative for TCB/MRTD on Azure.
 
+On non-Azure Linux TDX guests such as GCP, the TSM path needs local permissions
+for unprivileged quote generation. `livy-tee` writes to
+`/sys/kernel/config/tsm/report/.../inblob` and reads `outblob`, and the VM may
+also expose `/dev/tdx_guest` as `root:root`. If developers should run the
+program without `sudo`, the practical setup is:
+
+- create a dedicated group such as `tdx-attest`
+- grant `/dev/tdx_guest` to that group with a udev rule
+- reapply group ownership and write permissions to `/sys/kernel/config/tsm/report`
+  at boot with a small systemd unit
+
+This keeps the application process unprivileged while still allowing local TDX
+quote generation. A stricter production alternative is a tiny privileged quote
+broker service on a Unix socket, with the main application remaining fully
+unprivileged.
+
 ---
 
 ## Quick start — attesting any program
