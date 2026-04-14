@@ -163,42 +163,16 @@ pub struct UnauthenticatedAppraisalClaims {
     pub raw_token: String,
 }
 
-/// Claims extracted from an ITA token after JWT signature and expiry validation.
 #[derive(Debug, Clone)]
-pub(crate) struct VerifiedTokenClaims {
-    /// MRTD as a hex string (48 bytes = 96 hex chars).
-    pub mrtd: String,
-    /// Raw 64-byte TDX report data claim from the token.
-    pub report_data: [u8; 64],
-    /// Token binding material used to prove this token belongs to the attestation.
-    pub binding: VerifiedTokenBinding,
-    /// TCB status string from ITA.
-    pub tcb_status: String,
-    /// Optional TCB assessment date from ITA token claims.
-    pub tcb_date: Option<String>,
-    /// Advisory IDs reported by Intel Trust Authority for this appraisal.
-    pub advisory_ids: Vec<String>,
+struct AppraisalClaimsCore {
+    mrtd: String,
+    report_data: [u8; 64],
+    tcb_status: String,
+    tcb_date: Option<String>,
+    advisory_ids: Vec<String>,
 }
 
-impl VerifiedTokenClaims {
-    pub(crate) fn binding_matches(
-        &self,
-        runtime_data: &[u8; 64],
-        expected_runtime_hash: &[u8; 64],
-    ) -> bool {
-        match &self.binding {
-            VerifiedTokenBinding::StandardReportData => self.report_data == *expected_runtime_hash,
-            VerifiedTokenBinding::AzureRuntime {
-                held_data,
-                user_data_hash,
-            } => held_data == runtime_data && user_data_hash == expected_runtime_hash,
-        }
-    }
-
-    pub(crate) fn supports_offline_quote_report_data_binding(&self) -> bool {
-        matches!(self.binding, VerifiedTokenBinding::StandardReportData)
-    }
-
+impl AppraisalClaimsCore {
     fn into_unauthenticated_appraisal(
         self,
         runtime_data: [u8; 64],
@@ -216,6 +190,61 @@ impl VerifiedTokenClaims {
     }
 }
 
+/// Claims extracted from an ITA token after JWT signature and expiry validation.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedTokenClaims {
+    claims: AppraisalClaimsCore,
+    /// Token binding material used to prove this token belongs to the attestation.
+    pub binding: VerifiedTokenBinding,
+}
+
+impl VerifiedTokenClaims {
+    pub(crate) fn mrtd(&self) -> &str {
+        &self.claims.mrtd
+    }
+
+    pub(crate) fn tcb_status(&self) -> &str {
+        &self.claims.tcb_status
+    }
+
+    pub(crate) fn tcb_date(&self) -> Option<&str> {
+        self.claims.tcb_date.as_deref()
+    }
+
+    pub(crate) fn advisory_ids(&self) -> &[String] {
+        &self.claims.advisory_ids
+    }
+
+    pub(crate) fn binding_matches(
+        &self,
+        runtime_data: &[u8; 64],
+        expected_runtime_hash: &[u8; 64],
+    ) -> bool {
+        match &self.binding {
+            VerifiedTokenBinding::StandardReportData => {
+                self.claims.report_data == *expected_runtime_hash
+            }
+            VerifiedTokenBinding::AzureRuntime {
+                held_data,
+                user_data_hash,
+            } => held_data == runtime_data && user_data_hash == expected_runtime_hash,
+        }
+    }
+
+    pub(crate) fn supports_offline_quote_report_data_binding(&self) -> bool {
+        matches!(self.binding, VerifiedTokenBinding::StandardReportData)
+    }
+
+    fn into_unauthenticated_appraisal(
+        self,
+        runtime_data: [u8; 64],
+        raw_token: String,
+    ) -> UnauthenticatedAppraisalClaims {
+        self.claims
+            .into_unauthenticated_appraisal(runtime_data, raw_token)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum VerifiedTokenBinding {
     StandardReportData,
@@ -226,7 +255,7 @@ pub(crate) enum VerifiedTokenBinding {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
-struct TdxNestedClaims {
+struct TdxClaimFields {
     #[serde(default)]
     tdx_mrtd: String,
     #[serde(default)]
@@ -254,21 +283,9 @@ struct ItaClaims {
     #[serde(default)]
     appraisal: AppraisalClaims,
     #[serde(default)]
-    tdx: TdxNestedClaims,
-    #[serde(default)]
-    tdx_mrtd: String,
-    #[serde(default)]
-    tdx_report_data: String,
-    #[serde(default)]
-    attester_tcb_status: String,
-    #[serde(default)]
-    attester_tcb_date: String,
-    #[serde(default)]
-    attester_advisory_ids: Vec<String>,
-    #[serde(default)]
-    attester_held_data: String,
-    #[serde(default)]
-    attester_runtime_data: serde_json::Value,
+    tdx: TdxClaimFields,
+    #[serde(flatten)]
+    flat_tdx: TdxClaimFields,
     #[serde(default)]
     #[allow(dead_code)]
     exp: Option<u64>,
@@ -291,41 +308,37 @@ impl ItaClaims {
         value.trim()
     }
 
-    fn nested_or_flat_str<'a>(nested: &'a str, flat: &'a str) -> &'a str {
-        if !nested.is_empty() {
-            nested
-        } else {
-            flat
-        }
-    }
-
     fn appraisal_method(&self) -> &str {
         Self::trimmed(&self.appraisal.method)
     }
 
+    fn nested_or_flat_fields<'a, T, F>(&'a self, get: F) -> &'a T
+    where
+        T: Default + PartialEq,
+        F: Fn(&'a TdxClaimFields) -> &'a T,
+    {
+        let nested = get(&self.tdx);
+        if nested != &T::default() {
+            nested
+        } else {
+            get(&self.flat_tdx)
+        }
+    }
+
     fn tdx_mrtd(&self) -> &str {
-        Self::trimmed(Self::nested_or_flat_str(&self.tdx.tdx_mrtd, &self.tdx_mrtd))
+        Self::trimmed(self.nested_or_flat_fields(|claims| &claims.tdx_mrtd))
     }
 
     fn tdx_report_data(&self) -> &str {
-        Self::trimmed(Self::nested_or_flat_str(
-            &self.tdx.tdx_report_data,
-            &self.tdx_report_data,
-        ))
+        Self::trimmed(self.nested_or_flat_fields(|claims| &claims.tdx_report_data))
     }
 
     fn attester_tcb_status(&self) -> &str {
-        Self::trimmed(Self::nested_or_flat_str(
-            &self.tdx.attester_tcb_status,
-            &self.attester_tcb_status,
-        ))
+        Self::trimmed(self.nested_or_flat_fields(|claims| &claims.attester_tcb_status))
     }
 
     fn attester_tcb_date(&self) -> Option<&str> {
-        let v = Self::trimmed(Self::nested_or_flat_str(
-            &self.tdx.attester_tcb_date,
-            &self.attester_tcb_date,
-        ));
+        let v = Self::trimmed(self.nested_or_flat_fields(|claims| &claims.attester_tcb_date));
         if v.is_empty() {
             None
         } else {
@@ -334,18 +347,11 @@ impl ItaClaims {
     }
 
     fn attester_advisory_ids(&self) -> &[String] {
-        if !self.tdx.attester_advisory_ids.is_empty() {
-            &self.tdx.attester_advisory_ids
-        } else {
-            &self.attester_advisory_ids
-        }
+        self.nested_or_flat_fields(|claims| &claims.attester_advisory_ids)
     }
 
     fn attester_held_data(&self) -> &str {
-        Self::trimmed(Self::nested_or_flat_str(
-            &self.tdx.attester_held_data,
-            &self.attester_held_data,
-        ))
+        Self::trimmed(self.nested_or_flat_fields(|claims| &claims.attester_held_data))
     }
 
     fn attester_runtime_user_data(&self) -> Option<&str> {
@@ -354,7 +360,8 @@ impl ItaClaims {
             .get("user-data")
             .and_then(serde_json::Value::as_str)
             .or_else(|| {
-                self.attester_runtime_data
+                self.flat_tdx
+                    .attester_runtime_data
                     .get("user-data")
                     .and_then(serde_json::Value::as_str)
             })
@@ -743,12 +750,14 @@ fn parse_verified_claims(claims: ItaClaims) -> Result<VerifiedTokenClaims, Verif
     };
 
     Ok(VerifiedTokenClaims {
-        mrtd: claims.tdx_mrtd().to_string(),
-        report_data,
+        claims: AppraisalClaimsCore {
+            mrtd: claims.tdx_mrtd().to_string(),
+            report_data,
+            tcb_status: claims.attester_tcb_status().to_string(),
+            tcb_date: claims.attester_tcb_date().map(ToOwned::to_owned),
+            advisory_ids: claims.attester_advisory_ids().to_vec(),
+        },
         binding,
-        tcb_status: claims.attester_tcb_status().to_string(),
-        tcb_date: claims.attester_tcb_date().map(ToOwned::to_owned),
-        advisory_ids: claims.attester_advisory_ids().to_vec(),
     })
 }
 
@@ -962,10 +971,13 @@ mod tests {
         .expect("claims JSON should deserialize");
 
         let verified = parse_verified_claims(claims).expect("whitespace should be trimmed");
-        assert_eq!(verified.mrtd, sample_mrtd());
-        assert_eq!(verified.report_data, [0xabu8; 64]);
-        assert_eq!(verified.tcb_status, "UpToDate");
-        assert_eq!(verified.tcb_date.as_deref(), Some("2026-02-11T00:00:00Z"));
+        assert_eq!(verified.mrtd(), sample_mrtd());
+        assert!(
+            matches!(verified.binding, VerifiedTokenBinding::StandardReportData),
+            "expected standard token binding"
+        );
+        assert_eq!(verified.tcb_status(), "UpToDate");
+        assert_eq!(verified.tcb_date(), Some("2026-02-11T00:00:00Z"));
     }
 
     #[test]

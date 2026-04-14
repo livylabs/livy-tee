@@ -516,7 +516,7 @@ impl Attestation {
             policy
                 .accepted_tcb_statuses
                 .iter()
-                .any(|status| status.eq_ignore_ascii_case(&t.tcb_status))
+                .any(|status| status.eq_ignore_ascii_case(t.tcb_status()))
         });
 
         let quote_report_data_matches = match token.as_ref() {
@@ -540,32 +540,38 @@ impl Attestation {
                 .verify_commitment(&parsed_report.payload_hash),
             mrtd_matches_token: token
                 .as_ref()
-                .is_some_and(|t| self.mrtd.eq_ignore_ascii_case(&t.mrtd)),
+                .is_some_and(|t| self.mrtd.eq_ignore_ascii_case(t.mrtd())),
             tcb_status_matches_token: token
                 .as_ref()
-                .is_some_and(|t| self.tcb_status == t.tcb_status),
-            tcb_date_matches_token: token.as_ref().is_some_and(|t| self.tcb_date == t.tcb_date),
+                .is_some_and(|t| self.tcb_status == t.tcb_status()),
+            tcb_date_matches_token: token
+                .as_ref()
+                .is_some_and(|t| self.tcb_date.as_deref() == t.tcb_date()),
             advisory_ids_match_token: token
                 .as_ref()
-                .is_some_and(|t| advisory_id_sets_match(&self.advisory_ids, &t.advisory_ids)),
+                .is_some_and(|t| advisory_id_sets_match(&self.advisory_ids, t.advisory_ids())),
             tcb_status_allowed,
             tcb_status: token
                 .as_ref()
-                .map_or_else(String::new, |t| t.tcb_status.clone()),
-            tcb_date: token.as_ref().and_then(|t| t.tcb_date.clone()),
+                .map_or_else(String::new, |t| t.tcb_status().to_string()),
+            tcb_date: token
+                .as_ref()
+                .and_then(|t| t.tcb_date().map(str::to_string)),
             advisory_ids: token
                 .as_ref()
-                .map_or_else(Vec::new, |t| t.advisory_ids.clone()),
-            mrtd: token.as_ref().map_or_else(String::new, |t| t.mrtd.clone()),
+                .map_or_else(Vec::new, |t| t.advisory_ids().to_vec()),
+            mrtd: token
+                .as_ref()
+                .map_or_else(String::new, |t| t.mrtd().to_string()),
             expected_advisory_ids_matches: policy.expected_advisory_ids.as_ref().map(|expected| {
                 token
                     .as_ref()
-                    .is_some_and(|t| advisory_id_sets_match(expected, &t.advisory_ids))
+                    .is_some_and(|t| advisory_id_sets_match(expected, t.advisory_ids()))
             }),
             expected_mrtd_matches: policy.expected_mrtd.as_ref().map(|expected| {
                 token
                     .as_ref()
-                    .is_some_and(|t| expected.eq_ignore_ascii_case(&t.mrtd))
+                    .is_some_and(|t| expected.eq_ignore_ascii_case(t.mrtd()))
             }),
             expected_build_id_matches: policy
                 .expected_build_id

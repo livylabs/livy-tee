@@ -36,10 +36,20 @@ pub enum VerifyError {
     /// Intel Trust Authority API returned an error response.
     #[error("ITA API error: {0}")]
     ItaApi(String),
-    /// The attestation object itself is malformed.
+    /// The high-level [`crate::Attestation`] artifact itself is malformed.
+    ///
+    /// This variant is emitted by the high-level attestation verification flow
+    /// when locally stored fields such as `raw_quote`, `runtime_data`, or the
+    /// verifier nonce encodings cannot be decoded or do not have the expected
+    /// shape. Low-level ITA appraisal helpers do not construct this variant.
     #[error("invalid attestation: {0}")]
     InvalidAttestation(String),
     /// The stored low-level evidence artifact is malformed or incomplete.
+    ///
+    /// This variant is emitted by the high-level [`crate::Attestation`] flow
+    /// when replaying or reappraising bundled evidence. Low-level ITA network
+    /// calls do not construct this variant unless they are explicitly given a
+    /// malformed transport artifact from the caller.
     #[error("invalid stored evidence: {0}")]
     InvalidStoredEvidence(String),
     /// The ITA token or JWKS validation step failed.
