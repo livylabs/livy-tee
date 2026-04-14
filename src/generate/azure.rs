@@ -587,6 +587,7 @@ mod http {
     use std::time::Duration;
 
     const AZ_QUOTE_HOST: &str = "169.254.169.254";
+    const AZ_QUOTE_PORT: u16 = 80;
     const AZ_QUOTE_PATH: &str = "/acc/tdquote";
     const AZ_QUOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
     const AZ_QUOTE_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -594,7 +595,9 @@ mod http {
     const AZ_QUOTE_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 
     pub(super) fn post_quote(body: &str) -> Result<Vec<u8>, GenerateError> {
-        let addr = SocketAddr::from(([169, 254, 169, 254], 80));
+        let addr: SocketAddr = format!("{AZ_QUOTE_HOST}:{AZ_QUOTE_PORT}")
+            .parse()
+            .expect("Azure quote endpoint host and port are valid");
         let mut stream = TcpStream::connect_timeout(&addr, AZ_QUOTE_CONNECT_TIMEOUT)
             .map_err(GenerateError::Io)?;
         stream
