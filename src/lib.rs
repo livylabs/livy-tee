@@ -54,7 +54,10 @@ pub use verify::VerifyError;
 pub use attest::{generate_and_attest, AttestError, AttestedEvidence};
 
 #[cfg(feature = "ita-verify")]
-pub use bind::{verify_quote, verify_quote_with_public_values, AttestBuilder, Attestation, Livy};
+pub use bind::{
+    verify_quote, verify_quote_with_public_values, AttestBuilder, Attestation,
+    AttestationVerification, AttestationVerificationPolicy, Livy,
+};
 
 #[cfg(feature = "ita-verify")]
-pub use verify::ita::report_data_from_token;
+pub use verify::ita::report_data_hash_from_token;

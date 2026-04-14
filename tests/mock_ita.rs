@@ -7,8 +7,8 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use livy_tee::{
     binary_hash, build_id_from_hash_hex, extract_report_data, generate_and_attest,
-    generate_evidence, report_data_from_token, verify_quote_with_public_values, ItaConfig, Livy,
-    PublicValues, ReportData, REPORT_DATA_VERSION,
+    generate_evidence, report_data_hash_from_token, verify_quote_with_public_values,
+    AttestationVerificationPolicy, ItaConfig, Livy, PublicValues, ReportData, REPORT_DATA_VERSION,
 };
 use sha2::{Digest, Sha512};
 
@@ -77,7 +77,7 @@ fn commitment_hash_changes_with_order() {
 }
 
 // ===========================================================================
-// verify_quote_with_public_values (mock mode — full chain)
+// verify_quote_with_public_values (mock mode — local binding chain)
 // ===========================================================================
 
 /// Construct the same chain that generate_and_attest builds internally.
@@ -95,7 +95,7 @@ fn mock_chain(pv: &PublicValues) -> (String, String, String, String) {
         let mut h = Sha512::new();
         h.update(&nonce_val);
         h.update(&nonce_iat);
-        h.update(&rd_bytes);
+        h.update(rd_bytes);
         h.finalize().into()
     };
 
@@ -164,6 +164,23 @@ fn verify_quote_rejects_invalid_base64() {
     assert!(result.is_err());
 }
 
+#[test]
+fn verify_quote_rejects_runtime_data_with_trailing_bytes() {
+    let mut pv = PublicValues::new();
+    pv.commit(&"hello");
+    let (quote_b64, rd_b64, nonce_val_b64, nonce_iat_b64) = mock_chain(&pv);
+    let runtime_with_trailing = format!("{rd_b64}AA==");
+
+    let result = verify_quote_with_public_values(
+        &quote_b64,
+        &runtime_with_trailing,
+        &nonce_val_b64,
+        &nonce_iat_b64,
+        &pv,
+    );
+    assert!(result.is_err());
+}
+
 // ===========================================================================
 // generate_and_attest (mock path)
 // ===========================================================================
@@ -199,7 +216,7 @@ async fn generate_and_attest_mock_returns_valid_evidence() {
         let mut h = Sha512::new();
         h.update(&attested.nonce_val);
         h.update(&attested.nonce_iat);
-        h.update(&rd_bytes);
+        h.update(rd_bytes);
         h.finalize().into()
     };
     assert_eq!(extracted_rd, expected_rd);
@@ -216,20 +233,31 @@ async fn generate_and_attest_mock_zeroes_nonces() {
 }
 
 // ===========================================================================
-// report_data_from_token
+// report_data_hash_from_token
 // ===========================================================================
 
 #[test]
-fn report_data_from_token_invalid_jwt() {
-    let result = report_data_from_token("not-a-jwt");
+fn report_data_hash_from_token_invalid_jwt() {
+    let result = report_data_hash_from_token("not-a-jwt");
     assert!(result.is_err());
 }
 
 #[test]
-fn report_data_from_token_empty_report_data() {
+fn report_data_hash_from_token_empty_report_data() {
     let jwt = fake_jwt(r#"{"tdx":{}}"#);
-    let result = report_data_from_token(&jwt).unwrap();
+    let result = report_data_hash_from_token(&jwt).unwrap();
     assert!(result.is_none());
+}
+
+#[test]
+fn report_data_hash_from_token_decodes_hex_claim() {
+    let expected = [0xabu8; 64];
+    let jwt = fake_jwt(&format!(
+        r#"{{"tdx":{{"tdx_report_data":"{}"}}}}"#,
+        hex::encode(expected)
+    ));
+    let result = report_data_hash_from_token(&jwt).unwrap();
+    assert_eq!(result, Some(expected));
 }
 
 // ===========================================================================
@@ -256,15 +284,78 @@ async fn proof_via_attest_builder_mock() {
 }
 
 #[tokio::test]
-async fn proof_verify_mock() {
+async fn proof_verify_binding_mock() {
     let livy = Livy::new("mock-key");
     let mut builder = livy.attest();
     builder.commit(&"correct-data");
     let att = builder.finalize().await.unwrap();
 
     assert!(
-        att.verify().expect("verify should not error"),
-        "att.verify() should pass for matching public values"
+        att.verify_binding().expect("verify should not error"),
+        "att.verify_binding() should pass for matching public values"
+    );
+}
+
+#[tokio::test]
+async fn proof_verify_mock_reports_jwt_failure() {
+    let livy = Livy::new("mock-key");
+    let mut builder = livy.attest();
+    builder.commit(&"correct-data");
+    let att = builder.finalize().await.unwrap();
+
+    let report = att
+        .verify()
+        .await
+        .expect("verify should return a report, not Err");
+    assert!(
+        !report.jwt_signature_and_expiry_valid,
+        "mock has no real JWT"
+    );
+    assert!(
+        !report.all_passed(),
+        "all_passed should be false without valid JWT"
+    );
+    // Local checks that don't depend on the token should still pass.
+    assert!(report.runtime_data_matches_report);
+    assert!(report.public_values_bound);
+}
+
+#[tokio::test]
+async fn proof_verify_with_policy_reports_token_failures_but_keeps_local_checks() {
+    let livy = Livy::new("mock-key");
+    let mut builder = livy.attest();
+    builder.commit(&"correct-data");
+    builder.nonce(42);
+    let att = builder.finalize().await.unwrap();
+
+    let report = att
+        .verify_with_policy(&AttestationVerificationPolicy {
+            expected_mrtd: Some("00".repeat(48)),
+            expected_build_id: Some(att.report_data.build_id),
+            expected_nonce: Some(att.report_data.nonce),
+            ..AttestationVerificationPolicy::default()
+        })
+        .await
+        .expect("verify_with_policy should return a report, not Err");
+
+    assert!(
+        !report.jwt_signature_and_expiry_valid,
+        "mock has no real JWT"
+    );
+    assert!(!report.token_report_data_matches);
+    assert!(!report.mrtd_matches_token);
+    assert!(!report.tcb_status_matches_token);
+    assert!(!report.tcb_date_matches_token);
+    assert!(!report.tcb_status_allowed);
+    assert_eq!(report.expected_mrtd_matches, Some(false));
+
+    assert!(report.runtime_data_matches_report);
+    assert!(report.public_values_bound);
+    assert_eq!(report.expected_build_id_matches, Some(true));
+    assert_eq!(report.expected_nonce_matches, Some(true));
+    assert!(
+        !report.all_passed(),
+        "all_passed should be false without valid JWT"
     );
 }
 
@@ -287,7 +378,7 @@ async fn proof_payload_hash_hex_mock() {
 }
 
 #[tokio::test]
-async fn verify_quote_full_chain_mock() {
+async fn verify_quote_binding_chain_mock() {
     let livy = Livy::new("mock-key");
     let mut builder = livy.attest();
     builder.commit(&"chain-input");
@@ -302,7 +393,7 @@ async fn verify_quote_full_chain_mock() {
         &att.public_values,
     )
     .expect("verify should not error");
-    assert!(ok, "full chain verification should pass");
+    assert!(ok, "binding verification should pass");
 
     // Tampered public values should fail.
     let mut tampered = PublicValues::new();
@@ -315,5 +406,5 @@ async fn verify_quote_full_chain_mock() {
         &tampered,
     )
     .expect("should not error");
-    assert!(!ok2, "tampered values should fail full chain");
+    assert!(!ok2, "tampered values should fail binding verification");
 }

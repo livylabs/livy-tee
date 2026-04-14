@@ -216,7 +216,7 @@ request body format, with endpoint selection matching provider (`/attest` vs
 same reason it passes for Intel CLI quotes.
 
 The additional property livy-tee provides is **proof portability**: by storing the nonce
-and runtime_data in the `Attestation` struct, the full attestation chain can be
+and runtime_data in the `Attestation` struct, the local binding chain can be
 reconstructed offline by any party at any time.
 
 For Azure CVMs, Intel Trust Authority validates Azure runtime JSON via the
@@ -274,10 +274,10 @@ Bytes   Size  Field         Content
 56..64    8   reserved      Zero-filled
 ```
 
-### 4.3 Full reconstruction by any third party
+### 4.3 Binding reconstruction by any third party
 
 Given an `Attestation` and the expected public values buffer, any party can reconstruct
-the complete chain with nothing but standard cryptography libraries:
+the local binding chain with nothing but standard cryptography libraries:
 
 ```
 Step 1 — Recompute payload_hash from expected public values:
@@ -300,11 +300,12 @@ Step 5 — Extract and verify REPORTDATA in the raw quote:
   quote_rd    = quote_bytes[568..632]
   assert quote_rd == expected_rd
 
-Step 6 — Verify the ITA JWT signature (optional, Intel PKI):
+Step 6 — Verify the ITA JWT signature and expiry:
   fetch JWKS from https://portal.trustauthority.intel.com/certs
   verify attestation.ita_token against the JWKS
 
-Step 7 — Assert hardware identity (optional):
+Step 7 — Assert TCB and hardware identity policy:
+  token.tcb_status == "UpToDate"  // default livy-tee policy
   rd.build_id == first_8_bytes(SHA-256(known_binary))
   attestation.mrtd == expected_mrtd_for_this_binary
 ```
@@ -317,6 +318,9 @@ developer, auditor, or end user can perform them with only:
 
 This is implemented in `livy_tee::verify_quote` and tested in
 `tests/tdx_integration.rs::external_verifier_reconstructs_report_data_from_raw_inputs`.
+`Attestation::verify()` performs the full ITA JWT, TCB policy, and public-value
+binding checks and returns a report whose `all_passed()` method summarizes the
+required checks.
 
 ### 4.4 What livy-tee adds beyond the Intel CLI
 

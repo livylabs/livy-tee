@@ -1,0 +1,436 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+//! High-level attestation builder and verifier API.
+
+use super::local::{nonce_and_runtime_hash, verify_quote_with_public_values};
+use crate::{
+    attest::AttestError,
+    generate::binary_hash,
+    public_values::PublicValues,
+    report::{build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION},
+    verify::{
+        codec::{decode_standard_base64, decode_standard_base64_array_64},
+        ita::{verify_attestation_token, ItaConfig, DEFAULT_JWKS_URL},
+        VerifyError,
+    },
+};
+use serde::Serialize;
+
+/// Policy for full [`Attestation`] verification.
+#[derive(Debug, Clone)]
+pub struct AttestationVerificationPolicy {
+    /// Intel Trust Authority JWKS endpoint used to verify the token signature.
+    pub jwks_url: String,
+    /// Timeout in seconds for JWKS HTTP requests.
+    pub request_timeout_secs: u64,
+    /// Accepted ITA TCB status values. Defaults to only `"UpToDate"`.
+    pub accepted_tcb_statuses: Vec<String>,
+    /// Optional expected MRTD, as a 96-character hex string.
+    pub expected_mrtd: Option<String>,
+    /// Optional expected build ID from [`ReportData::build_id`].
+    pub expected_build_id: Option<[u8; 8]>,
+    /// Optional expected application nonce from [`ReportData::nonce`].
+    pub expected_nonce: Option<u64>,
+}
+
+impl Default for AttestationVerificationPolicy {
+    fn default() -> Self {
+        Self {
+            jwks_url: DEFAULT_JWKS_URL.to_string(),
+            request_timeout_secs: 30,
+            accepted_tcb_statuses: vec!["UpToDate".to_string()],
+            expected_mrtd: None,
+            expected_build_id: None,
+            expected_nonce: None,
+        }
+    }
+}
+
+/// Result of full [`Attestation`] verification.
+#[derive(Debug, Clone)]
+pub struct AttestationVerification {
+    /// The ITA JWT signature and registered time claims passed validation.
+    pub jwt_signature_and_expiry_valid: bool,
+    /// The token's signed binding claims match this attestation's nonce and runtime data.
+    ///
+    /// For standard TDX quotes, this is
+    /// `tdx_report_data == SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data)`.
+    /// For Azure TDX VMs, this checks Intel Trust Authority's Azure-specific
+    /// claims: `attester_held_data == runtime_data` and
+    /// `attester_runtime_data.user-data == SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data)`.
+    pub token_report_data_matches: bool,
+    /// The attestation's `runtime_data` decodes to exactly `report_data`.
+    pub runtime_data_matches_report: bool,
+    /// The public-values commitment matches the payload hash in `report_data`.
+    pub public_values_bound: bool,
+    /// The public `mrtd` field matches the signed token claim.
+    pub mrtd_matches_token: bool,
+    /// The public `tcb_status` field matches the signed token claim.
+    pub tcb_status_matches_token: bool,
+    /// The public `tcb_date` field matches the signed token claim.
+    pub tcb_date_matches_token: bool,
+    /// The signed token TCB status is accepted by the verification policy.
+    pub tcb_status_allowed: bool,
+    /// The TCB status extracted from the verified token.
+    pub tcb_status: String,
+    /// The optional TCB date extracted from the verified token.
+    pub tcb_date: Option<String>,
+    /// The MRTD extracted from the verified token.
+    pub mrtd: String,
+    /// Result of comparing the token MRTD to the policy's expected MRTD.
+    pub expected_mrtd_matches: Option<bool>,
+    /// Result of comparing the report build ID to the policy's expected build ID.
+    pub expected_build_id_matches: Option<bool>,
+    /// Result of comparing the report nonce to the policy's expected nonce.
+    pub expected_nonce_matches: Option<bool>,
+}
+
+impl AttestationVerification {
+    /// Return true when every required verification check passed.
+    #[must_use]
+    pub fn all_passed(&self) -> bool {
+        self.jwt_signature_and_expiry_valid
+            && self.token_report_data_matches
+            && self.runtime_data_matches_report
+            && self.public_values_bound
+            && self.mrtd_matches_token
+            && self.tcb_status_matches_token
+            && self.tcb_date_matches_token
+            && self.tcb_status_allowed
+            && self.expected_mrtd_matches.unwrap_or(true)
+            && self.expected_build_id_matches.unwrap_or(true)
+            && self.expected_nonce_matches.unwrap_or(true)
+    }
+}
+
+/// Livy client — the entry point for TDX-backed attestation.
+///
+/// Create with [`Livy::from_env`] (reads `ITA_API_KEY`) or [`Livy::new`]
+/// (explicit key). Then call [`Livy::attest`] to start committing values.
+#[derive(Debug, Clone)]
+pub struct Livy {
+    config: ItaConfig,
+}
+
+impl Livy {
+    /// Create a Livy client from an explicit API key.
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self {
+            config: ItaConfig {
+                api_key: api_key.into(),
+                ..ItaConfig::default()
+            },
+        }
+    }
+
+    /// Create a Livy client from an explicit [`ItaConfig`].
+    pub fn with_config(config: ItaConfig) -> Self {
+        Self { config }
+    }
+
+    /// Create a Livy client by reading `ITA_API_KEY` from the environment.
+    pub fn from_env() -> Result<Self, String> {
+        let key = std::env::var("ITA_API_KEY")
+            .map_err(|_| "ITA_API_KEY environment variable is not set".to_string())?;
+        if key.is_empty() {
+            return Err("ITA_API_KEY is empty".to_string());
+        }
+        Ok(Self::new(key))
+    }
+
+    /// Start building an attestation.
+    ///
+    /// Use `.commit(...)` to add public values, `.nonce(...)` for replay
+    /// protection, then `.finalize().await` to generate the attestation.
+    pub fn attest(&self) -> AttestBuilder<'_> {
+        AttestBuilder {
+            config: &self.config,
+            public_values: PublicValues::new(),
+            nonce: 0,
+        }
+    }
+}
+
+/// Builder for a single TDX attestation.
+///
+/// Obtained from [`Livy::attest`].
+#[derive(Debug, Clone)]
+pub struct AttestBuilder<'a> {
+    config: &'a ItaConfig,
+    public_values: PublicValues,
+    nonce: u64,
+}
+
+impl<'a> AttestBuilder<'a> {
+    /// Commit a typed value as a public output.
+    ///
+    /// Values are read back in commit order by the verifier via
+    /// `attestation.public_values.read::<T>()`.
+    ///
+    /// **Privacy notice:** the committed value is stored in plain text and is
+    /// readable by any party who receives the attestation. Only commit data that
+    /// is intended to be public. For sensitive values, use
+    /// [`commit_hashed`](Self::commit_hashed) to store a SHA-256 hash instead.
+    pub fn commit<T: Serialize>(&mut self, value: &T) -> &mut Self {
+        self.public_values.commit(value);
+        self
+    }
+
+    /// Commit the SHA-256 hash of a serialized value instead of the value itself.
+    ///
+    /// Use this for sensitive data that must be bound to the attestation without
+    /// revealing the raw content. The 32-byte hash is stored in the public values
+    /// buffer; the original value is never included.
+    ///
+    /// To verify: the verifier independently serializes the same value with
+    /// `serde_json` and checks that `SHA-256(serialized)` matches what is read
+    /// back from `public_values`.
+    pub fn commit_hashed<T: Serialize>(&mut self, value: &T) -> &mut Self {
+        use sha2::{Digest, Sha256};
+        let encoded =
+            serde_json::to_vec(value).expect("commit_hashed: serialization should not fail");
+        let hash: [u8; 32] = Sha256::digest(&encoded).into();
+        self.public_values.commit_raw(&hash);
+        self
+    }
+
+    /// Commit raw bytes as a public output (no serialization wrapper).
+    pub fn commit_raw(&mut self, bytes: &[u8]) -> &mut Self {
+        self.public_values.commit_raw(bytes);
+        self
+    }
+
+    /// Set a monotonically increasing nonce for replay protection.
+    ///
+    /// Defaults to `0`. The nonce is stored at bytes `[48..56]` of ReportData.
+    pub fn nonce(&mut self, n: u64) -> &mut Self {
+        self.nonce = n;
+        self
+    }
+
+    /// Generate a TDX quote and obtain an ITA attestation token.
+    ///
+    /// The attestation's `public_values` contains all committed values in plain
+    /// text. Any party with the attestation can read them. Commit only public
+    /// data or pre-hash sensitive values with [`commit_hashed`](Self::commit_hashed).
+    ///
+    /// `REPORTDATA[0..32]` = `SHA-256(public_values buffer)`.
+    pub async fn finalize(self) -> Result<Attestation, AttestError> {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+        let payload_hash = self.public_values.commitment_hash();
+
+        let binary_hash_hex = binary_hash().map_err(AttestError::Generate)?;
+        let build_id = build_id_from_hash_hex(&binary_hash_hex);
+        let rd = ReportData::new(payload_hash, build_id, REPORT_DATA_VERSION, 0, self.nonce);
+        let rd_bytes = rd.to_bytes();
+
+        let attested = crate::attest::generate_and_attest(&rd_bytes, self.config).await?;
+
+        Ok(Attestation {
+            ita_token: attested.ita_token,
+            mrtd: attested.mrtd,
+            tcb_status: attested.tcb_status,
+            tcb_date: attested.tcb_date,
+            raw_quote: BASE64.encode(attested.evidence.raw()),
+            runtime_data: BASE64.encode(attested.runtime_data),
+            verifier_nonce_val: BASE64.encode(&attested.nonce_val),
+            verifier_nonce_iat: BASE64.encode(&attested.nonce_iat),
+            report_data: rd,
+            public_values: self.public_values,
+        })
+    }
+}
+
+/// A TDX hardware attestation with inspectable public values.
+///
+/// This is a hardware attestation backed by Intel TDX — not a cryptographic
+/// proof.  Security relies on trusting the TDX hardware and Intel's signing
+/// keys.  The public values buffer is committed into `REPORTDATA[0..32]`
+/// via `SHA-256(buffer)` and can be verified by anyone with the raw quote.
+///
+/// **Privacy:** all committed values are stored in plain text inside
+/// `public_values`. Do not commit sensitive data — use
+/// [`AttestBuilder::commit_hashed`] to bind a value by its hash instead.
+///
+/// # Verification
+///
+/// ```rust,ignore
+/// // 1. Read and constrain individual values.
+/// let hash: [u8; 32] = attestation.public_values.read();
+/// assert_eq!(hash, expected);
+///
+/// // 2. Full check: verify ITA JWT, TCB policy, and public-value binding.
+/// let report = attestation.verify().await?;
+/// assert!(report.all_passed());
+/// ```
+///
+/// # Cross-language verification
+///
+/// The `public_values` buffer uses `serde_json` for entry serialization
+/// (length-prefixed JSON).  Verifiers in other languages must use the raw
+/// buffer bytes to recompute `SHA-256(buffer)` — they do NOT need to
+/// re-serialize values.  The buffer travels alongside the attestation as
+/// an opaque byte sequence.
+#[derive(Debug, Clone)]
+pub struct Attestation {
+    /// ITA-signed JWT.
+    pub ita_token: String,
+    /// Hex-encoded MRTD (96 chars = 48 bytes).
+    pub mrtd: String,
+    /// TCB status from Intel Trust Authority.
+    pub tcb_status: String,
+    /// Optional TCB assessment date from Intel Trust Authority claims.
+    pub tcb_date: Option<String>,
+    /// Base64-encoded raw DCAP quote.
+    pub raw_quote: String,
+    /// Base64-encoded original 64-byte ReportData struct.
+    pub runtime_data: String,
+    /// Base64-encoded verifier nonce value bytes.
+    pub verifier_nonce_val: String,
+    /// Base64-encoded verifier nonce issued-at bytes.
+    pub verifier_nonce_iat: String,
+    /// Structured REPORTDATA parsed from `runtime_data`.
+    pub report_data: ReportData,
+    /// The committed public values — read with `.public_values.read::<T>()`.
+    pub public_values: PublicValues,
+}
+
+impl Attestation {
+    /// Hex-encoded 32-byte commitment hash.
+    #[must_use]
+    pub fn payload_hash_hex(&self) -> String {
+        hex::encode(self.report_data.payload_hash)
+    }
+
+    /// Verify that public values are bound to the TDX quote bytes.
+    ///
+    /// Performs two checks in sequence:
+    /// 1. `SHA-512(nonce_val ‖ nonce_iat ‖ runtime_data) == REPORTDATA` in the TDX quote.
+    /// 2. `SHA-256(public_values buffer) == ReportData.payload_hash` in runtime_data.
+    ///
+    /// Both checks must pass. This confirms the public values are bound to the
+    /// raw quote bytes — not merely locally self-consistent.
+    ///
+    /// This is a local, offline binding check. It does not verify the ITA JWT
+    /// signature, JWT expiry, TCB status policy, expected MRTD/build identity,
+    /// or application nonce freshness. Callers that need those guarantees must
+    /// validate those fields separately.
+    ///
+    /// For the narrow self-consistency check only (no quote binding), see
+    /// [`verify_public_values_commitment`](Self::verify_public_values_commitment).
+    pub fn verify_binding(&self) -> Result<bool, crate::verify::extract::ExtractError> {
+        verify_quote_with_public_values(
+            &self.raw_quote,
+            &self.runtime_data,
+            &self.verifier_nonce_val,
+            &self.verifier_nonce_iat,
+            &self.public_values,
+        )
+    }
+
+    /// Verify the full attestation chain against the default policy.
+    ///
+    /// This verifies the ITA JWT signature and expiry using Intel Trust
+    /// Authority's JWKS, checks that the signed token's report-data claim
+    /// covers this attestation's verifier nonce and runtime data, checks that
+    /// public values are bound into `ReportData.payload_hash`, and enforces the
+    /// default TCB policy (`UpToDate` only). On Azure TDX VMs, the binding check
+    /// uses Intel Trust Authority's Azure-specific `attester_held_data` and
+    /// `attester_runtime_data.user-data` claims.
+    pub async fn verify(&self) -> Result<AttestationVerification, VerifyError> {
+        self.verify_with_policy(&AttestationVerificationPolicy::default())
+            .await
+    }
+
+    /// Verify the full attestation chain against an explicit policy.
+    ///
+    /// JWT signature verification is non-fatal: if it fails the report's
+    /// `jwt_signature_and_expiry_valid` field is `false` and all
+    /// token-derived checks (`*_matches_token`, `tcb_status_allowed`,
+    /// `expected_mrtd_matches`) are also `false`.  Structural errors in the
+    /// attestation's own fields (malformed base64) still return `Err`.
+    pub async fn verify_with_policy(
+        &self,
+        policy: &AttestationVerificationPolicy,
+    ) -> Result<AttestationVerification, VerifyError> {
+        let token = verify_attestation_token(
+            &self.ita_token,
+            &policy.jwks_url,
+            policy.request_timeout_secs,
+        )
+        .await
+        .ok();
+        let jwt_valid = token.is_some();
+
+        let runtime_data = decode_standard_base64_array_64("runtime_data", &self.runtime_data)
+            .map_err(VerifyError::JwtParse)?;
+        let nonce_val = decode_standard_base64("verifier_nonce_val", &self.verifier_nonce_val)
+            .map_err(VerifyError::JwtParse)?;
+        let nonce_iat = decode_standard_base64("verifier_nonce_iat", &self.verifier_nonce_iat)
+            .map_err(VerifyError::JwtParse)?;
+        let expected_token_report_data =
+            nonce_and_runtime_hash(&nonce_val, &nonce_iat, &runtime_data);
+
+        let parsed_report = ReportData::from_bytes(&runtime_data);
+        let tcb_status_allowed = token.as_ref().is_some_and(|t| {
+            policy
+                .accepted_tcb_statuses
+                .iter()
+                .any(|status| status.eq_ignore_ascii_case(&t.tcb_status))
+        });
+
+        Ok(AttestationVerification {
+            jwt_signature_and_expiry_valid: jwt_valid,
+            token_report_data_matches: token
+                .as_ref()
+                .is_some_and(|t| t.binding_matches(&runtime_data, &expected_token_report_data)),
+            runtime_data_matches_report: parsed_report == self.report_data,
+            public_values_bound: self
+                .public_values
+                .verify_commitment(&parsed_report.payload_hash),
+            mrtd_matches_token: token
+                .as_ref()
+                .is_some_and(|t| self.mrtd.eq_ignore_ascii_case(&t.mrtd)),
+            tcb_status_matches_token: token
+                .as_ref()
+                .is_some_and(|t| self.tcb_status == t.tcb_status),
+            tcb_date_matches_token: token.as_ref().is_some_and(|t| self.tcb_date == t.tcb_date),
+            tcb_status_allowed,
+            tcb_status: token
+                .as_ref()
+                .map_or_else(String::new, |t| t.tcb_status.clone()),
+            tcb_date: token.as_ref().and_then(|t| t.tcb_date.clone()),
+            mrtd: token.as_ref().map_or_else(String::new, |t| t.mrtd.clone()),
+            expected_mrtd_matches: policy.expected_mrtd.as_ref().map(|expected| {
+                token
+                    .as_ref()
+                    .is_some_and(|t| expected.eq_ignore_ascii_case(&t.mrtd))
+            }),
+            expected_build_id_matches: policy
+                .expected_build_id
+                .map(|expected| parsed_report.build_id == expected),
+            expected_nonce_matches: policy
+                .expected_nonce
+                .map(|expected| parsed_report.nonce == expected),
+        })
+    }
+
+    /// Check that `SHA-256(public_values)` matches `report_data.payload_hash`.
+    ///
+    /// This is a **local self-consistency** check only. It confirms the public
+    /// values buffer has not been tampered with relative to the `payload_hash`
+    /// stored in `report_data`, but it does **not** verify that `report_data`
+    /// is bound to the raw TDX quote via the verifier nonces.
+    ///
+    /// A forged `Attestation` where both `public_values` and `report_data` were
+    /// replaced together will pass this check while the TDX quote attests to
+    /// something else entirely.
+    ///
+    /// Use [`verify_binding`](Self::verify_binding) for quote-byte binding
+    /// verification.
+    #[must_use]
+    pub fn verify_public_values_commitment(&self) -> bool {
+        self.public_values
+            .verify_commitment(&self.report_data.payload_hash)
+    }
+}

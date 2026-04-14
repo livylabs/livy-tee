@@ -212,11 +212,23 @@ async fn proof_verify_correct_and_tampered() {
     builder.commit(&"verify-test");
     let att = builder.finalize().await.expect("finalize failed");
 
+    let report = att.verify().await.expect("verify should not error");
+    assert!(report.jwt_signature_and_expiry_valid);
+    assert!(report.token_report_data_matches);
+    assert!(report.runtime_data_matches_report);
+    assert!(report.public_values_bound);
+    assert!(report.mrtd_matches_token);
+    assert!(report.tcb_status_matches_token);
     if is_azure_runtime() {
-        assert!(!att.ita_token.is_empty());
-    } else {
-        assert!(att.verify().expect("verify should not error"));
+        assert!(
+            report.all_passed(),
+            "Azure verification report: {report:#?}"
+        );
     }
+    assert_eq!(
+        report.tcb_status_allowed,
+        report.tcb_status.eq_ignore_ascii_case("UpToDate")
+    );
 
     // Read back and check.
     let val: String = att.public_values.read();

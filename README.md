@@ -115,10 +115,11 @@ use sha2::{Digest, Sha256};
 let committed_hash: [u8; 32] = attestation.public_values.read(); // skip hashed entries
 assert_eq!(committed_hash, expected_content_hash);
 
-// Verify the full chain: public values → REPORTDATA → TDX quote (no network needed).
-assert!(attestation.verify().unwrap());
+// Verify the full attestation: ITA JWT, TCB policy, and public-value binding.
+let report = attestation.verify().await?;
+assert!(report.all_passed());
 
-// At this point the verifier knows:
+// After this full verification check, the verifier knows:
 // - The photo and record were processed by the exact binary measured in the quote (MRTD)
 // - This happened inside a genuine Intel TDX enclave (hardware guarantee)
 // - The attestation hasn't been replayed (nonce is unique and monotonic)
@@ -199,8 +200,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("tcb_status:   {}", attestation.tcb_status);
     println!("payload_hash: {}", attestation.payload_hash_hex());
 
-    // Locally verify the full chain — no network needed.
-    assert!(attestation.verify().unwrap());
+    // Verify the full attestation. This fetches ITA's JWKS to validate the JWT.
+    let report = attestation.verify().await?;
+    assert!(report.all_passed());
     Ok(())
 }
 ```
@@ -248,7 +250,7 @@ Any third party who has the attestation and the `public_values` buffer can verif
 ```rust
 use livy_tee::verify_quote_with_public_values;
 
-// Full chain verification via raw DCAP quote.
+// Local binding verification via raw DCAP quote bytes.
 // Checks: SHA-512(nonce_val ‖ nonce_iat ‖ runtime_data) == quote REPORTDATA
 //     AND: SHA-256(public_values buffer) == ReportData.payload_hash
 let ok = verify_quote_with_public_values(
@@ -260,16 +262,26 @@ let ok = verify_quote_with_public_values(
 )?;
 assert!(ok);
 
-// Or use the method form — identical check:
-assert!(attestation.verify().unwrap());
+// For full attestation verification, including ITA JWT signature, expiry, and
+// TCB policy, use the method form:
+let report = attestation.verify().await?;
+assert!(report.all_passed());
 ```
 
-Note for Azure CVMs: `attestation.verify()` performs native quote-byte binding checks.
-Azure's `/attest/azure` flow is validated authoritatively by ITA using Azure runtime data.
+The default full-attestation policy requires `tcb_status == "UpToDate"`. Use
+`AttestationVerificationPolicy` to pin an expected MRTD, build ID, or application
+nonce, or to intentionally accept additional TCB statuses.
+
+Note for Azure CVMs: Azure's `/attest/azure` flow is validated authoritatively by
+ITA using Azure runtime data; the ITA token is the source of truth for Azure
+TCB/MRTD claims. `Attestation::verify()` checks Azure's
+`attester_held_data == runtime_data` and
+`attester_runtime_data.user-data == SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data)`
+claims instead of treating raw quote `REPORTDATA` like the non-Azure path.
 
 ### Step-by-step manual verification recipe
 
-1. Obtain the `raw_quote` (base64-decode it) and `runtime_data` (base64-decode it → 64 bytes).
+1. For non-Azure TDX guests, obtain the `raw_quote` (base64-decode it) and `runtime_data` (base64-decode it → 64 bytes).
 2. Obtain `verifier_nonce_val` and `verifier_nonce_iat` (base64-decode each).
 3. Extract bytes `[568..632]` from the quote — the REPORTDATA field (= SHA-512 hash).
 4. Recompute `SHA-512(nonce_val ‖ nonce_iat ‖ runtime_data)` and assert it matches step 3.
@@ -278,7 +290,7 @@ Azure's `/attest/azure` flow is validated authoritatively by ITA using Azure run
 7. Assert `rd.verify_payload(&expected_hash)`.
 8. Assert `rd.build_id == build_id_from_hash_hex(&tee_binary_hash)` — confirms which binary ran.
 9. Assert `rd.nonce == expected_nonce` — replay protection.
-10. *(Optional)* Verify the ITA JWT signature against Intel's JWKS endpoint at `https://portal.trustauthority.intel.com/certs`.
+10. For full attestation policy, verify the ITA JWT signature, expiry, TCB status, MRTD/build identity, and application nonce. Intel's JWKS endpoint is `https://portal.trustauthority.intel.com/certs`. On Azure TDX VMs, use the ITA token's Azure binding claims rather than the raw quote `REPORTDATA` formula above.
 
 ---
 
@@ -391,20 +403,23 @@ assert!(ok);
 ```
 
 For the high-level commit/read model, use `verify_quote_with_public_values` or
-`Attestation::verify()` instead — both compute the `payload_hash` from the
-`PublicValues` buffer automatically.
+`Attestation::verify()` instead. `verify_quote_with_public_values` is the local
+offline binding helper; `Attestation::verify()` additionally validates the ITA JWT
+and TCB policy.
 
-### Extracting REPORTDATA from an ITA JWT
+### Extracting the token REPORTDATA hash from an ITA JWT
 
 ```rust
-use livy_tee::report_data_from_token;
+use livy_tee::report_data_hash_from_token;
 
 // No network, no TDX hardware.
-if let Some(rd) = report_data_from_token(&ita_token)? {
-    println!("payload_hash: {}", hex::encode(rd.payload_hash));
-    println!("nonce:        {}", rd.nonce);
+if let Some(report_data_hash) = report_data_hash_from_token(&ita_token)? {
+    println!("tdx_report_data: {}", hex::encode(report_data_hash));
 }
 ```
+
+This returns the raw 64-byte `tdx_report_data` claim from the ITA token.
+It is not the structured `ReportData` payload stored in `runtime_data`.
 
 ---
 
@@ -515,7 +530,10 @@ In `mock-tee` mode, `generate_evidence` returns a correctly-shaped 632-byte DCAP
 
 ```
 livy-tee
-├── bind.rs          High-level Livy API (Livy, AttestBuilder, Attestation, verify_quote_with_public_values)
+├── bind/
+│   ├── mod.rs       High-level API entry point
+│   ├── attestation.rs  Livy, AttestBuilder, Attestation, policy verification
+│   └── local.rs     Local quote/public-values binding helpers
 ├── report.rs        ReportData wire format + build_id helpers
 ├── evidence.rs      Evidence type (wraps raw DCAP quote bytes)
 ├── generate/
@@ -525,10 +543,11 @@ livy-tee
 ├── attest.rs        generate_and_attest (generation + ITA in one call)
 └── verify/
     ├── extract.rs   extract_report_data, extract_mrtd (local, no network)
-    └── ita.rs       Intel Trust Authority v2 REST client, report_data_from_token
+    ├── codec.rs     Shared token/runtime decoding helpers
+    └── ita.rs       Intel Trust Authority v2 REST client, report_data_hash_from_token
 ```
 
-The high-level `Livy` API in `bind.rs` is a thin layer over `attest.rs`, which combines `generate/` and `verify/ita.rs`. The low-level modules are independently usable.
+The high-level `Livy` API in `bind/` is a thin layer over `attest.rs`, which combines `generate/` and `verify/ita.rs`. The low-level modules are independently usable.
 
 ---
 

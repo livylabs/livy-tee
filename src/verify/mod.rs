@@ -10,6 +10,9 @@
 pub(crate) mod extract;
 
 #[cfg(feature = "ita-verify")]
+pub(crate) mod codec;
+
+#[cfg(feature = "ita-verify")]
 pub(crate) mod ita;
 
 #[cfg(feature = "ita-verify")]

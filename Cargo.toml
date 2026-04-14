@@ -24,6 +24,7 @@ serde_json = "1"
 uuid      = { version = "1", features = ["v4", "serde"] }
 
 reqwest      = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
+jsonwebtoken = { version = "9", optional = true }
 
 [dev-dependencies]
 base64     = "0.22"
@@ -36,4 +37,4 @@ tokio      = { version = "1.48", features = ["full"] }
 default    = []
 mock-tee   = []
 # ita-verify: Intel Trust Authority REST API verification
-ita-verify = ["dep:reqwest"]
+ita-verify = ["dep:reqwest", "dep:jsonwebtoken"]

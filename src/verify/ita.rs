@@ -3,8 +3,8 @@
 //!
 //! Sends the raw quote to ITA's appraisal endpoint and parses the returned JWT
 //! to extract TDX claims.  ITA performs the full DCAP chain verification
-//! server-side; we parse the JWT without re-verifying the signature (ITA is
-//! the authoritative verifier).
+//! server-side.  For stored attestations, verify the returned JWT against
+//! ITA's JWKS before trusting its claims.
 //!
 //! ## Attestation flow (Intel CLI-compatible)
 //!
@@ -40,8 +40,12 @@
 
 use crate::cloud::{detect_cloud_provider, log_detected_provider, CloudProvider};
 use crate::evidence::Evidence;
+use crate::verify::codec::{decode_claim_array_64, decode_standard_base64_array_64};
 use crate::verify::VerifyError;
 use serde::Deserialize;
+
+/// Default Intel Trust Authority token-signing JWKS endpoint.
+pub(crate) const DEFAULT_JWKS_URL: &str = "https://portal.trustauthority.intel.com/certs";
 
 /// Configuration for the Intel Trust Authority API.
 #[derive(Debug, Clone)]
@@ -108,7 +112,47 @@ pub struct VerifiedClaims {
     pub raw_token: String,
 }
 
-#[derive(Debug, Deserialize, Default)]
+/// Claims extracted from an ITA token after JWT signature and expiry validation.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedTokenClaims {
+    /// MRTD as a hex string (48 bytes = 96 hex chars).
+    pub mrtd: String,
+    /// Raw 64-byte TDX report data claim from the token.
+    pub report_data: [u8; 64],
+    /// Token binding material used to prove this token belongs to the attestation.
+    pub binding: VerifiedTokenBinding,
+    /// TCB status string from ITA.
+    pub tcb_status: String,
+    /// Optional TCB assessment date from ITA token claims.
+    pub tcb_date: Option<String>,
+}
+
+impl VerifiedTokenClaims {
+    pub(crate) fn binding_matches(
+        &self,
+        runtime_data: &[u8; 64],
+        expected_runtime_hash: &[u8; 64],
+    ) -> bool {
+        match &self.binding {
+            VerifiedTokenBinding::StandardReportData => self.report_data == *expected_runtime_hash,
+            VerifiedTokenBinding::AzureRuntime {
+                held_data,
+                user_data_hash,
+            } => held_data == runtime_data && user_data_hash == expected_runtime_hash,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum VerifiedTokenBinding {
+    StandardReportData,
+    AzureRuntime {
+        held_data: [u8; 64],
+        user_data_hash: [u8; 64],
+    },
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
 struct TdxNestedClaims {
     #[serde(default)]
     tdx_mrtd: String,
@@ -118,10 +162,22 @@ struct TdxNestedClaims {
     attester_tcb_status: String,
     #[serde(default)]
     attester_tcb_date: String,
+    #[serde(default)]
+    attester_held_data: String,
+    #[serde(default)]
+    attester_runtime_data: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default, Clone)]
+struct AppraisalClaims {
+    #[serde(default)]
+    method: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 struct ItaClaims {
+    #[serde(default)]
+    appraisal: AppraisalClaims,
     #[serde(default)]
     tdx: TdxNestedClaims,
     #[serde(default)]
@@ -132,6 +188,10 @@ struct ItaClaims {
     attester_tcb_status: String,
     #[serde(default)]
     attester_tcb_date: String,
+    #[serde(default)]
+    attester_held_data: String,
+    #[serde(default)]
+    attester_runtime_data: serde_json::Value,
 }
 
 impl ItaClaims {
@@ -171,6 +231,106 @@ impl ItaClaims {
             Some(v)
         }
     }
+
+    fn attester_held_data(&self) -> &str {
+        if !self.tdx.attester_held_data.is_empty() {
+            &self.tdx.attester_held_data
+        } else {
+            &self.attester_held_data
+        }
+    }
+
+    fn attester_runtime_user_data(&self) -> Option<&str> {
+        self.tdx
+            .attester_runtime_data
+            .get("user-data")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                self.attester_runtime_data
+                    .get("user-data")
+                    .and_then(serde_json::Value::as_str)
+            })
+    }
+
+    fn is_azure_method(&self) -> bool {
+        self.appraisal.method.eq_ignore_ascii_case("azure")
+            || (!self.attester_held_data().is_empty()
+                && self.attester_runtime_user_data().is_some())
+    }
+}
+
+/// Verify an ITA attestation token against Intel Trust Authority's JWKS.
+///
+/// The token header's `kid` selects the signing key from `jwks_url`; the token
+/// `jku` header, if present, is intentionally ignored.
+pub(crate) async fn verify_attestation_token(
+    jwt: &str,
+    jwks_url: &str,
+    request_timeout_secs: u64,
+) -> Result<VerifiedTokenClaims, VerifyError> {
+    use jsonwebtoken::jwk::JwkSet;
+    use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+
+    if jwt.trim().is_empty() {
+        return Err(VerifyError::JwtParse("JWT is empty".to_string()));
+    }
+
+    let header =
+        decode_header(jwt).map_err(|e| VerifyError::JwtParse(format!("JWT header: {e}")))?;
+    let algorithm = match header.alg {
+        Algorithm::PS384 | Algorithm::RS256 => header.alg,
+        other => {
+            return Err(VerifyError::JwtParse(format!(
+                "unsupported ITA token signing algorithm: {other:?}"
+            )))
+        }
+    };
+    let kid = header
+        .kid
+        .as_deref()
+        .ok_or_else(|| VerifyError::JwtParse("JWT header missing kid".to_string()))?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(request_timeout_secs))
+        .build()
+        .map_err(|e| VerifyError::Network(e.to_string()))?;
+    let response = client
+        .get(jwks_url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| VerifyError::Network(e.to_string()))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| VerifyError::Network(e.to_string()))?;
+    if !status.is_success() {
+        return Err(VerifyError::ItaApi(format!(
+            "ITA JWKS endpoint returned HTTP {status}: {body}"
+        )));
+    }
+
+    let jwks: JwkSet = serde_json::from_str(&body)
+        .map_err(|e| VerifyError::JwtParse(format!("JWKS JSON: {e}")))?;
+    let jwk = jwks
+        .keys
+        .iter()
+        .find(|jwk| jwk.common.key_id.as_deref() == Some(kid))
+        .ok_or_else(|| VerifyError::JwtParse(format!("JWKS has no key for kid {kid}")))?;
+    let key = DecodingKey::from_jwk(jwk)
+        .map_err(|e| VerifyError::JwtParse(format!("JWKS key for kid {kid}: {e}")))?;
+
+    let mut validation = Validation::new(algorithm);
+    validation.validate_exp = true;
+    validation.validate_nbf = true;
+    validation.validate_aud = false;
+
+    let token = decode::<ItaClaims>(jwt, &key, &validation)
+        .map_err(|e| VerifyError::JwtParse(format!("JWT validation: {e}")))?;
+    let claims = token.claims;
+    parse_verified_claims(claims)
 }
 
 fn attest_path() -> &'static str {
@@ -248,8 +408,11 @@ pub async fn get_nonce(config: &ItaConfig) -> Result<VerifierNonce, VerifyError>
 
 /// Verify TDX evidence via Intel Trust Authority (Intel CLI-compatible flow).
 ///
-/// Sends the raw quote along with `runtime_data` and `verifier_nonce` so that
-/// ITA can verify: `SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data) == REPORTDATA in quote`.
+/// Sends the raw quote along with `runtime_data` and `verifier_nonce`.
+/// For standard TDX attesters, ITA verifies
+/// `SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data) == REPORTDATA in quote`.
+/// Azure TDX VMs use Intel Trust Authority's `/attest/azure` flow, which binds
+/// the caller's `user_data` separately from the Azure runtime JSON.
 pub async fn verify_evidence(
     evidence: &Evidence,
     config: &ItaConfig,
@@ -347,7 +510,19 @@ pub async fn verify_evidence(
     };
 
     let claims = decode_jwt_claims(&jwt)?;
+    let verified = parse_verified_claims(claims)?;
 
+    Ok(VerifiedClaims {
+        mrtd: verified.mrtd,
+        report_data: verified.report_data,
+        runtime_data: *runtime_data,
+        tcb_status: verified.tcb_status,
+        tcb_date: verified.tcb_date,
+        raw_token: jwt,
+    })
+}
+
+fn parse_verified_claims(claims: ItaClaims) -> Result<VerifiedTokenClaims, VerifyError> {
     if claims.tdx_mrtd().len() != 96 {
         return Err(VerifyError::ItaApi(format!(
             "MRTD has unexpected length: {} chars (expected 96)",
@@ -357,71 +532,60 @@ pub async fn verify_evidence(
     hex::decode(claims.tdx_mrtd())
         .map_err(|_| VerifyError::ItaApi("MRTD is not valid hex".to_string()))?;
 
-    let report_data = if claims.tdx_report_data().is_empty() {
-        [0u8; 64]
+    if claims.tdx_report_data().is_empty() {
+        return Err(VerifyError::ItaApi(
+            "ITA token is missing tdx_report_data".to_string(),
+        ));
+    }
+    let report_data = decode_claim_array_64("tdx_report_data", claims.tdx_report_data())
+        .map_err(VerifyError::JwtParse)?;
+
+    let binding = if claims.is_azure_method() {
+        let held_data =
+            decode_standard_base64_array_64("attester_held_data", claims.attester_held_data())
+                .map_err(VerifyError::JwtParse)?;
+        let user_data_hash = decode_claim_array_64(
+            "attester_runtime_data.user-data",
+            claims.attester_runtime_user_data().ok_or_else(|| {
+                VerifyError::ItaApi(
+                    "Azure ITA token is missing attester_runtime_data.user-data".to_string(),
+                )
+            })?,
+        )
+        .map_err(VerifyError::JwtParse)?;
+        VerifiedTokenBinding::AzureRuntime {
+            held_data,
+            user_data_hash,
+        }
     } else {
-        parse_tdx_report_data(claims.tdx_report_data())?
+        VerifiedTokenBinding::StandardReportData
     };
 
-    Ok(VerifiedClaims {
+    Ok(VerifiedTokenClaims {
         mrtd: claims.tdx_mrtd().to_string(),
         report_data,
-        runtime_data: *runtime_data,
+        binding,
         tcb_status: claims.attester_tcb_status().to_string(),
         tcb_date: claims.attester_tcb_date().map(ToOwned::to_owned),
-        raw_token: jwt,
     })
 }
 
-/// Extract and parse the REPORTDATA embedded in an ITA v2 JWT.
+/// Extract the raw `tdx_report_data` claim embedded in an ITA v2 JWT.
 ///
 /// **Note:** After nonce integration, the JWT's `tdx_report_data` field contains
-/// `SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data)`, not the raw ReportData struct.
-pub fn report_data_from_token(jwt: &str) -> Result<Option<crate::report::ReportData>, VerifyError> {
+/// the token's 64-byte binding value, not the raw [`crate::report::ReportData`]
+/// struct. For standard TDX attesters this is
+/// `SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data)`.
+pub fn report_data_hash_from_token(jwt: &str) -> Result<Option<[u8; 64]>, VerifyError> {
     let claims = decode_jwt_claims(jwt)?;
 
     if claims.tdx_report_data().is_empty() {
         return Ok(None);
     }
 
-    let arr = parse_tdx_report_data(claims.tdx_report_data())?;
-    Ok(Some(crate::report::ReportData::from_bytes(&arr)))
-}
-
-fn parse_tdx_report_data(value: &str) -> Result<[u8; 64], VerifyError> {
-    use base64::{
-        engine::general_purpose::STANDARD as BASE64,
-        engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL, Engine,
-    };
-
-    // ITA can emit REPORTDATA as 128-char hex (64 bytes) in some responses.
-    if value.len() == 128 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
-        let bytes = hex::decode(value)
-            .map_err(|_| VerifyError::JwtParse("tdx_report_data: invalid hex".to_string()))?;
-        let mut arr = [0u8; 64];
-        arr.copy_from_slice(&bytes);
-        return Ok(arr);
-    }
-
-    let rd_bytes = BASE64URL
-        .decode(value)
-        .or_else(|_| BASE64.decode(value))
-        .map_err(|_| {
-            VerifyError::JwtParse(
-                "tdx_report_data: could not decode as base64url/base64".to_string(),
-            )
-        })?;
-
-    if rd_bytes.len() != 64 {
-        return Err(VerifyError::JwtParse(format!(
-            "tdx_report_data has unexpected length: {} bytes (expected 64)",
-            rd_bytes.len()
-        )));
-    }
-
-    let mut arr = [0u8; 64];
-    arr.copy_from_slice(&rd_bytes);
-    Ok(arr)
+    decode_claim_array_64("tdx_report_data", claims.tdx_report_data())
+        .map(Some)
+        .map_err(VerifyError::JwtParse)
 }
 
 fn decode_jwt_claims(jwt: &str) -> Result<ItaClaims, VerifyError> {
@@ -437,4 +601,82 @@ fn decode_jwt_claims(jwt: &str) -> Result<ItaClaims, VerifyError> {
 
     serde_json::from_slice::<ItaClaims>(&payload_bytes)
         .map_err(|e| VerifyError::JwtParse(format!("JWT claims JSON: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_verified_claims, VerifiedTokenBinding};
+    use crate::verify::VerifyError;
+    use base64::Engine;
+    use serde_json::json;
+    use sha2::{Digest, Sha512};
+
+    fn sample_mrtd() -> String {
+        "11".repeat(48)
+    }
+
+    #[test]
+    fn parse_verified_claims_azure_uses_held_data_and_runtime_hash_binding() {
+        let runtime_data = [0x5au8; 64];
+        let nonce_val = [0x11u8; 32];
+        let nonce_iat = [0x22u8; 32];
+        let user_data_hash: [u8; 64] = {
+            let mut h = Sha512::new();
+            h.update(nonce_val);
+            h.update(nonce_iat);
+            h.update(runtime_data);
+            h.finalize().into()
+        };
+
+        let claims = serde_json::from_value(json!({
+            "appraisal": { "method": "azure" },
+            "tdx": {
+                "tdx_mrtd": sample_mrtd(),
+                "tdx_report_data": format!("{}{}", "aa".repeat(32), "00".repeat(32)),
+                "attester_tcb_status": "UpToDate",
+                "attester_tcb_date": "2026-02-11T00:00:00Z",
+                "attester_held_data": base64::engine::general_purpose::STANDARD.encode(runtime_data),
+                "attester_runtime_data": {
+                    "user-data": hex::encode(user_data_hash),
+                }
+            }
+        }))
+        .expect("claims JSON should deserialize");
+
+        let verified = parse_verified_claims(claims).expect("Azure claims should parse");
+        match verified.binding {
+            VerifiedTokenBinding::AzureRuntime {
+                held_data,
+                user_data_hash: actual_hash,
+            } => {
+                assert_eq!(held_data, runtime_data);
+                assert_eq!(actual_hash, user_data_hash);
+                assert!(verified.binding_matches(&runtime_data, &user_data_hash));
+            }
+            VerifiedTokenBinding::StandardReportData => {
+                panic!("expected Azure runtime binding")
+            }
+        }
+    }
+
+    #[test]
+    fn parse_verified_claims_rejects_missing_azure_runtime_hash() {
+        let claims = serde_json::from_value(json!({
+            "appraisal": { "method": "azure" },
+            "tdx": {
+                "tdx_mrtd": sample_mrtd(),
+                "tdx_report_data": "00".repeat(64),
+                "attester_tcb_status": "UpToDate",
+                "attester_held_data": base64::engine::general_purpose::STANDARD.encode([0u8; 64]),
+                "attester_runtime_data": {}
+            }
+        }))
+        .expect("claims JSON should deserialize");
+
+        let err = parse_verified_claims(claims).unwrap_err();
+        assert!(
+            matches!(err, VerifyError::ItaApi(ref message) if message.contains("attester_runtime_data.user-data")),
+            "unexpected error: {err}"
+        );
+    }
 }
