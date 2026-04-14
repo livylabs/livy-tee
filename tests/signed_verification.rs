@@ -7,9 +7,10 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use livy_tee::{
-    appraise_evidence_unauthenticated, unauthenticated_report_data_hash_from_token, Attestation,
-    AttestationVerification, AttestationVerificationPolicy, Evidence, ItaConfig, PublicValues,
-    ReportData, VerifierNonce, VerifyError, REPORT_DATA_VERSION,
+    appraise_evidence_unauthenticated, default_issuer_for_jwks_url,
+    unauthenticated_report_data_hash_from_token, Attestation, AttestationVerification,
+    AttestationVerificationPolicy, Evidence, ItaConfig, PublicValues, ReportData, VerifierNonce,
+    VerifyError, REPORT_DATA_VERSION,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha512};
@@ -74,6 +75,10 @@ struct JwksServer {
 
 impl JwksServer {
     async fn spawn() -> Self {
+        Self::spawn_with_requests(1).await
+    }
+
+    async fn spawn_with_requests(requests: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind local JWKS server");
@@ -90,18 +95,20 @@ impl JwksServer {
         })
         .to_string();
         let task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept JWKS request");
-            let mut request = [0u8; 1024];
-            let _ = stream.read(&mut request).await;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream
-                .write_all(response.as_bytes())
-                .await
-                .expect("write JWKS response");
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().await.expect("accept JWKS request");
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write JWKS response");
+            }
         });
         Self {
             url: format!("http://{addr}/jwks.json"),
@@ -190,8 +197,8 @@ fn quote_with_report_data(report_data: [u8; 64]) -> String {
 
 fn verification_fixture(tcb_status: &str) -> VerificationFixture {
     let mut public_values = PublicValues::new();
-    public_values.commit(&"input");
-    public_values.commit(&"output");
+    public_values.commit(&"input").unwrap();
+    public_values.commit(&"output").unwrap();
 
     let report_data = ReportData::new(
         public_values.commitment_hash(),
@@ -327,8 +334,26 @@ fn verify_config(api_url: String) -> ItaConfig {
     ItaConfig {
         api_key: "test-key".to_string(),
         api_url,
+        expected_token_issuer: None,
+        expected_token_audience: None,
         request_timeout_secs: 30,
     }
+}
+
+fn with_issuer(mut claims: Value, issuer: &str) -> Value {
+    claims
+        .as_object_mut()
+        .expect("test claims should be a JSON object")
+        .insert("iss".to_string(), json!(issuer));
+    claims
+}
+
+fn with_audience(mut claims: Value, audience: impl Into<Value>) -> Value {
+    claims
+        .as_object_mut()
+        .expect("test claims should be a JSON object")
+        .insert("aud".to_string(), audience.into());
+    claims
 }
 
 fn attach_azure_runtime_evidence(fixture: &mut VerificationFixture) {
@@ -349,7 +374,8 @@ async fn verify_fixture(
     let server = JwksServer::spawn().await;
     let mut policy = policy;
     policy.jwks_url = server.url.clone();
-    fixture.attestation.ita_token = sign_token(claims);
+    let issuer = default_issuer_for_jwks_url(&policy.jwks_url).expect("derive issuer from JWKS");
+    fixture.attestation.ita_token = sign_token(with_issuer(claims, &issuer));
     let report = fixture
         .attestation
         .verify_with_policy(&policy)
@@ -365,9 +391,10 @@ async fn verify_fresh_fixture(
     appraisal_path: &'static str,
     policy: AttestationVerificationPolicy,
 ) -> AttestationVerification {
-    let stored_token = sign_token(claims.clone());
+    let jwks = JwksServer::spawn_with_requests(2).await;
+    let issuer = default_issuer_for_jwks_url(&jwks.url).expect("derive issuer from JWKS");
+    let stored_token = sign_token(with_issuer(claims.clone(), &issuer));
     let appraisal = AppraisalServer::spawn(appraisal_path, stored_token.clone()).await;
-    let jwks = JwksServer::spawn().await;
     let mut policy = policy;
     policy.jwks_url = jwks.url.clone();
     fixture.attestation.ita_token = stored_token;
@@ -397,6 +424,8 @@ async fn appraise_evidence_unauthenticated_returns_trimmed_token_claims() {
         &ItaConfig {
             api_key: "test-key".to_string(),
             api_url: appraisal.url.clone(),
+            expected_token_issuer: None,
+            expected_token_audience: None,
             request_timeout_secs: 30,
         },
         &fixture.runtime_data,
@@ -885,10 +914,14 @@ async fn verify_with_policy_reports_future_nbf_jwt() {
 #[tokio::test]
 async fn verify_with_policy_reports_unknown_kid_jwt() {
     let mut fixture = verification_fixture("UpToDate");
-    let claims = standard_claims(&fixture, fixture.runtime_hash, "UpToDate");
     let server = JwksServer::spawn().await;
     let mut policy = default_policy(&fixture);
     policy.jwks_url = server.url.clone();
+    let issuer = default_issuer_for_jwks_url(&policy.jwks_url).expect("derive issuer from JWKS");
+    let claims = with_issuer(
+        standard_claims(&fixture, fixture.runtime_hash, "UpToDate"),
+        &issuer,
+    );
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some("wrong-kid".to_string());
     fixture.attestation.ita_token = sign_token_with_header(claims, header);
@@ -915,7 +948,10 @@ async fn verify_with_policy_reports_unknown_kid_jwt() {
 #[tokio::test]
 async fn verify_with_policy_reports_unsupported_algorithm_jwt() {
     let mut fixture = verification_fixture("UpToDate");
-    let claims = standard_claims(&fixture, fixture.runtime_hash, "UpToDate");
+    let claims = with_issuer(
+        standard_claims(&fixture, fixture.runtime_hash, "UpToDate"),
+        "https://127.0.0.1:1/",
+    );
     let mut policy = default_policy(&fixture);
     policy.jwks_url = "http://127.0.0.1:1/jwks.json".to_string();
     let mut header = Header::new(Algorithm::HS256);
@@ -948,10 +984,14 @@ async fn verify_with_policy_reports_unsupported_algorithm_jwt() {
 #[tokio::test]
 async fn verify_with_policy_accepts_trimmed_jwt() {
     let mut fixture = verification_fixture("UpToDate");
-    let claims = standard_claims(&fixture, fixture.runtime_hash, "UpToDate");
     let server = JwksServer::spawn().await;
     let mut policy = default_policy(&fixture);
     policy.jwks_url = server.url.clone();
+    let issuer = default_issuer_for_jwks_url(&policy.jwks_url).expect("derive issuer from JWKS");
+    let claims = with_issuer(
+        standard_claims(&fixture, fixture.runtime_hash, "UpToDate"),
+        &issuer,
+    );
     fixture.attestation.ita_token = format!("  {} \n", sign_token(claims));
 
     let report = fixture
@@ -991,10 +1031,11 @@ async fn verify_fresh_rejects_missing_azure_runtime_json_as_invalid_stored_evide
         fixture.runtime_hash,
         "UpToDate",
     );
-    let stored_token = sign_token(claims);
     let jwks = JwksServer::spawn().await;
     let mut policy = default_policy(&fixture);
     policy.jwks_url = jwks.url.clone();
+    let issuer = default_issuer_for_jwks_url(&policy.jwks_url).expect("derive issuer from JWKS");
+    let stored_token = sign_token(with_issuer(claims, &issuer));
     fixture.attestation.ita_token = stored_token;
     fixture.attestation.evidence = fixture.attestation.raw_quote.clone();
 
@@ -1006,4 +1047,56 @@ async fn verify_fresh_rejects_missing_azure_runtime_json_as_invalid_stored_evide
     jwks.finish().await;
 
     assert!(matches!(err, VerifyError::InvalidStoredEvidence(_)));
+}
+
+#[tokio::test]
+async fn verify_with_policy_accepts_expected_audience() {
+    let fixture = verification_fixture("UpToDate");
+    let claims = with_audience(
+        standard_claims(&fixture, fixture.runtime_hash, "UpToDate"),
+        json!(["livy-tee", "verifier"]),
+    );
+    let mut policy = default_policy(&fixture);
+    policy.expected_token_audience = Some("verifier".to_string());
+    let report = verify_fixture(fixture, claims, policy).await;
+
+    assert!(report.jwt_signature_and_expiry_valid);
+    assert!(report.all_passed());
+}
+
+#[tokio::test]
+async fn verify_with_policy_reports_audience_mismatch() {
+    let fixture = verification_fixture("UpToDate");
+    let claims = with_audience(
+        standard_claims(&fixture, fixture.runtime_hash, "UpToDate"),
+        json!("someone-else"),
+    );
+    let mut policy = default_policy(&fixture);
+    policy.expected_token_audience = Some("verifier".to_string());
+    let report = verify_fixture(fixture, claims, policy).await;
+
+    assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(matches!(
+        report.token_verification_error,
+        Some(VerifyError::InvalidToken(_))
+    ));
+    assert!(!report.token_report_data_matches);
+    assert!(!report.all_passed());
+}
+
+#[tokio::test]
+async fn verify_with_policy_reports_issuer_mismatch() {
+    let fixture = verification_fixture("UpToDate");
+    let claims = standard_claims(&fixture, fixture.runtime_hash, "UpToDate");
+    let mut policy = default_policy(&fixture);
+    policy.expected_token_issuer = Some("https://wrong.example/".to_string());
+    let report = verify_fixture(fixture, claims, policy).await;
+
+    assert!(!report.jwt_signature_and_expiry_valid);
+    assert!(matches!(
+        report.token_verification_error,
+        Some(VerifyError::InvalidToken(_))
+    ));
+    assert!(!report.token_report_data_matches);
+    assert!(!report.all_passed());
 }

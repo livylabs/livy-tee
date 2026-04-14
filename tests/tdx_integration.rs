@@ -170,8 +170,8 @@ async fn verify_quote_rejects_tampered_values() {
     let att = builder.finalize().await.expect("finalize failed");
 
     let mut tampered = PublicValues::new();
-    tampered.commit(&"TAMPERED input");
-    tampered.commit(&"real output");
+    tampered.commit(&"TAMPERED input").unwrap();
+    tampered.commit(&"real output").unwrap();
 
     let ok = verify_quote_with_public_values(
         &att.raw_quote,
@@ -233,10 +233,25 @@ async fn proof_verify_correct_and_tampered() {
         Some(true),
         "strict verification report: {strict_report:#?}"
     );
-    assert!(
-        strict_report.all_passed(),
-        "strict verification report: {strict_report:#?}"
-    );
+    if strict_report.tcb_status.eq_ignore_ascii_case("UpToDate") {
+        assert!(
+            strict_report.all_passed(),
+            "strict verification report: {strict_report:#?}"
+        );
+    } else {
+        assert_eq!(
+            strict_report.tcb_status, "OutOfDate",
+            "unexpected non-UpToDate status: {strict_report:#?}"
+        );
+        assert!(
+            !strict_report.tcb_status_allowed,
+            "expected policy rejection for non-UpToDate TCB: {strict_report:#?}"
+        );
+        assert!(
+            !strict_report.all_passed(),
+            "non-UpToDate TCB should keep all_passed false under default policy: {strict_report:#?}"
+        );
+    }
     assert_eq!(
         report.tcb_status_allowed,
         report.tcb_status.eq_ignore_ascii_case("UpToDate")

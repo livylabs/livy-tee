@@ -33,12 +33,13 @@
 use crate::{
     evidence::Evidence,
     generate::{generate_evidence, GenerateError},
+    public_values::PublicValuesError,
     report::BuildIdError,
     verify::{ita::ItaConfig, VerifyError},
 };
 
 #[cfg(not(feature = "mock-tee"))]
-use crate::verify::ita::{appraise_evidence_unauthenticated, get_nonce};
+use crate::verify::ita::{appraise_evidence_authenticated, get_nonce};
 use thiserror::Error;
 
 /// Output of a combined TDX quote generation + ITA attestation call.
@@ -73,6 +74,9 @@ pub struct AttestedEvidence {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AttestError {
+    /// Preparing committed public values failed.
+    #[error("public values commit failed: {0}")]
+    PublicValues(#[from] PublicValuesError),
     /// Quote generation failed.
     #[error("quote generation failed: {0}")]
     Generate(#[from] GenerateError),
@@ -89,6 +93,7 @@ impl AttestError {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
+            Self::PublicValues(_) => "public_values",
             Self::Generate(err) => err.code(),
             Self::BuildId(_) => "build_id",
             Self::Verify(err) => err.code(),
@@ -152,15 +157,23 @@ pub async fn generate_and_attest(
 
     #[cfg(not(feature = "mock-tee"))]
     {
-        let claims =
-            appraise_evidence_unauthenticated(&evidence, config, user_data, &nonce).await?;
+        let (raw_token, claims) = appraise_evidence_authenticated(
+            &evidence,
+            config,
+            user_data,
+            &nonce,
+            &config.default_jwks_url(),
+            config.expected_token_issuer(),
+            config.expected_token_audience.clone(),
+        )
+        .await?;
         Ok(AttestedEvidence {
             evidence,
-            ita_token: claims.raw_token,
-            mrtd: claims.mrtd,
-            tcb_status: claims.tcb_status,
-            tcb_date: claims.tcb_date,
-            advisory_ids: claims.advisory_ids,
+            ita_token: raw_token,
+            mrtd: claims.mrtd().to_string(),
+            tcb_status: claims.tcb_status().to_string(),
+            tcb_date: claims.tcb_date().map(str::to_string),
+            advisory_ids: claims.advisory_ids().to_vec(),
             runtime_data: *user_data,
             nonce_val,
             nonce_iat,

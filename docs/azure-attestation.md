@@ -160,6 +160,11 @@ run on top of Azure's token binding:
 
 - `accepted_tcb_statuses`
   compared against the signed ITA token, case-insensitive
+- `expected_token_issuer`
+  compared against the signed token `iss`; by default this is derived from the
+  configured JWKS URL
+- `expected_token_audience`
+  optional `aud` pin; leave unset unless your ITA deployment populates it
 - `expected_mrtd`
   compared against the signed token MRTD
 - `expected_build_id`
@@ -174,6 +179,9 @@ use livy_tee::{AttestationVerificationPolicy, binary_hash, build_id_from_hash_he
 
 let mut policy = AttestationVerificationPolicy::default();
 policy.accepted_tcb_statuses = vec!["UpToDate".to_string()];
+policy.expected_token_issuer =
+    livy_tee::default_issuer_for_jwks_url(&attestation.jwks_url);
+policy.expected_token_audience = Some("your-verifier".to_string());
 policy.expected_mrtd = Some(expected_mrtd_hex.to_string());
 policy.expected_build_id = Some(build_id_from_hash_hex(&binary_hash()?)?);
 policy.expected_nonce = Some(expected_application_nonce);
@@ -219,7 +227,7 @@ Fresh evidence authentication on Azure requires:
 
 `verify_fresh()` reconstructs the stored `Evidence` from `attestation.evidence`,
 rebuilds the verifier nonce object, and calls
-`appraise_evidence_unauthenticated(...)`.
+`appraise_evidence_authenticated(...)`.
 
 Provider routing for this fresh appraisal is based on the evidence artifact
 itself:
@@ -235,6 +243,11 @@ If the attestation token indicates Azure but the bundled `evidence` field does
 not contain Azure runtime JSON, `verify_fresh()` now returns a hard
 `VerifyError::InvalidStoredEvidence` instead of silently using the non-Azure
 path.
+
+The fresh path also verifies the newly returned ITA token locally against JWKS
+before trusting the appraisal result. Fresh evidence verification is therefore
+not just "HTTPS to ITA succeeded"; it also rechecks the token signature and the
+Azure binding claims.
 
 ---
 

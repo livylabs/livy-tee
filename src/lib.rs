@@ -50,8 +50,8 @@ pub use verify::extract::{extract_mrtd, extract_report_data, ExtractError};
 
 #[cfg(feature = "ita-verify")]
 pub use verify::ita::{
-    appraise_evidence_unauthenticated, default_jwks_url_for_api_url, get_nonce, ItaConfig,
-    UnauthenticatedAppraisalClaims, VerifierNonce,
+    appraise_evidence_unauthenticated, default_issuer_for_jwks_url, default_jwks_url_for_api_url,
+    get_nonce, ItaConfig, UnauthenticatedAppraisalClaims, VerifierNonce,
 };
 #[cfg(feature = "ita-verify")]
 pub use verify::VerifyError;

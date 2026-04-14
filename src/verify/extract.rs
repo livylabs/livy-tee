@@ -32,6 +32,9 @@ pub enum ExtractError {
     /// Base64 decoding failed while parsing a textual quote/runtime input.
     #[error("base64 decode failed: {0}")]
     Base64(String),
+    /// Runtime data did not decode to exactly 64 bytes.
+    #[error("runtime_data must decode to exactly 64 bytes, got {0}")]
+    InvalidRuntimeDataLength(usize),
     /// Quote buffer is too short to contain the required DCAP fields.
     #[error("quote too short: need at least {QUOTE_MIN_LEN} bytes, got {0}")]
     TooShort(usize),

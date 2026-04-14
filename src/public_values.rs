@@ -89,20 +89,18 @@ impl PublicValues {
     /// Values are serialized with `serde_json` and appended to the on-wire
     /// buffer. Use [`commit_raw`](Self::commit_raw) when the payload is already
     /// pre-serialized (for example a precomputed hash).
-    pub fn commit<T: Serialize>(&mut self, value: &T) {
+    pub fn commit<T: Serialize>(&mut self, value: &T) -> Result<&mut Self, PublicValuesError> {
         let encoded =
-            serde_json::to_vec(value).expect("PublicValues::commit: serialization should not fail");
-        self.commit_raw(&encoded);
+            serde_json::to_vec(value).map_err(|e| PublicValuesError::Serialize(e.to_string()))?;
+        self.commit_raw(&encoded)
     }
 
     /// Commit raw bytes directly (no serialization wrapper).
-    pub fn commit_raw(&mut self, bytes: &[u8]) {
-        let len: u32 = bytes
-            .len()
-            .try_into()
-            .expect("PublicValues entry too large for wire format");
+    pub fn commit_raw(&mut self, bytes: &[u8]) -> Result<&mut Self, PublicValuesError> {
+        let len = entry_len_u32(bytes.len())?;
         self.buffer.extend_from_slice(&len.to_le_bytes());
         self.buffer.extend_from_slice(bytes);
+        Ok(self)
     }
 
     /// Read the next JSON-serialized entry.
@@ -267,6 +265,11 @@ pub fn entry_hash(wire_bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(wire_bytes).into()
 }
 
+fn entry_len_u32(len: usize) -> Result<u32, PublicValuesError> {
+    len.try_into()
+        .map_err(|_| PublicValuesError::EntryTooLarge(len))
+}
+
 fn entry_end(buffer: &[u8], offset: usize) -> Option<usize> {
     checked_entry_end(buffer, offset).ok().flatten()
 }
@@ -313,6 +316,12 @@ pub enum PublicValuesError {
     /// Base64 decoding failed.
     #[error("failed to decode public values base64: {0}")]
     Base64(String),
+    /// Serializing a committed value failed.
+    #[error("failed to serialize public value: {0}")]
+    Serialize(String),
+    /// A committed payload is too large for the 32-bit wire-format length prefix.
+    #[error("public value is too large for the wire format: {0} bytes")]
+    EntryTooLarge(usize),
     /// The buffer has no more complete entries to read.
     #[error("public values buffer exhausted — no more entries to read")]
     BufferExhausted,
@@ -346,10 +355,22 @@ pub enum PublicValuesError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::ser::Error as _;
+
+    struct FailingSerialize;
+
+    impl serde::Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(S::Error::custom("intentional serialization failure"))
+        }
+    }
 
     fn malformed_with_truncated_payload_tail() -> (PublicValues, usize) {
         let mut prefix = PublicValues::new();
-        prefix.commit(&"ok");
+        prefix.commit(&"ok").unwrap();
 
         let tail_offset = prefix.len();
         let mut bytes = prefix.into_bytes();
@@ -361,7 +382,7 @@ mod tests {
 
     fn malformed_with_truncated_length_prefix_tail() -> (PublicValues, usize) {
         let mut prefix = PublicValues::new();
-        prefix.commit(&"ok");
+        prefix.commit(&"ok").unwrap();
 
         let tail_offset = prefix.len();
         let mut bytes = prefix.into_bytes();
@@ -373,9 +394,9 @@ mod tests {
     #[test]
     fn commit_and_read_roundtrip() {
         let mut pv = PublicValues::new();
-        pv.commit(&42u64);
-        pv.commit(&"hello world".to_string());
-        pv.commit(&[1u8, 2, 3, 4]);
+        pv.commit(&42u64).unwrap();
+        pv.commit(&"hello world".to_string()).unwrap();
+        pv.commit(&[1u8, 2, 3, 4]).unwrap();
 
         let reader = PublicValues::from_bytes(pv.into_bytes());
         assert_eq!(reader.read::<u64>().unwrap(), 42);
@@ -386,12 +407,12 @@ mod tests {
     #[test]
     fn commitment_hash_is_deterministic() {
         let mut a = PublicValues::new();
-        a.commit(&100i64);
-        a.commit(&"test");
+        a.commit(&100i64).unwrap();
+        a.commit(&"test").unwrap();
 
         let mut b = PublicValues::new();
-        b.commit(&100i64);
-        b.commit(&"test");
+        b.commit(&100i64).unwrap();
+        b.commit(&"test").unwrap();
 
         assert_eq!(a.commitment_hash(), b.commitment_hash());
     }
@@ -399,10 +420,10 @@ mod tests {
     #[test]
     fn commitment_hash_changes_with_different_values() {
         let mut a = PublicValues::new();
-        a.commit(&1u32);
+        a.commit(&1u32).unwrap();
 
         let mut b = PublicValues::new();
-        b.commit(&2u32);
+        b.commit(&2u32).unwrap();
 
         assert_ne!(a.commitment_hash(), b.commitment_hash());
     }
@@ -410,12 +431,12 @@ mod tests {
     #[test]
     fn commitment_hash_changes_with_order() {
         let mut a = PublicValues::new();
-        a.commit(&1u32);
-        a.commit(&2u32);
+        a.commit(&1u32).unwrap();
+        a.commit(&2u32).unwrap();
 
         let mut b = PublicValues::new();
-        b.commit(&2u32);
-        b.commit(&1u32);
+        b.commit(&2u32).unwrap();
+        b.commit(&1u32).unwrap();
 
         assert_ne!(a.commitment_hash(), b.commitment_hash());
     }
@@ -423,7 +444,7 @@ mod tests {
     #[test]
     fn verify_commitment_passes() {
         let mut pv = PublicValues::new();
-        pv.commit(&"payload");
+        pv.commit(&"payload").unwrap();
         let hash = pv.commitment_hash();
         assert!(pv.verify_commitment(&hash));
     }
@@ -431,7 +452,7 @@ mod tests {
     #[test]
     fn verify_commitment_rejects_wrong_hash() {
         let mut pv = PublicValues::new();
-        pv.commit(&"payload");
+        pv.commit(&"payload").unwrap();
         assert!(!pv.verify_commitment(&[0u8; 32]));
     }
 
@@ -444,8 +465,8 @@ mod tests {
     #[test]
     fn base64_roundtrip() {
         let mut pv = PublicValues::new();
-        pv.commit(&99u64);
-        pv.commit(&"b64 test");
+        pv.commit(&99u64).unwrap();
+        pv.commit(&"b64 test").unwrap();
 
         let b64 = pv.to_base64();
         let restored = PublicValues::from_base64(&b64).unwrap();
@@ -457,7 +478,7 @@ mod tests {
     #[test]
     fn raw_commit_and_read() {
         let mut pv = PublicValues::new();
-        pv.commit_raw(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        pv.commit_raw(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
 
         let reader = PublicValues::from_bytes(pv.into_bytes());
         let raw = reader.read_raw().unwrap();
@@ -465,9 +486,30 @@ mod tests {
     }
 
     #[test]
+    fn commit_reports_serialization_failures() {
+        let mut pv = PublicValues::new();
+
+        assert!(matches!(
+            pv.commit(&FailingSerialize),
+            Err(PublicValuesError::Serialize(message))
+                if message == "intentional serialization failure"
+        ));
+    }
+
+    #[test]
+    fn commit_raw_rejects_entries_larger_than_u32_wire_limit() {
+        let oversized_len = u32::MAX as usize + 1;
+
+        assert_eq!(
+            entry_len_u32(oversized_len),
+            Err(PublicValuesError::EntryTooLarge(oversized_len))
+        );
+    }
+
+    #[test]
     fn reset_cursor_allows_rereading() {
         let mut pv = PublicValues::new();
-        pv.commit(&7u32);
+        pv.commit(&7u32).unwrap();
 
         let reader = PublicValues::from_bytes(pv.into_bytes());
         assert_eq!(reader.read::<u32>().unwrap(), 7);
@@ -480,9 +522,9 @@ mod tests {
     #[test]
     fn entries_raw_returns_entry_boundaries_and_indices() {
         let mut values = PublicValues::new();
-        values.commit(&"alpha");
-        values.commit(&42u32);
-        values.commit(&vec!["x", "y"]);
+        values.commit(&"alpha").unwrap();
+        values.commit(&42u32).unwrap();
+        values.commit(&vec!["x", "y"]).unwrap();
 
         let entries = values.entries_raw();
         assert_eq!(entries.len(), 3);
@@ -507,9 +549,9 @@ mod tests {
     #[test]
     fn entry_hash_is_stable_for_identical_values_and_changes_for_different_values() {
         let mut values = PublicValues::new();
-        values.commit(&"same");
-        values.commit(&"same");
-        values.commit(&"different");
+        values.commit(&"same").unwrap();
+        values.commit(&"same").unwrap();
+        values.commit(&"different").unwrap();
 
         let entries = values.entries_raw();
         let first = entry_hash(&entries[0].1);
@@ -525,9 +567,9 @@ mod tests {
         let mut values = PublicValues::new();
         assert_eq!(values.entry_count(), 0);
 
-        values.commit(&"one");
-        values.commit(&"two");
-        values.commit(&3u8);
+        values.commit(&"one").unwrap();
+        values.commit(&"two").unwrap();
+        values.commit(&3u8).unwrap();
 
         assert_eq!(values.entry_count(), 3);
     }
@@ -535,9 +577,9 @@ mod tests {
     #[test]
     fn entry_count_survives_from_bytes_and_from_base64() {
         let mut values = PublicValues::new();
-        values.commit(&"one");
-        values.commit(&"two");
-        values.commit(&3u8);
+        values.commit(&"one").unwrap();
+        values.commit(&"two").unwrap();
+        values.commit(&3u8).unwrap();
 
         let from_bytes = PublicValues::from_bytes(values.as_bytes().to_vec());
         let from_base64 = PublicValues::from_base64(&values.to_base64()).unwrap();
@@ -551,8 +593,8 @@ mod tests {
     #[test]
     fn entries_raw_does_not_advance_the_read_cursor() {
         let mut values = PublicValues::new();
-        values.commit(&"first");
-        values.commit(&"second");
+        values.commit(&"first").unwrap();
+        values.commit(&"second").unwrap();
 
         let _ = values.entries_raw();
         let first: String = values.read().unwrap();
@@ -565,7 +607,7 @@ mod tests {
     #[test]
     fn read_preserves_cursor_on_deserialize_error() {
         let mut values = PublicValues::new();
-        values.commit(&7u32);
+        values.commit(&7u32).unwrap();
 
         assert!(matches!(
             values.read::<String>(),
@@ -577,8 +619,8 @@ mod tests {
     #[test]
     fn base64_roundtrip_preserves_entries() {
         let mut values = PublicValues::new();
-        values.commit(&"alpha");
-        values.commit(&7u32);
+        values.commit(&"alpha").unwrap();
+        values.commit(&7u32).unwrap();
 
         let encoded = values.to_base64();
         let decoded = PublicValues::from_base64(&encoded).unwrap();
@@ -645,9 +687,9 @@ mod tests {
     #[test]
     fn validate_accepts_well_formed_raw_and_typed_entries() {
         let mut values = PublicValues::new();
-        values.commit(&"alpha");
-        values.commit_raw(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        values.commit(&42u32);
+        values.commit(&"alpha").unwrap();
+        values.commit_raw(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+        values.commit(&42u32).unwrap();
 
         assert!(values.validate().is_ok());
     }

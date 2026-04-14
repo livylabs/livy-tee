@@ -55,6 +55,15 @@ pub struct ItaConfig {
     pub api_key: String,
     /// ITA endpoint base URL (default: `https://api.trustauthority.intel.com`).
     pub api_url: String,
+    /// Optional expected token issuer (`iss`).
+    ///
+    /// If `None`, authenticated verification derives the issuer from the JWKS
+    /// URL associated with this ITA region.
+    pub expected_token_issuer: Option<String>,
+    /// Optional expected token audience (`aud`).
+    ///
+    /// If `None`, audience is not enforced.
+    pub expected_token_audience: Option<String>,
     /// Timeout in seconds for ITA HTTP requests (default: 30).
     pub request_timeout_secs: u64,
 }
@@ -65,6 +74,14 @@ impl ItaConfig {
     pub fn default_jwks_url(&self) -> String {
         default_jwks_url_for_api_url(&self.api_url)
     }
+
+    /// Derive the expected token issuer for this configuration.
+    #[must_use]
+    pub fn expected_token_issuer(&self) -> Option<String> {
+        self.expected_token_issuer
+            .clone()
+            .or_else(|| default_issuer_for_jwks_url(&self.default_jwks_url()))
+    }
 }
 
 impl Default for ItaConfig {
@@ -72,6 +89,8 @@ impl Default for ItaConfig {
         Self {
             api_key: String::new(),
             api_url: "https://api.trustauthority.intel.com".to_string(),
+            expected_token_issuer: None,
+            expected_token_audience: None,
             request_timeout_secs: 30,
         }
     }
@@ -88,6 +107,22 @@ pub fn default_jwks_url_for_api_url(api_url: &str) -> String {
         .ok()
         .and_then(default_jwks_url_from_api_url)
         .unwrap_or_else(|| DEFAULT_JWKS_URL.to_string())
+}
+
+/// Derive the default token issuer from an Intel Trust Authority JWKS URL.
+///
+/// For standard ITA regional JWKS URLs, this is the base portal URL with `/`
+/// as the path. For example:
+/// `https://portal.trustauthority.intel.com/certs`
+/// becomes
+/// `https://portal.trustauthority.intel.com/`.
+#[must_use]
+pub fn default_issuer_for_jwks_url(jwks_url: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(jwks_url).ok()?;
+    url.set_path("/");
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.to_string())
 }
 
 fn default_jwks_url_from_api_url(api_url: reqwest::Url) -> Option<String> {
@@ -287,6 +322,10 @@ struct ItaClaims {
     #[serde(flatten)]
     flat_tdx: TdxClaimFields,
     #[serde(default)]
+    iss: String,
+    #[serde(default)]
+    aud: serde_json::Value,
+    #[serde(default)]
     #[allow(dead_code)]
     exp: Option<u64>,
     #[serde(default)]
@@ -394,6 +433,15 @@ impl ItaClaims {
             return Ok(AppraisalBindingKind::Azure);
         }
 
+        // Intel Trust Authority currently returns `appraisal.method = "default"`
+        // for standard non-Azure TDX appraisals on GCP while still including
+        // supplemental `attester_*` fields. In that shape, `tdx_report_data`
+        // remains the authoritative standard binding surface and the extra
+        // attester claims must not force Azure semantics.
+        if method.eq_ignore_ascii_case("default") {
+            return Ok(AppraisalBindingKind::Standard);
+        }
+
         match (method.is_empty(), has_held_data, has_runtime_user_data) {
             (_, false, false) => Ok(AppraisalBindingKind::Standard),
             (true, true, true) => Ok(AppraisalBindingKind::Azure),
@@ -444,6 +492,8 @@ pub(crate) async fn verify_attestation_token(
     jwt: &str,
     jwks_url: &str,
     request_timeout_secs: u64,
+    expected_issuer: Option<&str>,
+    expected_audience: Option<&str>,
 ) -> Result<VerifiedTokenClaims, VerifyError> {
     use jsonwebtoken::jwk::JwkSet;
     use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
@@ -502,6 +552,8 @@ pub(crate) async fn verify_attestation_token(
     let token = decode::<ItaClaims>(jwt, &key, &validation)
         .map_err(|e| VerifyError::InvalidToken(format!("JWT validation: {e}")))?;
     let claims = token.claims;
+    validate_expected_issuer(&claims, expected_issuer)?;
+    validate_expected_audience(&claims, expected_audience)?;
     parse_verified_claims(claims)
 }
 
@@ -695,18 +747,33 @@ pub async fn appraise_evidence_unauthenticated(
     Ok(verified.into_unauthenticated_appraisal(*runtime_data, jwt))
 }
 
-/// Crate-internal compatibility wrapper for existing fresh-appraisal flows.
-///
-/// This parses the appraisal token without authenticating its signature because
-/// the token has just been returned by ITA on this request.
-#[allow(dead_code)]
-pub(crate) async fn verify_evidence(
+pub(crate) async fn appraise_evidence_authenticated(
     evidence: &Evidence,
     config: &ItaConfig,
     runtime_data: &[u8; 64],
     nonce: &VerifierNonce,
-) -> Result<UnauthenticatedAppraisalClaims, VerifyError> {
-    appraise_evidence_unauthenticated(evidence, config, runtime_data, nonce).await
+    jwks_url: &str,
+    expected_issuer: Option<String>,
+    expected_audience: Option<String>,
+) -> Result<(String, VerifiedTokenClaims), VerifyError> {
+    let claims = appraise_evidence_unauthenticated(evidence, config, runtime_data, nonce).await?;
+    let raw_token = claims.raw_token.clone();
+    let verified = verify_attestation_token(
+        &raw_token,
+        jwks_url,
+        config.request_timeout_secs,
+        expected_issuer.as_deref(),
+        expected_audience.as_deref(),
+    )
+    .await?;
+    let expected_runtime_hash = runtime_hash(&nonce.val, &nonce.iat, runtime_data);
+    if !verified.binding_matches(runtime_data, &expected_runtime_hash) {
+        return Err(VerifyError::InvalidTokenClaims(
+            "authenticated ITA token binding does not match the provided runtime_data and verifier nonce"
+                .to_string(),
+        ));
+    }
+    Ok((raw_token, verified))
 }
 
 fn parse_verified_claims(claims: ItaClaims) -> Result<VerifiedTokenClaims, VerifyError> {
@@ -800,6 +867,96 @@ fn decode_jwt_claims(jwt: &str) -> Result<ItaClaims, VerifyError> {
         .map_err(|e| VerifyError::InvalidToken(format!("JWT claims JSON: {e}")))
 }
 
+fn validate_expected_issuer(
+    claims: &ItaClaims,
+    expected_issuer: Option<&str>,
+) -> Result<(), VerifyError> {
+    let Some(expected_issuer) = expected_issuer
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let actual_issuer = claims.iss.trim();
+    if actual_issuer.is_empty() {
+        return Err(VerifyError::InvalidToken(
+            "JWT claims missing iss".to_string(),
+        ));
+    }
+    if !issuer_matches(actual_issuer, expected_issuer) {
+        return Err(VerifyError::InvalidToken(format!(
+            "JWT issuer mismatch: expected {expected_issuer}, got {actual_issuer}"
+        )));
+    }
+    Ok(())
+}
+
+fn issuer_matches(actual: &str, expected: &str) -> bool {
+    match (
+        normalize_issuer_for_compare(actual),
+        normalize_issuer_for_compare(expected),
+    ) {
+        (Some(actual), Some(expected)) => actual == expected,
+        _ => actual == expected,
+    }
+}
+
+fn normalize_issuer_for_compare(value: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(value).ok()?;
+    if url.path().is_empty() {
+        url.set_path("/");
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.to_string())
+}
+
+fn validate_expected_audience(
+    claims: &ItaClaims,
+    expected_audience: Option<&str>,
+) -> Result<(), VerifyError> {
+    let Some(expected_audience) = expected_audience
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let matches = match &claims.aud {
+        serde_json::Value::String(value) => value.trim() == expected_audience,
+        serde_json::Value::Array(values) => values.iter().any(|value| {
+            value
+                .as_str()
+                .is_some_and(|value| value.trim() == expected_audience)
+        }),
+        serde_json::Value::Null => false,
+        _ => {
+            return Err(VerifyError::InvalidToken(
+                "JWT aud claim must be a string or string array".to_string(),
+            ))
+        }
+    };
+
+    if matches {
+        Ok(())
+    } else {
+        Err(VerifyError::InvalidToken(format!(
+            "JWT audience mismatch: expected {expected_audience}"
+        )))
+    }
+}
+
+fn runtime_hash(nonce_val: &[u8], nonce_iat: &[u8], runtime_data: &[u8; 64]) -> [u8; 64] {
+    use sha2::{Digest, Sha512};
+
+    let mut h = Sha512::new();
+    h.update(nonce_val);
+    h.update(nonce_iat);
+    h.update(runtime_data);
+    h.finalize().into()
+}
+
 fn normalized_jwt(jwt: &str) -> Result<&str, VerifyError> {
     let jwt = jwt.trim();
     if jwt.is_empty() {
@@ -811,7 +968,7 @@ fn normalized_jwt(jwt: &str) -> Result<&str, VerifyError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_jwks_url_for_api_url, parse_verified_claims,
+        default_jwks_url_for_api_url, issuer_matches, parse_verified_claims,
         unauthenticated_report_data_hash_from_token, ItaConfig, VerifiedTokenBinding,
         DEFAULT_JWKS_URL,
     };
@@ -959,6 +1116,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_verified_claims_accepts_default_method_with_attester_claims_as_standard() {
+        let claims = serde_json::from_value(json!({
+            "appraisal": { "method": "default" },
+            "tdx": {
+                "tdx_mrtd": sample_mrtd(),
+                "tdx_report_data": "ab".repeat(64),
+                "attester_tcb_status": "OutOfDate",
+                "attester_tcb_date": "2025-05-14T00:00:00Z",
+                "attester_advisory_ids": ["INTEL-SA-00828"],
+                "attester_held_data": base64::engine::general_purpose::STANDARD.encode([0x12u8; 64]),
+                "attester_runtime_data": {
+                    "user-data": "34".repeat(64),
+                }
+            }
+        }))
+        .expect("claims JSON should deserialize");
+
+        let verified = parse_verified_claims(claims).expect("default-method claims should parse");
+        assert!(matches!(
+            verified.binding,
+            VerifiedTokenBinding::StandardReportData
+        ));
+        assert_eq!(verified.tcb_status(), "OutOfDate");
+        assert_eq!(verified.tcb_date(), Some("2025-05-14T00:00:00Z"));
+        assert_eq!(verified.advisory_ids(), &["INTEL-SA-00828".to_string()]);
+    }
+
+    #[test]
     fn parse_verified_claims_trims_wrapping_whitespace() {
         let claims = serde_json::from_value(json!({
             "tdx": {
@@ -1011,9 +1196,23 @@ mod tests {
         let config = ItaConfig {
             api_key: String::new(),
             api_url: "http://127.0.0.1:8080".to_string(),
+            expected_token_issuer: None,
+            expected_token_audience: None,
             request_timeout_secs: 30,
         };
 
         assert_eq!(config.default_jwks_url(), DEFAULT_JWKS_URL);
+    }
+
+    #[test]
+    fn issuer_matching_treats_trailing_slash_as_equivalent() {
+        assert!(issuer_matches(
+            "https://portal.trustauthority.intel.com",
+            "https://portal.trustauthority.intel.com/"
+        ));
+        assert!(issuer_matches(
+            "https://portal.trustauthority.intel.com/",
+            "https://portal.trustauthority.intel.com"
+        ));
     }
 }

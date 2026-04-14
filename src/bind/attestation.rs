@@ -8,13 +8,13 @@ use crate::{
     attest::AttestError,
     evidence::Evidence,
     generate::binary_hash,
-    public_values::PublicValues,
+    public_values::{PublicValues, PublicValuesError},
     report::{build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION},
     verify::{
         codec::{decode_standard_base64, decode_standard_base64_array_64},
         ita::{
-            appraise_evidence_unauthenticated, verify_attestation_token, ItaConfig, VerifierNonce,
-            DEFAULT_JWKS_URL,
+            appraise_evidence_authenticated, default_issuer_for_jwks_url, verify_attestation_token,
+            ItaConfig, VerifierNonce, DEFAULT_JWKS_URL,
         },
         VerifyError,
     },
@@ -28,6 +28,14 @@ use std::collections::BTreeSet;
 pub struct AttestationVerificationPolicy {
     /// Intel Trust Authority JWKS endpoint used to verify the token signature.
     pub jwks_url: String,
+    /// Optional expected token issuer (`iss`).
+    ///
+    /// If this is `None`, verification derives the issuer from `jwks_url`.
+    pub expected_token_issuer: Option<String>,
+    /// Optional expected token audience (`aud`).
+    ///
+    /// If this is `None`, audience is not enforced.
+    pub expected_token_audience: Option<String>,
     /// Timeout in seconds for JWKS HTTP requests.
     pub request_timeout_secs: u64,
     /// Accepted ITA TCB status values. Defaults to only `"UpToDate"`.
@@ -48,6 +56,8 @@ impl Default for AttestationVerificationPolicy {
     fn default() -> Self {
         Self {
             jwks_url: DEFAULT_JWKS_URL.to_string(),
+            expected_token_issuer: None,
+            expected_token_audience: None,
             request_timeout_secs: 30,
             accepted_tcb_statuses: vec!["UpToDate".to_string()],
             expected_advisory_ids: None,
@@ -217,6 +227,7 @@ impl Livy {
             config: &self.config,
             public_values: PublicValues::new(),
             nonce: 0,
+            pending_public_values_error: None,
         }
     }
 }
@@ -229,6 +240,7 @@ pub struct AttestBuilder<'a> {
     config: &'a ItaConfig,
     public_values: PublicValues,
     nonce: u64,
+    pending_public_values_error: Option<PublicValuesError>,
 }
 
 impl<'a> AttestBuilder<'a> {
@@ -241,8 +253,12 @@ impl<'a> AttestBuilder<'a> {
     /// readable by any party who receives the attestation. Only commit data that
     /// is intended to be public. For sensitive values, use
     /// [`commit_hashed`](Self::commit_hashed) to store a SHA-256 hash instead.
+    ///
+    /// Serialization failures are recorded and returned from
+    /// [`finalize`](Self::finalize) as [`AttestError::PublicValues`].
     pub fn commit<T: Serialize>(&mut self, value: &T) -> &mut Self {
-        self.public_values.commit(value);
+        let result = self.public_values.commit(value).map(|_| ());
+        self.record_public_values_result(result);
         self
     }
 
@@ -255,18 +271,25 @@ impl<'a> AttestBuilder<'a> {
     /// To verify: the verifier independently serializes the same value with
     /// `serde_json` and checks that `SHA-256(serialized)` matches what is read
     /// back from `public_values`.
+    ///
+    /// Serialization failures are recorded and returned from
+    /// [`finalize`](Self::finalize) as [`AttestError::PublicValues`].
     pub fn commit_hashed<T: Serialize>(&mut self, value: &T) -> &mut Self {
         use sha2::{Digest, Sha256};
-        let encoded =
-            serde_json::to_vec(value).expect("commit_hashed: serialization should not fail");
-        let hash: [u8; 32] = Sha256::digest(&encoded).into();
-        self.public_values.commit_raw(&hash);
+        let result = serde_json::to_vec(value)
+            .map_err(|e| PublicValuesError::Serialize(e.to_string()))
+            .and_then(|encoded| {
+                let hash: [u8; 32] = Sha256::digest(&encoded).into();
+                self.public_values.commit_raw(&hash).map(|_| ())
+            });
+        self.record_public_values_result(result);
         self
     }
 
     /// Commit raw bytes as a public output (no serialization wrapper).
     pub fn commit_raw(&mut self, bytes: &[u8]) -> &mut Self {
-        self.public_values.commit_raw(bytes);
+        let result = self.public_values.commit_raw(bytes).map(|_| ());
+        self.record_public_values_result(result);
         self
     }
 
@@ -287,6 +310,10 @@ impl<'a> AttestBuilder<'a> {
     /// `REPORTDATA[0..32]` = `SHA-256(public_values buffer)`.
     pub async fn finalize(self) -> Result<Attestation, AttestError> {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+        if let Some(err) = self.pending_public_values_error {
+            return Err(AttestError::PublicValues(err));
+        }
 
         let payload_hash = self.public_values.commitment_hash();
 
@@ -313,6 +340,14 @@ impl<'a> AttestBuilder<'a> {
             report_data: rd,
             public_values: self.public_values,
         })
+    }
+
+    fn record_public_values_result(&mut self, result: Result<(), PublicValuesError>) {
+        if self.pending_public_values_error.is_none() {
+            if let Err(err) = result {
+                self.pending_public_values_error = Some(err);
+            }
+        }
     }
 }
 
@@ -487,10 +522,13 @@ impl Attestation {
         &self,
         policy: &AttestationVerificationPolicy,
     ) -> Result<VerificationContext, VerifyError> {
+        let expected_token_issuer = resolved_expected_token_issuer(policy);
         let (token, token_verification_error) = match verify_attestation_token(
             &self.ita_token,
             &policy.jwks_url,
             policy.request_timeout_secs,
+            expected_token_issuer.as_deref(),
+            policy.expected_token_audience.as_deref(),
         )
         .await
         {
@@ -620,16 +658,25 @@ impl Attestation {
             ));
         }
         let nonce = self.stored_nonce_with_parts(nonce)?;
-        let fresh =
-            appraise_evidence_unauthenticated(&evidence, config, &runtime_data, &nonce).await?;
+        let expected_token_issuer = resolved_expected_token_issuer(policy);
+        let (_fresh_token, fresh) = appraise_evidence_authenticated(
+            &evidence,
+            config,
+            &runtime_data,
+            &nonce,
+            &policy.jwks_url,
+            expected_token_issuer,
+            policy.expected_token_audience.clone(),
+        )
+        .await?;
         let raw_quote_matches_evidence = BASE64.encode(evidence.raw()) == self.raw_quote.trim();
 
         report.bundled_evidence_authenticated = Some(
             raw_quote_matches_evidence
-                && fresh.mrtd.eq_ignore_ascii_case(&self.mrtd)
-                && fresh.tcb_status == self.tcb_status
-                && fresh.tcb_date == self.tcb_date
-                && advisory_id_sets_match(&fresh.advisory_ids, &self.advisory_ids),
+                && fresh.mrtd().eq_ignore_ascii_case(&self.mrtd)
+                && fresh.tcb_status() == self.tcb_status
+                && fresh.tcb_date().map(str::to_string) == self.tcb_date
+                && advisory_id_sets_match(fresh.advisory_ids(), &self.advisory_ids),
         );
 
         Ok(report)
@@ -706,6 +753,13 @@ struct StoredVerifierNonce {
 
 fn advisory_id_sets_match(left: &[String], right: &[String]) -> bool {
     normalize_advisory_ids(left) == normalize_advisory_ids(right)
+}
+
+fn resolved_expected_token_issuer(policy: &AttestationVerificationPolicy) -> Option<String> {
+    policy
+        .expected_token_issuer
+        .clone()
+        .or_else(|| default_issuer_for_jwks_url(&policy.jwks_url))
 }
 
 fn normalize_advisory_ids(values: &[String]) -> BTreeSet<String> {

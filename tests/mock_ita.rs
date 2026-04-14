@@ -11,6 +11,7 @@ use livy_tee::{
     verify_quote_with_public_values, Attestation, AttestationVerificationPolicy, ExtractError,
     ItaConfig, Livy, PublicValues, ReportData, VerifyError, REPORT_DATA_VERSION,
 };
+use serde::ser::Error as _;
 use sha2::{Digest, Sha512};
 
 // ---------------------------------------------------------------------------
@@ -45,6 +46,17 @@ fn fake_jwt(payload_json: &str) -> String {
     format!("{header}.{payload}.fakesig")
 }
 
+struct FailingSerialize;
+
+impl serde::Serialize for FailingSerialize {
+    fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Err(S::Error::custom("intentional serialization failure"))
+    }
+}
+
 // ===========================================================================
 // PublicValues commitment
 // ===========================================================================
@@ -52,12 +64,12 @@ fn fake_jwt(payload_json: &str) -> String {
 #[test]
 fn commitment_hash_is_deterministic() {
     let mut a = PublicValues::new();
-    a.commit(&"input");
-    a.commit(&"output");
+    a.commit(&"input").unwrap();
+    a.commit(&"output").unwrap();
 
     let mut b = PublicValues::new();
-    b.commit(&"input");
-    b.commit(&"output");
+    b.commit(&"input").unwrap();
+    b.commit(&"output").unwrap();
 
     assert_eq!(a.commitment_hash(), b.commitment_hash());
 }
@@ -65,10 +77,10 @@ fn commitment_hash_is_deterministic() {
 #[test]
 fn commitment_hash_changes_with_values() {
     let mut a = PublicValues::new();
-    a.commit(&"input-a");
+    a.commit(&"input-a").unwrap();
 
     let mut b = PublicValues::new();
-    b.commit(&"input-b");
+    b.commit(&"input-b").unwrap();
 
     assert_ne!(a.commitment_hash(), b.commitment_hash());
 }
@@ -76,12 +88,12 @@ fn commitment_hash_changes_with_values() {
 #[test]
 fn commitment_hash_changes_with_order() {
     let mut a = PublicValues::new();
-    a.commit(&1u32);
-    a.commit(&2u32);
+    a.commit(&1u32).unwrap();
+    a.commit(&2u32).unwrap();
 
     let mut b = PublicValues::new();
-    b.commit(&2u32);
-    b.commit(&1u32);
+    b.commit(&2u32).unwrap();
+    b.commit(&1u32).unwrap();
 
     assert_ne!(a.commitment_hash(), b.commitment_hash());
 }
@@ -122,8 +134,8 @@ fn mock_chain(pv: &PublicValues) -> (String, String, String, String) {
 #[test]
 fn verify_quote_accepts_correct_mock_binding() {
     let mut pv = PublicValues::new();
-    pv.commit(&"hello");
-    pv.commit(&"world");
+    pv.commit(&"hello").unwrap();
+    pv.commit(&"world").unwrap();
     let (quote_b64, rd_b64, nonce_val_b64, nonce_iat_b64) = mock_chain(&pv);
 
     let ok =
@@ -135,13 +147,13 @@ fn verify_quote_accepts_correct_mock_binding() {
 #[test]
 fn verify_quote_rejects_tampered_values_mock() {
     let mut pv = PublicValues::new();
-    pv.commit(&"hello");
-    pv.commit(&"world");
+    pv.commit(&"hello").unwrap();
+    pv.commit(&"world").unwrap();
     let (quote_b64, rd_b64, nonce_val_b64, nonce_iat_b64) = mock_chain(&pv);
 
     let mut tampered = PublicValues::new();
-    tampered.commit(&"TAMPERED");
-    tampered.commit(&"world");
+    tampered.commit(&"TAMPERED").unwrap();
+    tampered.commit(&"world").unwrap();
 
     let ok = verify_quote_with_public_values(
         &quote_b64,
@@ -157,7 +169,7 @@ fn verify_quote_rejects_tampered_values_mock() {
 #[test]
 fn verify_quote_rejects_wrong_nonce_mock() {
     let mut pv = PublicValues::new();
-    pv.commit(&"hello");
+    pv.commit(&"hello").unwrap();
     let (quote_b64, rd_b64, _nonce_val_b64, nonce_iat_b64) = mock_chain(&pv);
 
     let wrong_nonce_val = BASE64.encode([0xffu8; 32]);
@@ -177,7 +189,7 @@ fn verify_quote_rejects_invalid_base64() {
 #[test]
 fn verify_quote_rejects_runtime_data_with_trailing_bytes() {
     let mut pv = PublicValues::new();
-    pv.commit(&"hello");
+    pv.commit(&"hello").unwrap();
     let (quote_b64, rd_b64, nonce_val_b64, nonce_iat_b64) = mock_chain(&pv);
     let runtime_with_trailing = format!("{rd_b64}AA==");
 
@@ -209,8 +221,8 @@ async fn generate_and_attest_mock_returns_empty_token() {
 #[tokio::test]
 async fn generate_and_attest_mock_returns_valid_evidence() {
     let mut pv = PublicValues::new();
-    pv.commit(&"in");
-    pv.commit(&"out");
+    pv.commit(&"in").unwrap();
+    pv.commit(&"out").unwrap();
     let ph = pv.commitment_hash();
 
     let rd = ReportData::new(ph, sample_build_id(), REPORT_DATA_VERSION, 0, 0);
@@ -352,6 +364,21 @@ async fn proof_verify_binding_rejects_truncated_raw_quote() {
 }
 
 #[tokio::test]
+async fn attest_builder_finalize_surfaces_public_values_errors() {
+    let livy = Livy::new("mock-key");
+    let mut builder = livy.attest();
+    builder.commit(&FailingSerialize);
+
+    let err = builder
+        .finalize()
+        .await
+        .expect_err("finalize should surface commit serialization failures");
+
+    assert_eq!(err.code(), "public_values");
+    assert!(matches!(err, livy_tee::AttestError::PublicValues(_)));
+}
+
+#[tokio::test]
 async fn proof_verify_mock_reports_jwt_failure() {
     let att = build_mock_attestation(|builder| {
         builder.commit(&"correct-data");
@@ -489,8 +516,8 @@ async fn proof_payload_hash_hex_mock() {
 
     // Should match PublicValues commitment hash.
     let mut pv = PublicValues::new();
-    pv.commit(&"in");
-    pv.commit(&"out");
+    pv.commit(&"in").unwrap();
+    pv.commit(&"out").unwrap();
     assert_eq!(hex_str, hex::encode(pv.commitment_hash()));
 }
 
@@ -536,7 +563,7 @@ async fn verify_quote_binding_chain_mock() {
 
     // Tampered public values should fail.
     let mut tampered = PublicValues::new();
-    tampered.commit(&"tampered");
+    tampered.commit(&"tampered").unwrap();
     let ok2 = verify_quote_with_public_values(
         &att.raw_quote,
         &att.runtime_data,

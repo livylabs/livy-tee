@@ -310,13 +310,17 @@ assert!(report.all_passed());
 
 The default full-attestation policy requires `tcb_status == "UpToDate"`. Use
 `AttestationVerificationPolicy` to pin an expected MRTD, build ID, application
-nonce, or exact advisory-ID set, or to intentionally accept additional TCB statuses.
+nonce, token issuer/audience, or exact advisory-ID set, or to intentionally
+accept additional TCB statuses.
 
 ```rust
 use livy_tee::{AttestationVerificationPolicy, binary_hash, build_id_from_hash_hex};
 
 let mut policy = AttestationVerificationPolicy::default();
 policy.accepted_tcb_statuses = vec!["UpToDate".to_string()];
+policy.expected_token_issuer =
+    livy_tee::default_issuer_for_jwks_url(&attestation.jwks_url);
+policy.expected_token_audience = Some("your-verifier".to_string());
 policy.expected_mrtd = Some(expected_mrtd_hex.to_string()); // 96 hex chars
 policy.expected_build_id = Some(build_id_from_hash_hex(&binary_hash()?)?);
 policy.expected_nonce = Some(expected_application_nonce);
@@ -331,6 +335,10 @@ report.require_success().map_err(|report| {
     )
 })?;
 ```
+
+Issuer pinning defaults to the portal origin derived from the configured JWKS
+URL. Audience pinning is opt-in because Intel Trust Authority deployments do
+not always populate `aud` with a verifier-specific value.
 
 For GCP or any environment that currently appraises as `OutOfDate`, you can
 allow that state only for an exact known advisory-ID set:
@@ -395,6 +403,8 @@ TCB/MRTD claims. `Attestation::verify()` checks Azure's
 claims instead of treating raw quote `REPORTDATA` like the non-Azure path.
 To authenticate the bundled Azure evidence artifact itself, use
 `Attestation::verify_fresh()` so ITA reappraises `attestation.evidence`.
+The fresh path also verifies the freshly returned ITA token locally against
+JWKS before trusting its claims.
 
 ### Step-by-step manual verification recipe
 
@@ -527,6 +537,17 @@ For the high-level commit/read model, use `verify_quote_with_public_values`,
 `Attestation::verify()` adds ITA JWT/JWKS + TCB policy validation.
 `Attestation::verify_fresh()` additionally reappraises the bundled evidence
 artifact with ITA.
+
+At the low-level `PublicValues` API, `commit()` and `commit_raw()` are fallible:
+
+```rust
+let mut values = livy_tee::PublicValues::new();
+values.commit(&"public field")?;
+values.commit_raw(&[0xde, 0xad, 0xbe, 0xef])?;
+```
+
+The high-level `AttestBuilder` remains chainable. It records low-level commit
+failures and returns them from `finalize()` as `AttestError::PublicValues`.
 
 ### Extracting the token REPORTDATA hash from an ITA JWT
 

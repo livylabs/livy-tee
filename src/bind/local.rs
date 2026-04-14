@@ -55,7 +55,7 @@ pub fn verify_quote(
     let runtime_data: [u8; 64] = runtime_data_bytes
         .as_slice()
         .try_into()
-        .map_err(|_| ExtractError::TooShort(runtime_data_bytes.len()))?;
+        .map_err(|_| ExtractError::InvalidRuntimeDataLength(runtime_data_bytes.len()))?;
     let nonce_val = BASE64
         .decode(nonce_val_b64.trim())
         .map_err(|err| ExtractError::Base64(err.to_string()))?;
@@ -122,7 +122,7 @@ mod tests {
 
     fn mock_binding_inputs() -> (String, String, String, String, PublicValues) {
         let mut public_values = PublicValues::new();
-        public_values.commit(&"binding-value");
+        public_values.commit(&"binding-value").unwrap();
 
         let nonce_val = b"nonce-val".to_vec();
         let nonce_iat = b"nonce-iat".to_vec();
@@ -147,7 +147,7 @@ mod tests {
     fn verify_quote_with_public_values_returns_false_for_mismatched_public_values() {
         let (quote_b64, runtime_data_b64, nonce_val_b64, nonce_iat_b64, _) = mock_binding_inputs();
         let mut tampered = PublicValues::new();
-        tampered.commit(&"tampered-value");
+        tampered.commit(&"tampered-value").unwrap();
 
         let ok = verify_quote_with_public_values(
             &quote_b64,
