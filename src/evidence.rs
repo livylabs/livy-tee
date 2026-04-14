@@ -28,6 +28,7 @@ pub const QUOTE_MIN_LEN: usize = 632;
 #[derive(Debug, Clone)]
 pub struct Evidence {
     raw: Vec<u8>,
+    azure_runtime_data: Option<Vec<u8>>,
 }
 
 impl Evidence {
@@ -38,13 +39,40 @@ impl Evidence {
         if raw.len() < QUOTE_MIN_LEN {
             return Err(EvidenceError::TooShort(raw.len()));
         }
-        Ok(Self { raw })
+        Ok(Self {
+            raw,
+            azure_runtime_data: None,
+        })
+    }
+
+    /// Wrap raw quote bytes plus Azure runtime JSON bytes.
+    ///
+    /// This is used by the Azure quote adapter so ITA `/attest/azure` can be
+    /// called with the expected Azure runtime payload format.
+    #[cfg(not(feature = "mock-tee"))]
+    pub(crate) fn from_bytes_with_azure_runtime(
+        raw: Vec<u8>,
+        azure_runtime_data: Vec<u8>,
+    ) -> Result<Self, EvidenceError> {
+        if raw.len() < QUOTE_MIN_LEN {
+            return Err(EvidenceError::TooShort(raw.len()));
+        }
+        Ok(Self {
+            raw,
+            azure_runtime_data: Some(azure_runtime_data),
+        })
     }
 
     /// Access the raw quote bytes.
     #[must_use]
     pub fn raw(&self) -> &[u8] {
         &self.raw
+    }
+
+    /// Optional Azure runtime JSON bytes captured during quote collection.
+    #[must_use]
+    pub fn azure_runtime_data(&self) -> Option<&[u8]> {
+        self.azure_runtime_data.as_deref()
     }
 
     /// Encode the raw quote bytes as standard base64.
@@ -55,7 +83,9 @@ impl Evidence {
 
     /// Decode a standard base64 string into raw quote bytes.
     pub fn from_base64(s: &str) -> Result<Self, EvidenceError> {
-        let raw = BASE64.decode(s).map_err(|e| EvidenceError::Base64(e.to_string()))?;
+        let raw = BASE64
+            .decode(s)
+            .map_err(|e| EvidenceError::Base64(e.to_string()))?;
         Self::from_bytes(raw)
     }
 }

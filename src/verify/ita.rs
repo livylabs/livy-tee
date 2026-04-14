@@ -28,7 +28,7 @@
 //! {
 //!   "tdx": {
 //!     "tdx_mrtd": "<96-hex-char MRTD>",
-//!     "tdx_report_data": "<base64-encoded 64-byte REPORTDATA (= SHA-512 hash)>",
+//!     "tdx_report_data": "<base64 or hex-encoded 64-byte REPORTDATA>",
 //!     "attester_tcb_status": "UpToDate",
 //!     "attester_advisory_ids": [...],
 //!     ...
@@ -38,6 +38,7 @@
 //! }
 //! ```
 
+use crate::cloud::{detect_cloud_provider, log_detected_provider, CloudProvider};
 use crate::evidence::Evidence;
 use crate::verify::VerifyError;
 use serde::Deserialize;
@@ -101,6 +102,8 @@ pub struct VerifiedClaims {
     pub runtime_data: [u8; 64],
     /// TCB status string from ITA.
     pub tcb_status: String,
+    /// Optional TCB assessment date from ITA token claims.
+    pub tcb_date: Option<String>,
     /// The full raw JWT for storage or further inspection.
     pub raw_token: String,
 }
@@ -113,12 +116,70 @@ struct TdxNestedClaims {
     tdx_report_data: String,
     #[serde(default)]
     attester_tcb_status: String,
+    #[serde(default)]
+    attester_tcb_date: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct ItaClaims {
     #[serde(default)]
     tdx: TdxNestedClaims,
+    #[serde(default)]
+    tdx_mrtd: String,
+    #[serde(default)]
+    tdx_report_data: String,
+    #[serde(default)]
+    attester_tcb_status: String,
+    #[serde(default)]
+    attester_tcb_date: String,
+}
+
+impl ItaClaims {
+    fn tdx_mrtd(&self) -> &str {
+        if !self.tdx.tdx_mrtd.is_empty() {
+            &self.tdx.tdx_mrtd
+        } else {
+            &self.tdx_mrtd
+        }
+    }
+
+    fn tdx_report_data(&self) -> &str {
+        if !self.tdx.tdx_report_data.is_empty() {
+            &self.tdx.tdx_report_data
+        } else {
+            &self.tdx_report_data
+        }
+    }
+
+    fn attester_tcb_status(&self) -> &str {
+        if !self.tdx.attester_tcb_status.is_empty() {
+            &self.tdx.attester_tcb_status
+        } else {
+            &self.attester_tcb_status
+        }
+    }
+
+    fn attester_tcb_date(&self) -> Option<&str> {
+        let v = if !self.tdx.attester_tcb_date.is_empty() {
+            &self.tdx.attester_tcb_date
+        } else {
+            &self.attester_tcb_date
+        };
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    }
+}
+
+fn attest_path() -> &'static str {
+    if detect_cloud_provider() == Some(CloudProvider::Azure) {
+        log_detected_provider(CloudProvider::Azure);
+        "/appraisal/v2/attest/azure"
+    } else {
+        "/appraisal/v2/attest"
+    }
 }
 
 /// Fetch an anti-replay verifier nonce from Intel Trust Authority.
@@ -195,29 +256,52 @@ pub async fn verify_evidence(
     runtime_data: &[u8; 64],
     nonce: &VerifierNonce,
 ) -> Result<VerifiedClaims, VerifyError> {
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL;
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
     if config.api_key.is_empty() {
         return Err(VerifyError::ItaApi("ITA API key is empty".to_string()));
     }
 
-    let quote_b64url = BASE64URL.encode(evidence.raw());
-    let runtime_data_b64 = BASE64.encode(runtime_data);
-
-    let body = serde_json::json!({
-        "tdx": {
-            "quote": quote_b64url,
-            "runtime_data": runtime_data_b64,
-            "verifier_nonce": {
-                "val": nonce.val_b64,
-                "iat": nonce.iat_b64,
-                "signature": nonce.signature_b64,
+    let path = attest_path();
+    let body = if path.ends_with("/azure") {
+        let runtime_json = evidence.azure_runtime_data().ok_or_else(|| {
+            VerifyError::ItaApi(
+                "Azure provider selected but evidence has no Azure runtime_data".to_string(),
+            )
+        })?;
+        let quote_b64 = BASE64.encode(evidence.raw());
+        let runtime_json_b64 = BASE64.encode(runtime_json);
+        let user_data_b64 = BASE64.encode(runtime_data);
+        serde_json::json!({
+            "tdx": {
+                "quote": quote_b64,
+                "runtime_data": runtime_json_b64,
+                "user_data": user_data_b64,
+                "verifier_nonce": {
+                    "val": nonce.val_b64,
+                    "iat": nonce.iat_b64,
+                    "signature": nonce.signature_b64,
+                }
             }
-        }
-    });
+        })
+    } else {
+        let quote_b64url = BASE64URL.encode(evidence.raw());
+        let runtime_data_b64 = BASE64.encode(runtime_data);
+        serde_json::json!({
+            "tdx": {
+                "quote": quote_b64url,
+                "runtime_data": runtime_data_b64,
+                "verifier_nonce": {
+                    "val": nonce.val_b64,
+                    "iat": nonce.iat_b64,
+                    "signature": nonce.signature_b64,
+                }
+            }
+        })
+    };
 
-    let url = format!("{}/appraisal/v2/attest", config.api_url);
+    let url = format!("{}{}", config.api_url, path);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(config.request_timeout_secs))
@@ -247,48 +331,44 @@ pub async fn verify_evidence(
 
     // ITA v2 returns a JSON envelope: { "token": "<JWT>" }.
     // Fall back to treating the body as a raw JWT string for forward-compat.
-    let jwt = if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&raw_token) {
-        envelope
+    let jwt = match serde_json::from_str::<serde_json::Value>(&raw_token) {
+        Ok(serde_json::Value::Object(envelope)) => envelope
             .get("token")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| raw_token.trim().trim_matches('"').to_string())
-    } else {
-        raw_token.trim().trim_matches('"').to_string()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| VerifyError::ItaApi("ITA JSON response missing token".to_string()))?,
+        Ok(serde_json::Value::String(token)) => token,
+        Ok(_) => {
+            return Err(VerifyError::ItaApi(
+                "ITA JSON response is not a token envelope".to_string(),
+            ))
+        }
+        Err(_) => raw_token.trim().to_string(),
     };
 
     let claims = decode_jwt_claims(&jwt)?;
 
-    if claims.tdx.tdx_mrtd.len() != 96 {
+    if claims.tdx_mrtd().len() != 96 {
         return Err(VerifyError::ItaApi(format!(
             "MRTD has unexpected length: {} chars (expected 96)",
-            claims.tdx.tdx_mrtd.len()
+            claims.tdx_mrtd().len()
         )));
     }
-    hex::decode(&claims.tdx.tdx_mrtd)
+    hex::decode(claims.tdx_mrtd())
         .map_err(|_| VerifyError::ItaApi("MRTD is not valid hex".to_string()))?;
 
-    let mut report_data = [0u8; 64];
-    if !claims.tdx.tdx_report_data.is_empty() {
-        let rd_bytes = BASE64URL
-            .decode(&claims.tdx.tdx_report_data)
-            .map_err(|_| VerifyError::JwtParse(
-                "tdx_report_data: could not decode as base64url".to_string()
-            ))?;
-        if rd_bytes.len() != 64 {
-            return Err(VerifyError::JwtParse(format!(
-                "tdx_report_data has unexpected length: {} bytes (expected 64)",
-                rd_bytes.len()
-            )));
-        }
-        report_data.copy_from_slice(&rd_bytes);
-    }
+    let report_data = if claims.tdx_report_data().is_empty() {
+        [0u8; 64]
+    } else {
+        parse_tdx_report_data(claims.tdx_report_data())?
+    };
 
     Ok(VerifiedClaims {
-        mrtd: claims.tdx.tdx_mrtd,
+        mrtd: claims.tdx_mrtd().to_string(),
         report_data,
         runtime_data: *runtime_data,
-        tcb_status: claims.tdx.attester_tcb_status,
+        tcb_status: claims.attester_tcb_status().to_string(),
+        tcb_date: claims.attester_tcb_date().map(ToOwned::to_owned),
         raw_token: jwt,
     })
 }
@@ -298,19 +378,39 @@ pub async fn verify_evidence(
 /// **Note:** After nonce integration, the JWT's `tdx_report_data` field contains
 /// `SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data)`, not the raw ReportData struct.
 pub fn report_data_from_token(jwt: &str) -> Result<Option<crate::report::ReportData>, VerifyError> {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL, Engine};
-
     let claims = decode_jwt_claims(jwt)?;
 
-    if claims.tdx.tdx_report_data.is_empty() {
+    if claims.tdx_report_data().is_empty() {
         return Ok(None);
     }
 
+    let arr = parse_tdx_report_data(claims.tdx_report_data())?;
+    Ok(Some(crate::report::ReportData::from_bytes(&arr)))
+}
+
+fn parse_tdx_report_data(value: &str) -> Result<[u8; 64], VerifyError> {
+    use base64::{
+        engine::general_purpose::STANDARD as BASE64,
+        engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL, Engine,
+    };
+
+    // ITA can emit REPORTDATA as 128-char hex (64 bytes) in some responses.
+    if value.len() == 128 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let bytes = hex::decode(value)
+            .map_err(|_| VerifyError::JwtParse("tdx_report_data: invalid hex".to_string()))?;
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&bytes);
+        return Ok(arr);
+    }
+
     let rd_bytes = BASE64URL
-        .decode(&claims.tdx.tdx_report_data)
-        .map_err(|_| VerifyError::JwtParse(
-            "tdx_report_data: could not decode as base64url".to_string()
-        ))?;
+        .decode(value)
+        .or_else(|_| BASE64.decode(value))
+        .map_err(|_| {
+            VerifyError::JwtParse(
+                "tdx_report_data: could not decode as base64url/base64".to_string(),
+            )
+        })?;
 
     if rd_bytes.len() != 64 {
         return Err(VerifyError::JwtParse(format!(
@@ -321,7 +421,7 @@ pub fn report_data_from_token(jwt: &str) -> Result<Option<crate::report::ReportD
 
     let mut arr = [0u8; 64];
     arr.copy_from_slice(&rd_bytes);
-    Ok(Some(crate::report::ReportData::from_bytes(&arr)))
+    Ok(arr)
 }
 
 fn decode_jwt_claims(jwt: &str) -> Result<ItaClaims, VerifyError> {

@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 use base64::Engine;
 use livy_tee::{
-    binary_hash, extract_report_data, generate_evidence,
-    report::{build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION},
-    Evidence,
+    binary_hash, build_id_from_hash_hex, extract_report_data, generate_evidence, Evidence,
+    EvidenceError, ReportData, REPORT_DATA_VERSION,
 };
 use sha2::{Digest, Sha256};
 
@@ -12,11 +11,17 @@ fn sample_payload() -> [u8; 32] {
 }
 
 fn sample_build_id() -> [u8; 8] {
-    build_id_from_hash_hex(&binary_hash().unwrap()).unwrap()
+    build_id_from_hash_hex(&binary_hash().unwrap())
 }
 
 fn sample_report() -> ReportData {
-    ReportData::new(sample_payload(), sample_build_id(), REPORT_DATA_VERSION, 0, 1)
+    ReportData::new(
+        sample_payload(),
+        sample_build_id(),
+        REPORT_DATA_VERSION,
+        0,
+        1,
+    )
 }
 
 #[test]
@@ -34,14 +39,26 @@ fn report_data_is_deterministic() {
 fn report_data_changes_with_different_payload() {
     let r1 = sample_report();
     let different_payload: [u8; 32] = Sha256::digest(b"different").into();
-    let r2 = ReportData::new(different_payload, sample_build_id(), REPORT_DATA_VERSION, 0, 1);
+    let r2 = ReportData::new(
+        different_payload,
+        sample_build_id(),
+        REPORT_DATA_VERSION,
+        0,
+        1,
+    );
     assert_ne!(r1.to_bytes(), r2.to_bytes());
 }
 
 #[test]
 fn report_data_changes_with_nonce() {
     let r1 = sample_report();
-    let r2 = ReportData::new(sample_payload(), sample_build_id(), REPORT_DATA_VERSION, 0, 2);
+    let r2 = ReportData::new(
+        sample_payload(),
+        sample_build_id(),
+        REPORT_DATA_VERSION,
+        0,
+        2,
+    );
     assert_ne!(r1.to_bytes(), r2.to_bytes());
 }
 
@@ -109,7 +126,6 @@ fn extract_report_data_roundtrip() {
 
 #[test]
 fn evidence_from_bytes_rejects_short_buffer() {
-    use livy_tee::evidence::EvidenceError;
     let result = Evidence::from_bytes(vec![0u8; 100]);
     assert!(matches!(result, Err(EvidenceError::TooShort(100))));
 }
@@ -153,14 +169,12 @@ fn livy_from_env_fails_when_key_missing() {
 
 #[test]
 fn evidence_from_base64_rejects_invalid_base64() {
-    use livy_tee::evidence::EvidenceError;
     let result = Evidence::from_base64("not-valid-base64!!!");
     assert!(matches!(result, Err(EvidenceError::Base64(_))));
 }
 
 #[test]
 fn evidence_from_base64_rejects_short_decoded() {
-    use livy_tee::evidence::EvidenceError;
     // Valid base64 but decodes to only 3 bytes — well under 632.
     let b64 = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
     let result = Evidence::from_base64(&b64);

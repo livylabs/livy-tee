@@ -1,149 +1,105 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-//! Length-prefixed public values buffer.
+//! Ordered, typed public values committed by TEE code and read by verifiers.
 //!
-//! Each committed value is encoded as:
+//! The on-wire format is a sequence of entries encoded as:
 //! `[u32 little-endian payload length][serde_json payload bytes]`.
-//! The buffer can be replayed sequentially with a read cursor or inspected
-//! entry-by-entry without deserializing payloads.
+//! The full buffer is public and can be independently parsed and hashed.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
-use thiserror::Error;
+use std::cell::Cell;
 
-/// A serialized buffer of public values with a read cursor.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Ordered collection of public values committed during a TEE attestation.
+#[derive(Debug, Clone)]
 pub struct PublicValues {
     buffer: Vec<u8>,
-    cursor: usize,
-}
-
-/// Errors returned by [`PublicValues`].
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum PublicValuesError {
-    /// Failed to decode the base64 buffer.
-    #[error("base64 decode failed: {0}")]
-    Base64(#[from] base64::DecodeError),
-    /// Failed to encode or decode the JSON payload.
-    #[error("JSON serialization failed: {0}")]
-    Json(#[from] serde_json::Error),
-    /// An entry payload exceeded the on-wire `u32` length prefix.
-    #[error("entry payload too large to encode: {0} bytes")]
-    EntryTooLarge(usize),
-    /// The buffer ended before a full 4-byte length prefix was available.
-    #[error("buffer ended while reading length prefix at offset {offset}")]
-    TruncatedLength {
-        /// The byte offset where the incomplete length prefix begins.
-        offset: usize,
-    },
-    /// The buffer ended before a full payload was available.
-    #[error(
-        "buffer ended while reading entry at offset {offset}: payload length {length}, buffer size {buffer_len}"
-    )]
-    TruncatedEntry {
-        /// The byte offset where the entry length prefix begins.
-        offset: usize,
-        /// The decoded payload length from the entry prefix.
-        length: usize,
-        /// The total buffer size that failed validation.
-        buffer_len: usize,
-    },
-    /// The read cursor is already at the end of the buffer.
-    #[error("no more entries available at cursor {offset}")]
-    EndOfBuffer {
-        /// The cursor position that attempted to read past the end.
-        offset: usize,
-    },
+    /// Read cursor with interior mutability so reads work on `&self`.
+    read_cursor: Cell<usize>,
 }
 
 impl PublicValues {
-    /// Create an empty public values buffer.
+    /// Create an empty `PublicValues` for committing.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Construct a validated public values buffer from raw bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the buffer does not contain a complete sequence of
-    /// length-prefixed entries.
-    pub fn from_bytes(buffer: Vec<u8>) -> Result<Self, PublicValuesError> {
-        validate_buffer(&buffer)?;
-        Ok(Self { buffer, cursor: 0 })
-    }
-
-    /// Decode a validated public values buffer from base64.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the base64 is invalid or if the decoded bytes do not
-    /// contain a complete sequence of length-prefixed entries.
-    pub fn from_base64(encoded: &str) -> Result<Self, PublicValuesError> {
-        let buffer = BASE64.decode(encoded.trim())?;
-        Self::from_bytes(buffer)
-    }
-
-    /// Encode the buffer as standard base64.
-    #[must_use]
-    pub fn to_base64(&self) -> String {
-        BASE64.encode(&self.buffer)
-    }
-
-    /// Borrow the raw on-wire bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.buffer
-    }
-
-    /// Reset the sequential read cursor to the start of the buffer.
-    pub fn reset_cursor(&mut self) {
-        self.cursor = 0;
-    }
-
-    /// Append a new JSON-serialized value to the buffer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the value cannot be serialized or the encoded
-    /// payload would exceed the `u32` length prefix.
-    pub fn commit<T: Serialize>(&mut self, value: &T) -> Result<(), PublicValuesError> {
-        let payload = serde_json::to_vec(value)?;
-        let len = u32::try_from(payload.len())
-            .map_err(|_| PublicValuesError::EntryTooLarge(payload.len()))?;
-        self.buffer.extend_from_slice(&len.to_le_bytes());
-        self.buffer.extend_from_slice(&payload);
-        Ok(())
-    }
-
-    /// Read the next value from the buffer and advance the cursor.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the cursor is at the end of the buffer, the next
-    /// entry is truncated, or the JSON payload cannot be decoded as `T`.
-    pub fn read<T: DeserializeOwned>(&mut self) -> Result<T, PublicValuesError> {
-        if self.cursor >= self.buffer.len() {
-            return Err(PublicValuesError::EndOfBuffer {
-                offset: self.cursor,
-            });
+        Self {
+            buffer: Vec::new(),
+            read_cursor: Cell::new(0),
         }
+    }
 
-        let (entry_start, entry_len) = parse_entry_header(&self.buffer, self.cursor)?;
-        let payload_start = entry_start + 4;
-        let payload_end = payload_start + entry_len;
-        let value = serde_json::from_slice(&self.buffer[payload_start..payload_end])?;
-        self.cursor = payload_end;
+    /// Reconstruct from a raw byte buffer.
+    #[must_use]
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self {
+            buffer: bytes,
+            read_cursor: Cell::new(0),
+        }
+    }
+
+    /// Reconstruct from a base64-encoded buffer.
+    pub fn from_base64(b64: &str) -> Result<Self, base64::DecodeError> {
+        Ok(Self::from_bytes(BASE64.decode(b64.trim())?))
+    }
+
+    /// Commit a value as a public output.
+    ///
+    /// Values are serialized with `serde_json` and appended to the on-wire
+    /// buffer. Use [`commit_raw`](Self::commit_raw) when the payload is already
+    /// pre-serialized (for example a precomputed hash).
+    pub fn commit<T: Serialize>(&mut self, value: &T) {
+        let encoded =
+            serde_json::to_vec(value).expect("PublicValues::commit: serialization should not fail");
+        self.commit_raw(&encoded);
+    }
+
+    /// Commit raw bytes directly (no serialization wrapper).
+    pub fn commit_raw(&mut self, bytes: &[u8]) {
+        let len: u32 = bytes
+            .len()
+            .try_into()
+            .expect("PublicValues entry too large for wire format");
+        self.buffer.extend_from_slice(&len.to_le_bytes());
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    /// Read the next committed value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer is exhausted or deserialization fails.
+    /// Use [`try_read`](Self::try_read) for a fallible version.
+    pub fn read<T: DeserializeOwned>(&self) -> T {
+        self.try_read()
+            .expect("PublicValues::read: failed to read next value")
+    }
+
+    /// Try to read the next committed value.
+    pub fn try_read<T: DeserializeOwned>(&self) -> Result<T, PublicValuesError> {
+        let (start, end) = self.next_entry_bounds()?;
+        let value = serde_json::from_slice(&self.buffer[start..end])
+            .map_err(|e| PublicValuesError::Deserialize(e.to_string()))?;
+        self.read_cursor.set(end);
         Ok(value)
     }
 
-    /// Return each raw on-wire entry as `(field_index, wire_bytes)`.
+    /// Read the raw bytes for the next entry payload (without deserializing).
+    pub fn read_raw(&self) -> Result<Vec<u8>, PublicValuesError> {
+        let (start, end) = self.next_entry_bounds()?;
+        let bytes = self.buffer[start..end].to_vec();
+        self.read_cursor.set(end);
+        Ok(bytes)
+    }
+
+    /// Reset the read cursor to the beginning.
+    pub fn reset_cursor(&self) {
+        self.read_cursor.set(0);
+    }
+
+    /// Return each entry as `(field_index, wire_bytes)`.
     ///
-    /// `wire_bytes` includes both the 4-byte little-endian length prefix and
-    /// the JSON payload bytes. This helper does not consult or advance the
-    /// sequential read cursor.
+    /// `wire_bytes` includes both the 4-byte length prefix and payload bytes.
+    /// This helper does not advance the sequential read cursor.
     #[must_use]
     pub fn entries_raw(&self) -> Vec<(u32, Vec<u8>)> {
         let mut entries = Vec::new();
@@ -151,11 +107,11 @@ impl PublicValues {
         let mut index = 0u32;
 
         while offset < self.buffer.len() {
-            let (entry_start, entry_len) = parse_entry_header(&self.buffer, offset)
-                .expect("PublicValues buffers are validated on construction");
-            let entry_end = entry_start + 4 + entry_len;
-            entries.push((index, self.buffer[entry_start..entry_end].to_vec()));
-            offset = entry_end;
+            let Some(end) = entry_end(&self.buffer, offset) else {
+                break;
+            };
+            entries.push((index, self.buffer[offset..end].to_vec()));
+            offset = end;
             index += 1;
         }
 
@@ -169,13 +125,68 @@ impl PublicValues {
         let mut offset = 0usize;
 
         while offset < self.buffer.len() {
-            let (entry_start, entry_len) = parse_entry_header(&self.buffer, offset)
-                .expect("PublicValues buffers are validated on construction");
-            offset = entry_start + 4 + entry_len;
+            let Some(end) = entry_end(&self.buffer, offset) else {
+                break;
+            };
+            offset = end;
             count += 1;
         }
 
         count
+    }
+
+    /// Compute `SHA-256(buffer)` — the 32-byte commitment hash.
+    #[must_use]
+    pub fn commitment_hash(&self) -> [u8; 32] {
+        Sha256::digest(&self.buffer).into()
+    }
+
+    /// Verify that this buffer's commitment matches `expected`.
+    #[must_use]
+    pub fn verify_commitment(&self, expected: &[u8; 32]) -> bool {
+        self.commitment_hash() == *expected
+    }
+
+    /// Borrow raw buffer bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    /// Consume and return the raw buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.buffer
+    }
+
+    /// Base64-encode the buffer.
+    #[must_use]
+    pub fn to_base64(&self) -> String {
+        BASE64.encode(&self.buffer)
+    }
+
+    /// Number of bytes in the buffer.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Whether the buffer is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    fn next_entry_bounds(&self) -> Result<(usize, usize), PublicValuesError> {
+        let cursor = self.read_cursor.get();
+        let end = entry_end(&self.buffer, cursor).ok_or(PublicValuesError::BufferExhausted)?;
+        Ok((cursor + 4, end))
+    }
+}
+
+impl Default for PublicValues {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -185,47 +196,148 @@ pub fn entry_hash(wire_bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(wire_bytes).into()
 }
 
-fn validate_buffer(buffer: &[u8]) -> Result<(), PublicValuesError> {
-    let mut offset = 0usize;
-    while offset < buffer.len() {
-        let (entry_start, entry_len) = parse_entry_header(buffer, offset)?;
-        offset = entry_start + 4 + entry_len;
+fn entry_end(buffer: &[u8], offset: usize) -> Option<usize> {
+    if offset + 4 > buffer.len() {
+        return None;
     }
-    Ok(())
+
+    let len = u32::from_le_bytes(buffer[offset..offset + 4].try_into().ok()?) as usize;
+    let end = offset + 4 + len;
+    if end > buffer.len() {
+        return None;
+    }
+
+    Some(end)
 }
 
-fn parse_entry_header(buffer: &[u8], offset: usize) -> Result<(usize, usize), PublicValuesError> {
-    let len_bytes = buffer
-        .get(offset..offset + 4)
-        .ok_or(PublicValuesError::TruncatedLength { offset })?;
-
-    let mut prefix = [0u8; 4];
-    prefix.copy_from_slice(len_bytes);
-    let entry_len = u32::from_le_bytes(prefix) as usize;
-    let payload_start = offset + 4;
-    let payload_end = payload_start + entry_len;
-
-    if payload_end > buffer.len() {
-        return Err(PublicValuesError::TruncatedEntry {
-            offset,
-            length: entry_len,
-            buffer_len: buffer.len(),
-        });
-    }
-
-    Ok((offset, entry_len))
+/// Errors when reading from [`PublicValues`].
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum PublicValuesError {
+    /// The buffer has no more complete entries to read.
+    #[error("public values buffer exhausted — no more entries to read")]
+    BufferExhausted,
+    /// A value could not be deserialized from the buffer.
+    #[error("failed to deserialize public value: {0}")]
+    Deserialize(String),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{entry_hash, PublicValues, PublicValuesError};
+    use super::*;
+
+    #[test]
+    fn commit_and_read_roundtrip() {
+        let mut pv = PublicValues::new();
+        pv.commit(&42u64);
+        pv.commit(&"hello world".to_string());
+        pv.commit(&[1u8, 2, 3, 4]);
+
+        let reader = PublicValues::from_bytes(pv.into_bytes());
+        assert_eq!(reader.read::<u64>(), 42);
+        assert_eq!(reader.read::<String>(), "hello world");
+        assert_eq!(reader.read::<Vec<u8>>(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn commitment_hash_is_deterministic() {
+        let mut a = PublicValues::new();
+        a.commit(&100i64);
+        a.commit(&"test");
+
+        let mut b = PublicValues::new();
+        b.commit(&100i64);
+        b.commit(&"test");
+
+        assert_eq!(a.commitment_hash(), b.commitment_hash());
+    }
+
+    #[test]
+    fn commitment_hash_changes_with_different_values() {
+        let mut a = PublicValues::new();
+        a.commit(&1u32);
+
+        let mut b = PublicValues::new();
+        b.commit(&2u32);
+
+        assert_ne!(a.commitment_hash(), b.commitment_hash());
+    }
+
+    #[test]
+    fn commitment_hash_changes_with_order() {
+        let mut a = PublicValues::new();
+        a.commit(&1u32);
+        a.commit(&2u32);
+
+        let mut b = PublicValues::new();
+        b.commit(&2u32);
+        b.commit(&1u32);
+
+        assert_ne!(a.commitment_hash(), b.commitment_hash());
+    }
+
+    #[test]
+    fn verify_commitment_passes() {
+        let mut pv = PublicValues::new();
+        pv.commit(&"payload");
+        let hash = pv.commitment_hash();
+        assert!(pv.verify_commitment(&hash));
+    }
+
+    #[test]
+    fn verify_commitment_rejects_wrong_hash() {
+        let mut pv = PublicValues::new();
+        pv.commit(&"payload");
+        assert!(!pv.verify_commitment(&[0u8; 32]));
+    }
+
+    #[test]
+    fn read_exhausted_returns_error() {
+        let pv = PublicValues::new();
+        assert!(pv.try_read::<u32>().is_err());
+    }
+
+    #[test]
+    fn base64_roundtrip() {
+        let mut pv = PublicValues::new();
+        pv.commit(&99u64);
+        pv.commit(&"b64 test");
+
+        let b64 = pv.to_base64();
+        let restored = PublicValues::from_base64(&b64).unwrap();
+        assert_eq!(restored.read::<u64>(), 99);
+        assert_eq!(restored.read::<String>(), "b64 test");
+        assert_eq!(pv.commitment_hash(), restored.commitment_hash());
+    }
+
+    #[test]
+    fn raw_commit_and_read() {
+        let mut pv = PublicValues::new();
+        pv.commit_raw(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let reader = PublicValues::from_bytes(pv.into_bytes());
+        let raw = reader.read_raw().unwrap();
+        assert_eq!(raw, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn reset_cursor_allows_rereading() {
+        let mut pv = PublicValues::new();
+        pv.commit(&7u32);
+
+        let reader = PublicValues::from_bytes(pv.into_bytes());
+        assert_eq!(reader.read::<u32>(), 7);
+        assert!(reader.try_read::<u32>().is_err());
+
+        reader.reset_cursor();
+        assert_eq!(reader.read::<u32>(), 7);
+    }
 
     #[test]
     fn entries_raw_returns_entry_boundaries_and_indices() {
         let mut values = PublicValues::new();
-        values.commit(&"alpha").unwrap();
-        values.commit(&42u32).unwrap();
-        values.commit(&vec!["x", "y"]).unwrap();
+        values.commit(&"alpha");
+        values.commit(&42u32);
+        values.commit(&vec!["x", "y"]);
 
         let entries = values.entries_raw();
         assert_eq!(entries.len(), 3);
@@ -250,9 +362,9 @@ mod tests {
     #[test]
     fn entry_hash_is_stable_for_identical_values_and_changes_for_different_values() {
         let mut values = PublicValues::new();
-        values.commit(&"same").unwrap();
-        values.commit(&"same").unwrap();
-        values.commit(&"different").unwrap();
+        values.commit(&"same");
+        values.commit(&"same");
+        values.commit(&"different");
 
         let entries = values.entries_raw();
         let first = entry_hash(&entries[0].1);
@@ -268,9 +380,9 @@ mod tests {
         let mut values = PublicValues::new();
         assert_eq!(values.entry_count(), 0);
 
-        values.commit(&"one").unwrap();
-        values.commit(&"two").unwrap();
-        values.commit(&3u8).unwrap();
+        values.commit(&"one");
+        values.commit(&"two");
+        values.commit(&3u8);
 
         assert_eq!(values.entry_count(), 3);
     }
@@ -278,11 +390,11 @@ mod tests {
     #[test]
     fn entry_count_survives_from_bytes_and_from_base64() {
         let mut values = PublicValues::new();
-        values.commit(&"one").unwrap();
-        values.commit(&"two").unwrap();
-        values.commit(&3u8).unwrap();
+        values.commit(&"one");
+        values.commit(&"two");
+        values.commit(&3u8);
 
-        let from_bytes = PublicValues::from_bytes(values.as_bytes().to_vec()).unwrap();
+        let from_bytes = PublicValues::from_bytes(values.as_bytes().to_vec());
         let from_base64 = PublicValues::from_base64(&values.to_base64()).unwrap();
 
         assert_eq!(from_bytes.entry_count(), 3);
@@ -294,12 +406,12 @@ mod tests {
     #[test]
     fn entries_raw_does_not_advance_the_read_cursor() {
         let mut values = PublicValues::new();
-        values.commit(&"first").unwrap();
-        values.commit(&"second").unwrap();
+        values.commit(&"first");
+        values.commit(&"second");
 
         let _ = values.entries_raw();
-        let first: String = values.read().unwrap();
-        let second: String = values.read().unwrap();
+        let first: String = values.read();
+        let second: String = values.read();
 
         assert_eq!(first, "first");
         assert_eq!(second, "second");
@@ -308,8 +420,8 @@ mod tests {
     #[test]
     fn base64_roundtrip_preserves_entries() {
         let mut values = PublicValues::new();
-        values.commit(&"alpha").unwrap();
-        values.commit(&7u32).unwrap();
+        values.commit(&"alpha");
+        values.commit(&7u32);
 
         let encoded = values.to_base64();
         let decoded = PublicValues::from_base64(&encoded).unwrap();
@@ -319,17 +431,11 @@ mod tests {
     }
 
     #[test]
-    fn truncated_buffer_is_rejected() {
-        let err = PublicValues::from_bytes(vec![5, 0, 0, 0, b'a'])
-            .expect_err("incomplete payload should fail validation");
+    fn truncated_buffer_has_zero_visible_entries() {
+        let values = PublicValues::from_bytes(vec![5, 0, 0, 0, b'a']);
 
-        assert!(matches!(
-            err,
-            PublicValuesError::TruncatedEntry {
-                offset: 0,
-                length: 5,
-                buffer_len: 5,
-            }
-        ));
+        assert_eq!(values.entry_count(), 0);
+        assert!(values.entries_raw().is_empty());
+        assert!(values.try_read::<String>().is_err());
     }
 }

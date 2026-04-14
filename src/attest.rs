@@ -54,6 +54,8 @@ pub struct AttestedEvidence {
     pub mrtd: String,
     /// TCB evaluation status. Empty in `mock-tee` mode.
     pub tcb_status: String,
+    /// Optional TCB evaluation date (RFC3339 date-time from ITA token claims).
+    pub tcb_date: Option<String>,
     /// The original 64-byte runtime_data (our ReportData struct).
     pub runtime_data: [u8; 64],
     /// Decoded verifier nonce value bytes. Zeroed in `mock-tee` mode.
@@ -86,7 +88,7 @@ pub enum AttestError {
 /// In `mock-tee` mode: uses zeroed nonces, produces a stub quote, skips ITA.
 pub async fn generate_and_attest(
     user_data: &[u8; 64],
-    _config: &ItaConfig,
+    #[cfg_attr(feature = "mock-tee", allow(unused_variables))] config: &ItaConfig,
 ) -> Result<AttestedEvidence, AttestError> {
     use sha2::{Digest, Sha512};
 
@@ -94,7 +96,7 @@ pub async fn generate_and_attest(
     let (nonce_val, nonce_iat) = (vec![0u8; 32], vec![0u8; 32]);
 
     #[cfg(not(feature = "mock-tee"))]
-    let nonce = get_nonce(_config).await?;
+    let nonce = get_nonce(config).await?;
     #[cfg(not(feature = "mock-tee"))]
     let (nonce_val, nonce_iat) = (nonce.val.clone(), nonce.iat.clone());
 
@@ -115,6 +117,7 @@ pub async fn generate_and_attest(
             ita_token: String::new(),
             mrtd: String::new(),
             tcb_status: String::new(),
+            tcb_date: None,
             runtime_data: *user_data,
             nonce_val,
             nonce_iat,
@@ -123,12 +126,13 @@ pub async fn generate_and_attest(
 
     #[cfg(not(feature = "mock-tee"))]
     {
-        let claims = verify_evidence(&evidence, _config, user_data, &nonce).await?;
+        let claims = verify_evidence(&evidence, config, user_data, &nonce).await?;
         Ok(AttestedEvidence {
             evidence,
             ita_token: claims.raw_token,
             mrtd: claims.mrtd,
             tcb_status: claims.tcb_status,
+            tcb_date: claims.tcb_date,
             runtime_data: *user_data,
             nonce_val,
             nonce_iat,

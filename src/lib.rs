@@ -14,27 +14,35 @@
 //!
 //! | Feature      | Default | Description |
 //! |--------------|---------|-------------|
-//! | *(none)*     | yes     | TSM configfs generation — requires TDX hardware (kernel ≥ 6.7) |
+//! | *(none)*     | yes     | Runtime provider auto-detection: TSM configfs or Azure vTPM/paravisor |
 //! | `mock-tee`   | no      | Correctly-shaped 632-byte stub — no hardware required |
 //! | `ita-verify` | no      | Intel Trust Authority REST API verification |
 
-pub mod evidence;
-pub mod generate;
-pub mod public_values;
-pub mod report;
-pub mod verify;
+mod cloud;
+mod evidence;
+mod generate;
+mod parser;
+mod public_values;
+mod report;
+mod types;
+mod verify;
 
 #[cfg(feature = "ita-verify")]
-pub mod attest;
+mod attest;
 #[cfg(feature = "ita-verify")]
-pub mod bind;
+mod bind;
 
-pub use evidence::Evidence;
-pub use evidence::EvidenceError;
+// ── Core types ─────────────────────────────────────────────────────────────
+pub use evidence::{Evidence, EvidenceError, QUOTE_MIN_LEN};
+pub use parser::parse;
 pub use public_values::{entry_hash, PublicValues, PublicValuesError};
 pub use report::{build_id_from_binary, build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION};
+pub use types::Config;
+
+// ── Generation ─────────────────────────────────────────────────────────────
 pub use generate::{binary_hash, generate_evidence, GenerateError};
 
+// ── Verification — local (always available) ────────────────────────────────
 pub use verify::extract::{extract_mrtd, extract_report_data, ExtractError};
 
 #[cfg(feature = "ita-verify")]
@@ -43,10 +51,10 @@ pub use verify::ita::{get_nonce, verify_evidence, ItaConfig, VerifiedClaims, Ver
 pub use verify::VerifyError;
 
 #[cfg(feature = "ita-verify")]
-pub use attest::{generate_and_attest, AttestedEvidence, AttestError};
+pub use attest::{generate_and_attest, AttestError, AttestedEvidence};
 
 #[cfg(feature = "ita-verify")]
-pub use bind::{payload_hash_for, verify_quote, verify_token, AttestBuilder, Livy, Proof};
+pub use bind::{verify_quote, verify_quote_with_public_values, AttestBuilder, Attestation, Livy};
 
 #[cfg(feature = "ita-verify")]
 pub use verify::ita::report_data_from_token;
