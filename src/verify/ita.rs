@@ -142,6 +142,11 @@ struct NonceApiResponse {
 /// Claims extracted from an ITA attestation token (JWT).
 #[derive(Debug, Clone)]
 pub struct VerifiedClaims {
+    /// ITA appraisal result for a specific evidence submission.
+    ///
+    /// This is the server-side appraisal response, not a standalone local
+    /// verification artifact. Callers that persist `raw_token` should still
+    /// validate it against Intel's JWKS before trusting it later.
     /// MRTD as a hex string (48 bytes = 96 hex chars).
     pub mrtd: String,
     /// Raw 64-byte REPORTDATA extracted from the JWT.
@@ -248,6 +253,15 @@ struct ItaClaims {
     attester_held_data: String,
     #[serde(default)]
     attester_runtime_data: serde_json::Value,
+    #[serde(default)]
+    #[allow(dead_code)]
+    exp: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    nbf: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    iat: Option<u64>,
 }
 
 impl ItaClaims {
@@ -305,9 +319,11 @@ impl ItaClaims {
     }
 
     fn is_azure_method(&self) -> bool {
-        self.appraisal.method.eq_ignore_ascii_case("azure")
-            || (!self.attester_held_data().is_empty()
-                && self.attester_runtime_user_data().is_some())
+        if !self.appraisal.method.is_empty() {
+            return self.appraisal.method.eq_ignore_ascii_case("azure");
+        }
+
+        !self.attester_held_data().is_empty() && self.attester_runtime_user_data().is_some()
     }
 }
 
@@ -315,12 +331,10 @@ fn http_client(request_timeout_secs: u64) -> Result<reqwest::Client, VerifyError
     static CLIENTS: OnceLock<Mutex<HashMap<u64, reqwest::Client>>> = OnceLock::new();
 
     let clients = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(client) = clients
+    let mut clients = clients
         .lock()
-        .expect("http client cache lock poisoned")
-        .get(&request_timeout_secs)
-        .cloned()
-    {
+        .map_err(|_| VerifyError::Network("http client cache lock poisoned".to_string()))?;
+    if let Some(client) = clients.get(&request_timeout_secs).cloned() {
         return Ok(client);
     }
 
@@ -329,10 +343,7 @@ fn http_client(request_timeout_secs: u64) -> Result<reqwest::Client, VerifyError
         .build()
         .map_err(|e| VerifyError::Network(e.to_string()))?;
 
-    clients
-        .lock()
-        .expect("http client cache lock poisoned")
-        .insert(request_timeout_secs, client.clone());
+    clients.insert(request_timeout_secs, client.clone());
 
     Ok(client)
 }
@@ -349,7 +360,8 @@ pub(crate) async fn verify_attestation_token(
     use jsonwebtoken::jwk::JwkSet;
     use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 
-    if jwt.trim().is_empty() {
+    let jwt = normalized_jwt(jwt)?;
+    if jwt.is_empty() {
         return Err(VerifyError::InvalidToken("JWT is empty".to_string()));
     }
 
@@ -479,14 +491,18 @@ pub async fn get_nonce(config: &ItaConfig) -> Result<VerifierNonce, VerifyError>
     })
 }
 
-/// Verify TDX evidence via Intel Trust Authority (Intel CLI-compatible flow).
+/// Submit evidence to Intel Trust Authority for server-side appraisal.
 ///
 /// Sends the raw quote along with `runtime_data` and `verifier_nonce`.
 /// For standard TDX attesters, ITA verifies
 /// `SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data) == REPORTDATA in quote`.
 /// Azure TDX VMs use Intel Trust Authority's `/attest/azure` flow, which binds
 /// the caller's `user_data` separately from the Azure runtime JSON.
-pub async fn verify_evidence(
+///
+/// This returns ITA's appraisal result for the submitted evidence. It does not
+/// by itself prove that a separately stored token or attestation object was
+/// locally revalidated; use the high-level attestation APIs for that flow.
+pub async fn appraise_evidence(
     evidence: &Evidence,
     config: &ItaConfig,
     runtime_data: &[u8; 64],
@@ -595,6 +611,20 @@ pub async fn verify_evidence(
     })
 }
 
+/// Legacy name for [`appraise_evidence`].
+///
+/// This submits evidence to Intel Trust Authority and returns the appraisal
+/// result. The name is kept for compatibility, but the operation is an ITA
+/// appraisal step rather than a complete standalone local verification verdict.
+pub async fn verify_evidence(
+    evidence: &Evidence,
+    config: &ItaConfig,
+    runtime_data: &[u8; 64],
+    nonce: &VerifierNonce,
+) -> Result<VerifiedClaims, VerifyError> {
+    appraise_evidence(evidence, config, runtime_data, nonce).await
+}
+
 fn parse_verified_claims(claims: ItaClaims) -> Result<VerifiedTokenClaims, VerifyError> {
     if claims.tdx_mrtd().len() != 96 {
         return Err(VerifyError::InvalidTokenClaims(format!(
@@ -614,16 +644,18 @@ fn parse_verified_claims(claims: ItaClaims) -> Result<VerifiedTokenClaims, Verif
         .map_err(VerifyError::InvalidTokenClaims)?;
 
     let binding = if claims.is_azure_method() {
-        let held_data =
-            decode_standard_base64_array_64("attester_held_data", claims.attester_held_data())
-                .map_err(VerifyError::InvalidTokenClaims)?;
+        let held_data = decode_standard_base64_array_64(
+            "attester_held_data",
+            normalized_claim_field(claims.attester_held_data()),
+        )
+        .map_err(VerifyError::InvalidTokenClaims)?;
         let user_data_hash = decode_claim_array_64(
             "attester_runtime_data.user-data",
-            claims.attester_runtime_user_data().ok_or_else(|| {
+            normalized_claim_field(claims.attester_runtime_user_data().ok_or_else(|| {
                 VerifyError::InvalidTokenClaims(
                     "Azure ITA token is missing attester_runtime_data.user-data".to_string(),
                 )
-            })?,
+            })?),
         )
         .map_err(VerifyError::InvalidTokenClaims)?;
         VerifiedTokenBinding::AzureRuntime {
@@ -644,25 +676,37 @@ fn parse_verified_claims(claims: ItaClaims) -> Result<VerifiedTokenClaims, Verif
     })
 }
 
-/// Extract the raw `tdx_report_data` claim embedded in an ITA v2 JWT.
+/// Extract the raw `tdx_report_data` claim embedded in an ITA v2 JWT without
+/// authenticating the token.
 ///
 /// **Note:** After nonce integration, the JWT's `tdx_report_data` field contains
 /// the token's 64-byte binding value, not the raw [`crate::report::ReportData`]
 /// struct. For standard TDX attesters this is
 /// `SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data)`.
-pub fn report_data_hash_from_token(jwt: &str) -> Result<Option<[u8; 64]>, VerifyError> {
+pub fn unauthenticated_report_data_hash_from_token(
+    jwt: &str,
+) -> Result<Option<[u8; 64]>, VerifyError> {
     let claims = decode_jwt_claims(jwt)?;
 
     if claims.tdx_report_data().is_empty() {
         return Ok(None);
     }
 
-    decode_claim_array_64("tdx_report_data", claims.tdx_report_data())
-        .map(Some)
-        .map_err(VerifyError::InvalidTokenClaims)
+    decode_claim_array_64(
+        "tdx_report_data",
+        normalized_claim_field(claims.tdx_report_data()),
+    )
+    .map(Some)
+    .map_err(VerifyError::InvalidTokenClaims)
+}
+
+/// Legacy name for [`unauthenticated_report_data_hash_from_token`].
+pub fn report_data_hash_from_token(jwt: &str) -> Result<Option<[u8; 64]>, VerifyError> {
+    unauthenticated_report_data_hash_from_token(jwt)
 }
 
 fn decode_jwt_claims(jwt: &str) -> Result<ItaClaims, VerifyError> {
+    let jwt = normalized_jwt(jwt)?;
     let parts: Vec<&str> = jwt.splitn(3, '.').collect();
     if parts.len() != 3 {
         return Err(VerifyError::InvalidToken(
@@ -679,10 +723,23 @@ fn decode_jwt_claims(jwt: &str) -> Result<ItaClaims, VerifyError> {
         .map_err(|e| VerifyError::InvalidToken(format!("JWT claims JSON: {e}")))
 }
 
+fn normalized_jwt(jwt: &str) -> Result<&str, VerifyError> {
+    let jwt = jwt.trim();
+    if jwt.is_empty() {
+        return Err(VerifyError::InvalidToken("JWT is empty".to_string()));
+    }
+    Ok(jwt)
+}
+
+fn normalized_claim_field(value: &str) -> &str {
+    value.trim()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        default_jwks_url_for_api_url, parse_verified_claims, ItaConfig, VerifiedTokenBinding,
+        default_jwks_url_for_api_url, normalized_claim_field, parse_verified_claims,
+        unauthenticated_report_data_hash_from_token, ItaConfig, VerifiedTokenBinding,
         DEFAULT_JWKS_URL,
     };
     use crate::verify::VerifyError;
@@ -757,6 +814,46 @@ mod tests {
             matches!(err, VerifyError::InvalidTokenClaims(ref message) if message.contains("attester_runtime_data.user-data")),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn parse_verified_claims_does_not_treat_non_azure_method_as_azure() {
+        let claims = serde_json::from_value(json!({
+            "appraisal": { "method": "tdx" },
+            "tdx": {
+                "tdx_mrtd": sample_mrtd(),
+                "tdx_report_data": "00".repeat(64),
+                "attester_tcb_status": "UpToDate",
+                "attester_held_data": base64::engine::general_purpose::STANDARD.encode([0u8; 64]),
+                "attester_runtime_data": {
+                    "user-data": "11".repeat(64),
+                }
+            }
+        }))
+        .expect("claims JSON should deserialize");
+
+        let verified = parse_verified_claims(claims).expect("claims should parse as standard");
+        assert!(matches!(
+            verified.binding,
+            VerifiedTokenBinding::StandardReportData
+        ));
+    }
+
+    #[test]
+    fn unauthenticated_report_data_hash_from_token_trims_input() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"alg":"RS256","kid":"test"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(
+            r#"{{"tdx":{{"tdx_report_data":"{}"}}}}"#,
+            "aa".repeat(64)
+        ));
+        let jwt = format!("  {header}.{payload}.sig  ");
+
+        let claim =
+            unauthenticated_report_data_hash_from_token(&jwt).expect("trimmed JWT should parse");
+
+        assert_eq!(claim, Some([0xaau8; 64]));
+        assert_eq!(normalized_claim_field("  abc  "), "abc");
     }
 
     #[test]

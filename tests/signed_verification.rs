@@ -7,8 +7,9 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use livy_tee::{
-    Attestation, AttestationVerification, AttestationVerificationPolicy, Evidence, ItaConfig,
-    PublicValues, ReportData, VerifyError, REPORT_DATA_VERSION,
+    unauthenticated_report_data_hash_from_token, Attestation, AttestationVerification,
+    AttestationVerificationPolicy, Evidence, ItaConfig, PublicValues, ReportData, VerifyError,
+    REPORT_DATA_VERSION,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha512};
@@ -164,11 +165,11 @@ fn sample_mrtd() -> String {
     "11".repeat(48)
 }
 
-fn now_unix_secs() -> usize {
+fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("current time should be after unix epoch")
-        .as_secs() as usize
+        .as_secs()
 }
 
 fn runtime_hash(nonce_val: &[u8], nonce_iat: &[u8], runtime_data: &[u8; 64]) -> [u8; 64] {
@@ -294,15 +295,15 @@ fn azure_claims(
 }
 
 fn default_policy(fixture: &VerificationFixture) -> AttestationVerificationPolicy {
-    AttestationVerificationPolicy {
-        jwks_url: String::new(),
-        request_timeout_secs: 5,
-        accepted_tcb_statuses: vec!["UpToDate".to_string()],
-        expected_advisory_ids: None,
-        expected_mrtd: Some(fixture.mrtd.clone()),
-        expected_build_id: Some(fixture.attestation.report_data.build_id),
-        expected_nonce: Some(fixture.attestation.report_data.nonce),
-    }
+    let mut policy = AttestationVerificationPolicy::default();
+    policy.jwks_url = String::new();
+    policy.request_timeout_secs = 5;
+    policy.accepted_tcb_statuses = vec!["UpToDate".to_string()];
+    policy.expected_advisory_ids = None;
+    policy.expected_mrtd = Some(fixture.mrtd.clone());
+    policy.expected_build_id = Some(fixture.attestation.report_data.build_id);
+    policy.expected_nonce = Some(fixture.attestation.report_data.nonce);
+    policy
 }
 
 async fn verify_fixture(
@@ -582,16 +583,21 @@ async fn verify_with_policy_reports_empty_raw_quote_without_full_pass() {
     fixture.attestation.raw_quote.clear();
     let claims = standard_claims(&fixture, fixture.runtime_hash, "UpToDate");
     let policy = default_policy(&fixture);
-    let report = verify_fixture(fixture, claims, policy).await;
+    let server = JwksServer::spawn().await;
+    let mut policy = policy;
+    policy.jwks_url = server.url.clone();
+    fixture.attestation.ita_token = sign_token(claims);
 
-    assert!(report.jwt_signature_and_expiry_valid);
-    assert_eq!(report.token_verification_error, None);
-    assert!(report.token_report_data_matches);
-    assert_eq!(report.quote_report_data_matches, Some(false));
-    assert!(report.runtime_data_matches_report);
-    assert!(report.public_values_bound);
-    assert!(report.require_success().is_err());
-    assert!(!report.all_passed());
+    let err = fixture
+        .attestation
+        .verify_with_policy(&policy)
+        .await
+        .expect_err("empty raw quote should be rejected structurally");
+    server.finish().await;
+
+    assert!(
+        matches!(err, VerifyError::InvalidAttestation(message) if message.contains("raw_quote"))
+    );
 }
 
 #[tokio::test]
@@ -837,6 +843,43 @@ async fn verify_with_policy_reports_unsupported_algorithm_jwt() {
     assert!(report.runtime_data_matches_report);
     assert!(report.public_values_bound);
     assert!(report.require_success().is_err());
+}
+
+#[tokio::test]
+async fn verify_with_policy_accepts_trimmed_jwt() {
+    let mut fixture = verification_fixture("UpToDate");
+    let claims = standard_claims(&fixture, fixture.runtime_hash, "UpToDate");
+    let server = JwksServer::spawn().await;
+    let mut policy = default_policy(&fixture);
+    policy.jwks_url = server.url.clone();
+    fixture.attestation.ita_token = format!("  {} \n", sign_token(claims));
+
+    let report = fixture
+        .attestation
+        .verify_with_policy(&policy)
+        .await
+        .expect("verification should return a report");
+    server.finish().await;
+
+    assert!(report.jwt_signature_and_expiry_valid);
+    assert_eq!(report.token_verification_error, None);
+    assert!(report.all_passed());
+}
+
+#[test]
+fn unauthenticated_report_data_hash_from_token_accepts_trimmed_input() {
+    let claims = serde_json::json!({
+        "tdx": {
+            "tdx_report_data": hex::encode([0xabu8; 64]),
+        }
+    });
+    let token = format!("  {} \n", sign_token(with_registered_claims(claims)));
+
+    let hash = unauthenticated_report_data_hash_from_token(&token)
+        .expect("trimmed JWT should decode")
+        .expect("claim should be present");
+
+    assert_eq!(hash, [0xabu8; 64]);
 }
 
 #[tokio::test]

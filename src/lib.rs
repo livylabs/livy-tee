@@ -50,8 +50,8 @@ pub use verify::extract::{extract_mrtd, extract_report_data, ExtractError};
 
 #[cfg(feature = "ita-verify")]
 pub use verify::ita::{
-    default_jwks_url_for_api_url, get_nonce, verify_evidence, ItaConfig, VerifiedClaims,
-    VerifierNonce,
+    appraise_evidence, default_jwks_url_for_api_url, get_nonce, verify_evidence, ItaConfig,
+    VerifiedClaims, VerifierNonce,
 };
 #[cfg(feature = "ita-verify")]
 pub use verify::VerifyError;
@@ -66,4 +66,4 @@ pub use bind::{
 };
 
 #[cfg(feature = "ita-verify")]
-pub use verify::ita::report_data_hash_from_token;
+pub use verify::ita::{report_data_hash_from_token, unauthenticated_report_data_hash_from_token};
