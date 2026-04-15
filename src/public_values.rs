@@ -116,11 +116,6 @@ impl PublicValues {
         Ok(value)
     }
 
-    /// Backward-compatible alias for [`read`](Self::read).
-    pub fn try_read<T: DeserializeOwned>(&self) -> Result<T, PublicValuesError> {
-        self.read()
-    }
-
     /// Read the exact payload bytes for the next entry without deserializing.
     ///
     /// Use this for raw entries, including hash bytes stored by higher-level
@@ -513,7 +508,7 @@ mod tests {
 
         let reader = PublicValues::from_bytes(pv.into_bytes());
         assert_eq!(reader.read::<u32>().unwrap(), 7);
-        assert!(reader.try_read::<u32>().is_err());
+        assert!(reader.read::<u32>().is_err());
 
         reader.reset_cursor();
         assert_eq!(reader.read::<u32>().unwrap(), 7);
@@ -667,7 +662,7 @@ mod tests {
         assert_eq!(values.entry_count(), 0);
         assert!(values.entries_raw().is_empty());
         assert_eq!(
-            values.try_read::<String>(),
+            values.read::<String>(),
             Err(PublicValuesError::TruncatedEntryPayload {
                 offset: 0,
                 declared_len: 5,

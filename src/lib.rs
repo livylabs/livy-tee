@@ -67,12 +67,3 @@ pub use bind::{
 
 #[cfg(feature = "ita-verify")]
 pub use verify::ita::unauthenticated_report_data_hash_from_token;
-
-/// Deprecated alias for [`unauthenticated_report_data_hash_from_token`].
-#[cfg(feature = "ita-verify")]
-#[deprecated(
-    note = "use unauthenticated_report_data_hash_from_token to make the unauthenticated trust boundary explicit"
-)]
-pub fn report_data_hash_from_token(jwt: &str) -> Result<Option<[u8; 64]>, VerifyError> {
-    verify::ita::unauthenticated_report_data_hash_from_token(jwt)
-}

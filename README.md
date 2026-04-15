@@ -113,7 +113,7 @@ use sha2::{Digest, Sha256};
 // Hashed entries are raw 32-byte payloads, so consume them with read_raw().
 let _input_hash = attestation.public_values.read_raw()?;
 let _output_hash = attestation.public_values.read_raw()?;
-let committed_hash: [u8; 32] = attestation.public_values.try_read()?;
+let committed_hash: [u8; 32] = attestation.public_values.read()?;
 assert_eq!(committed_hash, expected_content_hash);
 
 // Strict verification: ITA JWT/JWKS, TCB policy, public-value binding,
