@@ -6,7 +6,6 @@ achieves the same security guarantees while also producing *self-verifiable proo
 proofs that can be fully reconstructed and re-checked by any third party long after the
 original attestation session is gone.
 
----
 
 ## 1. The Intel TDX security model
 
@@ -41,7 +40,6 @@ that was loaded into the TD at boot time. If two separate machines run the same 
 and produce quotes with the same MRTD, anyone can verify those quotes came from the same
 code — without trusting the vendor.
 
----
 
 ## 2. The relay-attack problem and Intel's verifier nonce solution
 
@@ -106,7 +104,6 @@ If they match, ITA knows:
 The signed JWT that ITA returns then carries the attested claims — MRTD, TCB status,
 report data — as a credential anchored to Intel's PKI.
 
----
 
 ## 3. How the Intel Go CLI implements this
 
@@ -206,7 +203,6 @@ livy-tee JWT:
 Both JWTs are valid and carry the same hardware claims. The difference is in what is
 stored alongside the JWT for future verification.
 
----
 
 ## 4. How livy-tee achieves the same security (and more)
 
@@ -367,7 +363,6 @@ a "yes/no" from Intel at a single point in time. livy-tee treats proofs as porta
 self-contained records that carry all material needed to re-derive every hash in the
 chain from the original data.
 
----
 
 ## 5. The two nonces in livy-tee
 
@@ -403,7 +398,6 @@ Application nonce:   "This quote was generated for REQUEST #42, not a replay of 
 Both nonces are embedded in the hardware-signed quote. Neither can be forged or stripped
 without invalidating the signature.
 
----
 
 ## 6. Summary
 

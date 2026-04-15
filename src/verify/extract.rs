@@ -1,19 +1,8 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 //! Local extraction of fields from a raw TDX DCAP quote.
 //!
-//! TDX DCAP v4 quote layout (byte offsets):
-//!
-//! ```text
-//!  [0..2]     version      u16 LE — must be 4
-//!  [2..4]     att_key_type u16 LE
-//!  [4..8]     tee_type     u32 LE — 0x81 = TDX
-//!  [8..48]    header rest
-//!  ── TD Report Body (520 bytes @ 48) ──
-//!  [48..184]  various TD fields (TEETCBSVN, MRSEAM, …)
-//!  [184..232] MRTD         48 bytes — measurement of the TD binary
-//!  [232..568] more TD fields (RTMR0..3, etc.)
-//!  [568..632] REPORTDATA   64 bytes — our embedded user_data
-//! ```
+//! This module parses fixed offsets from the quote body. It does not verify the
+//! quote signature chain.
 
 use crate::evidence::{Evidence, QUOTE_MIN_LEN};
 use thiserror::Error;
@@ -67,10 +56,7 @@ fn parse_header(evidence: &Evidence) -> Result<(), ExtractError> {
     Ok(())
 }
 
-/// Extract the 64-byte REPORTDATA field from a raw TDX DCAP quote.
-///
-/// This is a local, network-free operation. No signature verification is
-/// performed — use the `ita-verify` feature for full chain verification.
+/// Extract the 64-byte `REPORTDATA` field from a raw TDX quote.
 pub fn extract_report_data(evidence: &Evidence) -> Result<[u8; 64], ExtractError> {
     parse_header(evidence)?;
     let mut out = [0u8; 64];
@@ -78,10 +64,7 @@ pub fn extract_report_data(evidence: &Evidence) -> Result<[u8; 64], ExtractError
     Ok(out)
 }
 
-/// Extract the 48-byte MRTD (TD binary measurement) from a raw TDX DCAP quote.
-///
-/// In real quotes this equals SHA-384 of the TD image as measured by the TDX
-/// module at launch.  In mock quotes this is all zeros.
+/// Extract the 48-byte MRTD from a raw TDX quote.
 pub fn extract_mrtd(evidence: &Evidence) -> Result<[u8; 48], ExtractError> {
     parse_header(evidence)?;
     let mut out = [0u8; 48];

@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 //! TDX evidence generation.
 //!
-//! Default runtime behavior:
-//! - Azure CVMs: Azure vTPM/paravisor quote path
-//! - Other Linux TDX: TSM configfs (`/sys/kernel/config/tsm/report/`)
-//!
-//! Add `--features mock-tee` to use a correctly-shaped stub without hardware.
+//! Azure CVMs use the Azure vTPM/paravisor path. Other Linux TDX guests use
+//! TSM configfs. Enable `mock-tee` to use a correctly-shaped stub instead.
 
 #[cfg(not(feature = "mock-tee"))]
 mod azure;
@@ -68,9 +65,6 @@ impl GenerateError {
 }
 
 /// Generate TDX evidence over 64 bytes of caller-supplied user data.
-///
-/// The `user_data` slice is embedded verbatim as the REPORTDATA field in the
-/// resulting DCAP quote (bytes 568–632).
 pub fn generate_evidence(user_data: &[u8; 64]) -> Result<Evidence, GenerateError> {
     #[cfg(not(feature = "mock-tee"))]
     {

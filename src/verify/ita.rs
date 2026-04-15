@@ -1,42 +1,12 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-//! Intel Trust Authority (ITA) REST API verification.
+//! Intel Trust Authority HTTP helpers.
 //!
-//! Sends the raw quote to ITA's appraisal endpoint and parses the returned JWT
-//! to extract TDX claims.  ITA performs the full DCAP chain verification
-//! server-side.  For stored attestations, verify the returned JWT against
-//! ITA's JWKS before trusting its claims.
+//! This module fetches verifier nonces, submits evidence to ITA, and validates
+//! returned JWTs against JWKS.
 //!
-//! ## Attestation flow (Intel CLI-compatible)
-//!
-//! 1. GET  `{api_url}/appraisal/v2/nonce`  — fetch anti-replay verifier nonce
-//! 2. Compute `REPORTDATA = SHA-512(nonce.val ‖ nonce.iat ‖ our_64_byte_struct)` — 64 bytes
-//! 3. Generate DCAP quote with the new REPORTDATA via TSM configfs
-//! 4. POST `{api_url}/appraisal/v2/attest`:
-//!    ```json
-//!    {
-//!      "tdx": {
-//!        "quote":          "<base64url-DCAP-quote>",
-//!        "runtime_data":   "<base64 of our 64-byte ReportData struct>",
-//!        "verifier_nonce": { "val": "...", "iat": "...", "signature": "..." }
-//!      }
-//!    }
-//!    ```
-//! 5. ITA verifies server-side: `SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data) == REPORTDATA in quote`
-//!
-//! ITA v2 JWT payload structure (TDX-specific claims nested under "tdx"):
-//! ```json
-//! {
-//!   "tdx": {
-//!     "tdx_mrtd": "<96-hex-char MRTD>",
-//!     "tdx_report_data": "<base64 or hex-encoded 64-byte REPORTDATA>",
-//!     "attester_tcb_status": "UpToDate",
-//!     "attester_advisory_ids": [...],
-//!     ...
-//!   },
-//!   "verifier_instance_ids": [...],
-//!   "exp": ..., "iat": ..., ...
-//! }
-//! ```
+//! Most callers should prefer [`crate::Attestation::verify`] or
+//! [`crate::Attestation::verify_fresh`]. The lower-level appraisal helpers are
+//! for request-scoped flows and custom tooling.
 
 use crate::evidence::Evidence;
 use crate::verify::codec::{decode_claim_array_64, decode_standard_base64_array_64};
@@ -49,6 +19,11 @@ use std::sync::{Mutex, OnceLock};
 pub(crate) const DEFAULT_JWKS_URL: &str = "https://portal.trustauthority.intel.com/certs";
 
 /// Configuration for the Intel Trust Authority API.
+///
+/// High-level callers usually need only `api_key`. The defaults are:
+/// - `api_url = https://api.trustauthority.intel.com`
+/// - `request_timeout_secs = 30`
+/// - issuer and audience are derived or left unset unless you pin them
 #[derive(Debug, Clone)]
 pub struct ItaConfig {
     /// Intel Trust Authority API key (`x-api-key` request header).
@@ -97,10 +72,6 @@ impl Default for ItaConfig {
 }
 
 /// Derive the default Intel Trust Authority JWKS URL from an ITA API base URL.
-///
-/// Official regional hosts map `api...trustauthority.intel.com` to the matching
-/// `portal...trustauthority.intel.com/certs` endpoint. Unknown hosts fall back
-/// to the global default.
 #[must_use]
 pub fn default_jwks_url_for_api_url(api_url: &str) -> String {
     reqwest::Url::parse(api_url)
@@ -109,13 +80,7 @@ pub fn default_jwks_url_for_api_url(api_url: &str) -> String {
         .unwrap_or_else(|| DEFAULT_JWKS_URL.to_string())
 }
 
-/// Derive the default token issuer from an Intel Trust Authority JWKS URL.
-///
-/// For standard ITA regional JWKS URLs, this is the base portal URL with `/`
-/// as the path. For example:
-/// `https://portal.trustauthority.intel.com/certs`
-/// becomes
-/// `https://portal.trustauthority.intel.com/`.
+/// Derive the default token issuer from an ITA JWKS URL.
 #[must_use]
 pub fn default_issuer_for_jwks_url(jwks_url: &str) -> Option<String> {
     let mut url = reqwest::Url::parse(jwks_url).ok()?;
@@ -174,12 +139,11 @@ struct NonceApiResponse {
     signature: String,
 }
 
-/// Claims parsed from an ITA appraisal token without authenticating its JWT signature.
+/// Claims parsed from an ITA appraisal token without authenticating its JWT.
 ///
-/// This is only suitable for the immediate appraisal response returned by
-/// Intel Trust Authority. For stored attestations, use
-/// [`crate::Attestation::verify_with_policy`] to authenticate the token before
-/// trusting these values.
+/// Use this only for the immediate response returned by ITA on the same
+/// request. For stored attestations, use the high-level
+/// [`crate::Attestation::verify`] or [`crate::Attestation::verify_fresh`] path.
 #[derive(Debug, Clone)]
 pub struct UnauthenticatedAppraisalClaims {
     /// MRTD as a hex string (48 bytes = 96 hex chars).
@@ -225,7 +189,7 @@ impl AppraisalClaimsCore {
     }
 }
 
-/// Claims extracted from an ITA token after JWT signature and expiry validation.
+/// Claims extracted from an ITA token after JWT validation.
 #[derive(Debug, Clone)]
 pub(crate) struct VerifiedTokenClaims {
     claims: AppraisalClaimsCore,
@@ -484,10 +448,10 @@ fn http_client(request_timeout_secs: u64) -> Result<reqwest::Client, VerifyError
     Ok(client)
 }
 
-/// Verify an ITA attestation token against Intel Trust Authority's JWKS.
+/// Verify an ITA attestation token against a JWKS endpoint.
 ///
-/// The token header's `kid` selects the signing key from `jwks_url`; the token
-/// `jku` header, if present, is intentionally ignored.
+/// This is the authenticated low-level entry point. Most callers should prefer
+/// [`crate::Attestation::verify`] instead of calling this directly.
 pub(crate) async fn verify_attestation_token(
     jwt: &str,
     jwks_url: &str,
@@ -565,10 +529,9 @@ fn attest_path_for_evidence(evidence: &Evidence) -> &'static str {
     }
 }
 
-/// Fetch an anti-replay verifier nonce from Intel Trust Authority.
+/// Fetch a verifier nonce from Intel Trust Authority.
 ///
-/// This must be called before generating the DCAP quote so that the nonce
-/// bytes can be incorporated into REPORTDATA.
+/// This nonce is incorporated into the quote binding hash before evidence is generated.
 pub async fn get_nonce(config: &ItaConfig) -> Result<VerifierNonce, VerifyError> {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
@@ -628,18 +591,11 @@ pub async fn get_nonce(config: &ItaConfig) -> Result<VerifierNonce, VerifyError>
     })
 }
 
-/// Submit evidence to Intel Trust Authority for server-side appraisal and parse
-/// the returned token without authenticating its JWT signature.
+/// Submit evidence to ITA and parse the returned token without authenticating it.
 ///
-/// Sends the raw quote along with `runtime_data` and `verifier_nonce`.
-/// For standard TDX attesters, ITA verifies
-/// `SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data) == REPORTDATA in quote`.
-/// Azure TDX VMs use Intel Trust Authority's `/attest/azure` flow, which binds
-/// the caller's `user_data` separately from the Azure runtime JSON.
-///
-/// This is suitable for the immediate ITA response on the same request. For
-/// stored attestations, use [`crate::Attestation::verify_with_policy`] to
-/// authenticate the token before trusting any claims.
+/// Use this only when you trust the HTTPS response in the same request flow and
+/// need the returned claims immediately. For stored attestations, use
+/// [`crate::Attestation::verify_with_policy`] or [`crate::Attestation::verify`].
 pub async fn appraise_evidence_unauthenticated(
     evidence: &Evidence,
     config: &ItaConfig,
@@ -828,13 +784,10 @@ fn parse_verified_claims(claims: ItaClaims) -> Result<VerifiedTokenClaims, Verif
     })
 }
 
-/// Extract the raw `tdx_report_data` claim embedded in an ITA v2 JWT without
-/// authenticating the token.
+/// Extract the raw `tdx_report_data` claim from a JWT without authenticating it.
 ///
-/// **Note:** After nonce integration, the JWT's `tdx_report_data` field contains
-/// the token's 64-byte binding value, not the raw [`crate::report::ReportData`]
-/// struct. For standard TDX attesters this is
-/// `SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data)`.
+/// This is a low-level inspection helper. The returned value is the token-side
+/// binding hash, not the raw [`crate::report::ReportData`].
 pub fn unauthenticated_report_data_hash_from_token(
     jwt: &str,
 ) -> Result<Option<[u8; 64]>, VerifyError> {

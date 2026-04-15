@@ -23,18 +23,9 @@ pub(crate) fn verify_quote_report_data_binding(
     Ok(quote_rd_bytes == *expected_report_data)
 }
 
-/// Verify a raw DCAP quote's ITA nonce binding and an expected `payload_hash`.
+/// Verify a raw quote against the verifier nonce binding and an expected payload hash.
 ///
-/// **No TDX hardware. No network.** Pure software — anyone can call this.
-///
-/// Checks:
-/// 1. `SHA-512(nonce_val ‖ nonce_iat ‖ runtime_data) == REPORTDATA` in the quote.
-/// 2. `ReportData.payload_hash == expected_payload_hash`.
-///
-/// Use this when you built the `payload_hash` yourself with the low-level API
-/// (e.g. `SHA-256(your_inputs)`) rather than through a [`PublicValues`] buffer.
-/// For the high-level commit/read model, use [`verify_quote_with_public_values`]
-/// or [`crate::bind::Attestation::verify`] instead.
+/// This is a local check. It does not require hardware or network access.
 pub fn verify_quote(
     raw_quote_b64: &str,
     runtime_data_b64: &str,
@@ -72,17 +63,10 @@ pub fn verify_quote(
     Ok(rd.verify_payload(expected_payload_hash))
 }
 
-/// Verify a raw DCAP quote against a [`PublicValues`] buffer.
+/// Verify a raw quote against a [`PublicValues`] buffer.
 ///
-/// **No TDX hardware. No network.** Pure software — anyone can call this.
-///
-/// Checks:
-/// 1. `SHA-512(nonce_val ‖ nonce_iat ‖ runtime_data) == REPORTDATA` in the quote.
-/// 2. `SHA-256(public_values.buffer) == ReportData.payload_hash` in runtime_data.
-///
-/// This is the high-level counterpart to [`verify_quote`]: it computes the
-/// `payload_hash` automatically from the `PublicValues` buffer rather than
-/// requiring you to supply it directly.
+/// This is the same check as [`verify_quote`], but it derives the payload hash
+/// from the supplied `PublicValues`.
 pub fn verify_quote_with_public_values(
     raw_quote_b64: &str,
     runtime_data_b64: &str,

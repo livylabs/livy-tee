@@ -22,7 +22,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-/// Policy for full [`Attestation`] verification.
+/// Policy for [`Attestation::verify_with_policy`] and [`Attestation::verify_fresh_with_policy`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct AttestationVerificationPolicy {
@@ -68,81 +68,84 @@ impl Default for AttestationVerificationPolicy {
     }
 }
 
-/// Result of full [`Attestation`] verification.
+/// Diagnostic report returned by attestation verification.
+///
+/// Read this in three groups:
+/// - token trust: `jwt_signature_and_expiry_valid`, `token_verification_error`
+/// - binding checks: `token_report_data_matches`, `quote_report_data_matches`,
+///   `runtime_data_matches_report`, `public_values_bound`
+/// - policy / identity checks: `*_matches_token`, `tcb_status_allowed`,
+///   `expected_*`
+///
+/// `Ok(report)` is still diagnostic. Use [`require_success`](Self::require_success)
+/// or [`all_passed`](Self::all_passed) for a strict verdict.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[must_use = "verification is diagnostic until you check all_passed() or require_success()"]
 #[non_exhaustive]
 pub struct AttestationVerification {
-    /// The ITA JWT signature and registered time claims passed validation.
+    /// `true` when the ITA JWT passed signature and registered time validation.
     pub jwt_signature_and_expiry_valid: bool,
-    /// Non-fatal token verification failure, when the JWT/JWKS step did not validate.
+    /// Why token validation failed, when it failed non-fatally.
     ///
-    /// This is populated when [`verify_with_policy`](Attestation::verify_with_policy)
-    /// or [`verify`](Attestation::verify) can still return a diagnostic report,
-    /// but the ITA token could not be trusted. Typical values are
-    /// [`VerifyError::InvalidToken`], [`VerifyError::InvalidTokenClaims`],
-    /// [`VerifyError::Network`], or [`VerifyError::ItaApi`].
+    /// When this is `Some(_)`, the report still describes local checks, but the
+    /// token-derived checks should be treated as untrusted.
     pub token_verification_error: Option<VerifyError>,
-    /// The token's signed binding claims match this attestation's nonce and runtime data.
-    ///
-    /// For standard TDX quotes, this is
-    /// `tdx_report_data == SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data)`.
-    /// For Azure TDX VMs, this checks Intel Trust Authority's Azure-specific
-    /// claims: `attester_held_data == runtime_data` and
-    /// `attester_runtime_data.user-data == SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data)`.
+    /// `true` when the signed token binding matches this attestation's nonce and runtime data.
     pub token_report_data_matches: bool,
-    /// Whether the raw quote's REPORTDATA matched the expected binding hash.
+    /// Local raw-quote binding result, when this attestation format exposes it portably.
     ///
-    /// `Some(true)` means the quote bytes locally proved
-    /// `REPORTDATA == SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data)`.
-    /// `Some(false)` means the quote bytes were present but did not match.
-    /// `None` means this attestation provider does not expose a portable local
-    /// REPORTDATA binding check through the attestation artifact. Today that is
-    /// the Azure `/attest/azure` path, where the authoritative binding lives in
-    /// Intel Trust Authority's Azure-specific token claims instead.
+    /// `None` means this check is not available for the stored artifact format,
+    /// which is the normal Azure case.
     pub quote_report_data_matches: Option<bool>,
-    /// The attestation's `runtime_data` decodes to exactly `report_data`.
+    /// `true` when the stored `runtime_data` decodes to the stored `report_data`.
     pub runtime_data_matches_report: bool,
-    /// The public-values commitment matches the payload hash in `report_data`.
+    /// `true` when `SHA-256(public_values)` matches `report_data.payload_hash`.
     pub public_values_bound: bool,
-    /// The public `mrtd` field matches the signed token claim.
+    /// `true` when the public `mrtd` field matches the verified token claim.
     pub mrtd_matches_token: bool,
-    /// The public `tcb_status` field matches the signed token claim.
+    /// `true` when the public `tcb_status` field matches the verified token claim.
     pub tcb_status_matches_token: bool,
-    /// The public `tcb_date` field matches the signed token claim.
+    /// `true` when the public `tcb_date` field matches the verified token claim.
     pub tcb_date_matches_token: bool,
-    /// The public advisory-ID list matches the signed token claim.
+    /// `true` when the public advisory-ID list matches the verified token claim.
     pub advisory_ids_match_token: bool,
-    /// The signed token TCB status is accepted by the verification policy.
+    /// `true` when the token TCB status is accepted by the verification policy.
     pub tcb_status_allowed: bool,
-    /// The TCB status extracted from the verified token.
+    /// TCB status extracted from the verified token.
     pub tcb_status: String,
-    /// The optional TCB date extracted from the verified token.
+    /// Optional TCB date extracted from the verified token.
     pub tcb_date: Option<String>,
-    /// The advisory IDs extracted from the verified token.
+    /// Advisory IDs extracted from the verified token.
     pub advisory_ids: Vec<String>,
-    /// The MRTD extracted from the verified token.
+    /// MRTD extracted from the verified token.
     pub mrtd: String,
     /// Result of comparing the token advisory IDs to the policy's expected set.
+    ///
+    /// `None` means the policy did not pin advisory IDs.
     pub expected_advisory_ids_matches: Option<bool>,
     /// Result of comparing the token MRTD to the policy's expected MRTD.
+    ///
+    /// `None` means the policy did not pin MRTD.
     pub expected_mrtd_matches: Option<bool>,
     /// Result of comparing the report build ID to the policy's expected build ID.
+    ///
+    /// `None` means the policy did not pin build ID.
     pub expected_build_id_matches: Option<bool>,
     /// Result of comparing the report nonce to the policy's expected nonce.
+    ///
+    /// `None` means the policy did not pin an application nonce.
     pub expected_nonce_matches: Option<bool>,
     /// Result of fresh ITA appraisal of the bundled evidence, when performed.
     ///
-    /// `None` means verification was done without reappraising the stored
-    /// evidence. `Some(true)` means the bundled evidence was successfully
-    /// reappraised by ITA and the resulting MRTD/TCB matched the attestation's
-    /// public fields. `Some(false)` means the fresh appraisal completed but did
-    /// not match the attestation object.
+    /// `None` means verification was run without a fresh ITA reappraisal.
     pub bundled_evidence_authenticated: Option<bool>,
 }
 
 impl AttestationVerification {
-    /// Return true when every required verification check passed.
+    /// Return `true` when every required verification check passed.
+    ///
+    /// Fields that are `None` because the check was not requested or not
+    /// applicable are treated as pass-through.
     #[must_use]
     pub fn all_passed(&self) -> bool {
         self.jwt_signature_and_expiry_valid
@@ -163,6 +166,8 @@ impl AttestationVerification {
     }
 
     /// Enforce the strict verification contract while preserving diagnostics.
+    ///
+    /// Returns `Ok(())` only when [`all_passed`](Self::all_passed) is `true`.
     pub fn require_success(&self) -> Result<(), &Self> {
         if self.all_passed() {
             Ok(())
@@ -172,10 +177,7 @@ impl AttestationVerification {
     }
 }
 
-/// Livy client — the entry point for TDX-backed attestation.
-///
-/// Create with [`Livy::from_env`] (reads `ITA_API_KEY`) or [`Livy::new`]
-/// (explicit key). Then call [`Livy::attest`] to start committing values.
+/// Client entry point for TDX-backed attestation.
 #[derive(Debug, Clone)]
 pub struct Livy {
     config: ItaConfig,
@@ -219,9 +221,6 @@ impl Livy {
     }
 
     /// Start building an attestation.
-    ///
-    /// Use `.commit(...)` to add public values, `.nonce(...)` for replay
-    /// protection, then `.finalize().await` to generate the attestation.
     pub fn attest(&self) -> AttestBuilder<'_> {
         AttestBuilder {
             config: &self.config,
@@ -246,16 +245,8 @@ pub struct AttestBuilder<'a> {
 impl<'a> AttestBuilder<'a> {
     /// Commit a typed value as a public output.
     ///
-    /// Values are read back in commit order by the verifier via
-    /// `attestation.public_values.read::<T>()?`.
-    ///
-    /// **Privacy notice:** the committed value is stored in plain text and is
-    /// readable by any party who receives the attestation. Only commit data that
-    /// is intended to be public. For sensitive values, use
-    /// [`commit_hashed`](Self::commit_hashed) to store a SHA-256 hash instead.
-    ///
-    /// Serialization failures are recorded and returned from
-    /// [`finalize`](Self::finalize) as [`AttestError::PublicValues`].
+    /// Values are stored in plain text. Use [`commit_hashed`](Self::commit_hashed)
+    /// when a value should be bound by hash only.
     pub fn commit<T: Serialize>(&mut self, value: &T) -> &mut Self {
         let result = self.public_values.commit(value).map(|_| ());
         self.record_public_values_result(result);
@@ -263,17 +254,6 @@ impl<'a> AttestBuilder<'a> {
     }
 
     /// Commit the SHA-256 hash of a serialized value instead of the value itself.
-    ///
-    /// Use this for sensitive data that must be bound to the attestation without
-    /// revealing the raw content. The 32-byte hash is stored in the public values
-    /// buffer; the original value is never included.
-    ///
-    /// To verify: the verifier independently serializes the same value with
-    /// `serde_json` and checks that `SHA-256(serialized)` matches what is read
-    /// back from `public_values`.
-    ///
-    /// Serialization failures are recorded and returned from
-    /// [`finalize`](Self::finalize) as [`AttestError::PublicValues`].
     pub fn commit_hashed<T: Serialize>(&mut self, value: &T) -> &mut Self {
         use sha2::{Digest, Sha256};
         let result = serde_json::to_vec(value)
@@ -293,21 +273,13 @@ impl<'a> AttestBuilder<'a> {
         self
     }
 
-    /// Set a monotonically increasing nonce for replay protection.
-    ///
-    /// Defaults to `0`. The nonce is stored at bytes `[48..56]` of ReportData.
+    /// Set the application nonce stored in [`ReportData::nonce`].
     pub fn nonce(&mut self, n: u64) -> &mut Self {
         self.nonce = n;
         self
     }
 
     /// Generate a TDX quote and obtain an ITA attestation token.
-    ///
-    /// The attestation's `public_values` contains all committed values in plain
-    /// text. Any party with the attestation can read them. Commit only public
-    /// data or pre-hash sensitive values with [`commit_hashed`](Self::commit_hashed).
-    ///
-    /// `REPORTDATA[0..32]` = `SHA-256(public_values buffer)`.
     pub async fn finalize(self) -> Result<Attestation, AttestError> {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
@@ -351,44 +323,10 @@ impl<'a> AttestBuilder<'a> {
     }
 }
 
-/// A TDX hardware attestation with inspectable public values.
+/// A TDX attestation plus its committed public values.
 ///
-/// This is a hardware attestation backed by Intel TDX — not a cryptographic
-/// proof.  Security relies on trusting the TDX hardware and Intel's signing
-/// keys.  The public values buffer is committed into `REPORTDATA[0..32]`
-/// via `SHA-256(buffer)`.
-///
-/// On non-Azure TDX guests, anyone with the raw quote can reconstruct the
-/// local REPORTDATA binding offline. On Azure, the portable `evidence`
-/// artifact plus a fresh Intel Trust Authority appraisal is the authoritative
-/// way to authenticate the bundled evidence.
-///
-/// **Privacy:** all committed values are stored in plain text inside
-/// `public_values`. Do not commit sensitive data — use
-/// [`AttestBuilder::commit_hashed`] to bind a value by its hash instead.
-///
-/// # Verification
-///
-/// ```rust,ignore
-/// // 1. Read and constrain individual values.
-/// // Raw/hash entries should be consumed with read_raw() or read().
-/// let hash_bytes = attestation.public_values.read_raw()?;
-/// let hash: [u8; 32] = hash_bytes.as_slice().try_into()?;
-/// assert_eq!(hash, expected);
-///
-/// // 2. Strict check: verify ITA JWT, TCB policy, public-value binding,
-/// //    and reappraise the bundled evidence.
-/// let report = attestation.verify_fresh(&config).await?;
-/// assert!(report.all_passed());
-/// ```
-///
-/// # Cross-language verification
-///
-/// The `public_values` buffer uses `serde_json` for entry serialization
-/// (length-prefixed JSON).  Verifiers in other languages must use the raw
-/// buffer bytes to recompute `SHA-256(buffer)` — they do NOT need to
-/// re-serialize values.  The buffer travels alongside the attestation as
-/// an opaque byte sequence.
+/// `public_values` are public. Use [`AttestBuilder::commit_hashed`] for values
+/// that should be bound by hash rather than stored in plain text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attestation {
     /// ITA-signed JWT.
@@ -433,22 +371,9 @@ impl Attestation {
         hex::encode(self.report_data.payload_hash)
     }
 
-    /// Verify that public values are bound to the TDX quote bytes.
+    /// Verify that `public_values` are bound to the raw quote bytes.
     ///
-    /// Performs two checks in sequence:
-    /// 1. `SHA-512(nonce_val ‖ nonce_iat ‖ runtime_data) == REPORTDATA` in the TDX quote.
-    /// 2. `SHA-256(public_values buffer) == ReportData.payload_hash` in runtime_data.
-    ///
-    /// Both checks must pass. This confirms the public values are bound to the
-    /// raw quote bytes — not merely locally self-consistent.
-    ///
-    /// This is a local, offline binding check. It does not verify the ITA JWT
-    /// signature, JWT expiry, TCB status policy, expected MRTD/build identity,
-    /// or application nonce freshness. Callers that need those guarantees must
-    /// validate those fields separately.
-    ///
-    /// For the narrow self-consistency check only (no quote binding), see
-    /// [`verify_public_values_commitment`](Self::verify_public_values_commitment).
+    /// This is a local check. It does not verify the ITA token or policy.
     pub fn verify_binding(&self) -> Result<bool, crate::verify::extract::ExtractError> {
         verify_quote_with_public_values(
             &self.raw_quote,
@@ -459,33 +384,16 @@ impl Attestation {
         )
     }
 
-    /// Verify the signed ITA token and local bindings against the default policy.
+    /// Verify the ITA token and local bindings against the default policy.
     ///
-    /// This verifies the ITA JWT signature and expiry using Intel Trust
-    /// Authority's JWKS, checks that the signed token's report-data claim
-    /// covers this attestation's verifier nonce and runtime data, checks local
-    /// quote/runtime binding when that is provider-portable, checks that public
-    /// values are bound into `ReportData.payload_hash`, and enforces the
-    /// default TCB policy (`UpToDate` only). On Azure TDX VMs, the token-side
-    /// binding check uses Intel Trust Authority's Azure-specific
-    /// `attester_held_data` and `attester_runtime_data.user-data` claims.
-    ///
-    /// This method does not reappraise the bundled `evidence` artifact. Use
-    /// [`verify_fresh`](Self::verify_fresh) when you need to authenticate the
-    /// stored evidence itself, especially on Azure.
-    ///
-    /// `Ok(report)` is diagnostic. Call [`AttestationVerification::all_passed`]
-    /// or [`AttestationVerification::require_success`] before trusting it.
+    /// This does not reappraise the bundled evidence. Use [`verify_fresh`](Self::verify_fresh)
+    /// when that stronger check is required.
     pub async fn verify(&self) -> Result<AttestationVerification, VerifyError> {
         let policy = self.default_policy();
         self.verify_with_policy(&policy).await
     }
 
-    /// Verify the full attestation chain and reappraise the bundled evidence via ITA.
-    ///
-    /// This is the stricter path for authenticating the stored evidence
-    /// artifact itself, including Azure portable evidence. It requires an ITA
-    /// API key because it performs a fresh appraisal of the bundled evidence.
+    /// Verify the attestation and reappraise the bundled evidence via ITA.
     pub async fn verify_fresh(
         &self,
         config: &ItaConfig,
@@ -494,23 +402,10 @@ impl Attestation {
         self.verify_fresh_with_policy(config, &policy).await
     }
 
-    /// Verify the signed ITA token and local bindings against an explicit policy.
+    /// Verify the ITA token and local bindings against an explicit policy.
     ///
-    /// JWT signature verification is non-fatal: if it fails the report's
-    /// `jwt_signature_and_expiry_valid` field is `false` and all
-    /// token-derived checks (`*_matches_token`, `tcb_status_allowed`,
-    /// `expected_mrtd_matches`) are also `false`. The underlying cause is
-    /// preserved in [`AttestationVerification::token_verification_error`].
-    /// Structural errors in the attestation's own fields (malformed base64)
-    /// still return `Err`.
-    /// Quote-byte mismatches stay diagnostic via `quote_report_data_matches`.
-    /// Azure attestations report `None` there because their portable artifact
-    /// does not expose the same offline REPORTDATA check as the standard TDX
-    /// quote path.
-    ///
-    /// `Ok(report)` is not a success verdict by itself. Call
-    /// [`AttestationVerification::all_passed`] or
-    /// [`AttestationVerification::require_success`] explicitly.
+    /// `Ok(report)` is still diagnostic. Call
+    /// [`AttestationVerification::require_success`] or check [`AttestationVerification::all_passed`].
     pub async fn verify_with_policy(
         &self,
         policy: &AttestationVerificationPolicy,
@@ -637,9 +532,6 @@ impl Attestation {
     }
 
     /// Verify with an explicit policy and reappraise the bundled evidence via ITA.
-    ///
-    /// This is the strict path that sets
-    /// [`bundled_evidence_authenticated`](AttestationVerification::bundled_evidence_authenticated).
     pub async fn verify_fresh_with_policy(
         &self,
         config: &ItaConfig,
@@ -687,17 +579,8 @@ impl Attestation {
 
     /// Check that `SHA-256(public_values)` matches `report_data.payload_hash`.
     ///
-    /// This is a **local self-consistency** check only. It confirms the public
-    /// values buffer has not been tampered with relative to the `payload_hash`
-    /// stored in `report_data`, but it does **not** verify that `report_data`
-    /// is bound to the raw TDX quote via the verifier nonces.
-    ///
-    /// A forged `Attestation` where both `public_values` and `report_data` were
-    /// replaced together will pass this check while the TDX quote attests to
-    /// something else entirely.
-    ///
-    /// Use [`verify_binding`](Self::verify_binding) for quote-byte binding
-    /// verification.
+    /// This is a self-consistency check only. It does not prove the quote
+    /// itself matches the stored `report_data`.
     #[must_use]
     pub fn verify_public_values_commitment(&self) -> bool {
         self.public_values

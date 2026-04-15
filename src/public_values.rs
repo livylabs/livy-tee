@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-//! Ordered, typed public values committed by TEE code and read by verifiers.
+//! Ordered public values committed by TEE code and read by verifiers.
 //!
-//! The on-wire format is a sequence of entries encoded as:
-//! `[u32 little-endian payload length][serde_json payload bytes]`.
-//! The full buffer is public and can be independently parsed and hashed.
+//! The wire format is a sequence of `[u32 little-endian length][payload]`
+//! entries. Typed entries use `serde_json`; raw entries keep their bytes as-is.
+//!
+//! Constructor rule:
+//! - [`from_bytes`](Self::from_bytes): trusted local bytes, no validation
+//! - [`try_from_bytes`](Self::try_from_bytes): untrusted raw bytes, validate first
+//! - [`from_base64`](Self::from_base64): transport form, decode and validate
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
@@ -47,16 +51,10 @@ impl PublicValues {
         }
     }
 
-    /// Reconstruct from a raw byte buffer.
+    /// Reconstruct from raw bytes without validating entry framing.
     ///
-    /// This constructor preserves the bytes exactly as provided and does not
-    /// validate that the buffer is a complete sequence of
-    /// `[u32 little-endian length][payload]` entries. Use this for buffers
-    /// created locally via [`commit`](Self::commit) / [`commit_raw`](Self::commit_raw).
-    ///
-    /// For malformed or otherwise untrusted input, prefer
-    /// [`try_from_bytes`](Self::try_from_bytes) or call [`validate`](Self::validate)
-    /// before consuming entries.
+    /// Use this only for trusted local bytes. For untrusted input, prefer
+    /// [`try_from_bytes`](Self::try_from_bytes) or [`from_base64`](Self::from_base64).
     #[must_use]
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
         Self {
@@ -66,17 +64,17 @@ impl PublicValues {
     }
 
     /// Reconstruct from raw bytes after validating the full entry framing.
+    ///
+    /// Use this when the bytes came from an untrusted source but are already decoded.
     pub fn try_from_bytes(bytes: Vec<u8>) -> Result<Self, PublicValuesError> {
         let values = Self::from_bytes(bytes);
         values.validate()?;
         Ok(values)
     }
 
-    /// Reconstruct from a base64-encoded buffer after validating entry framing.
+    /// Reconstruct from base64 after validating entry framing.
     ///
-    /// This is the validating transport constructor and matches the behavior of
-    /// `serde` deserialization. For unchecked local reconstruction from raw
-    /// bytes, use [`from_bytes`](Self::from_bytes).
+    /// This is the normal transport constructor and matches `serde` deserialization.
     pub fn from_base64(b64: &str) -> Result<Self, PublicValuesError> {
         let bytes = BASE64
             .decode(b64.trim())
@@ -84,11 +82,7 @@ impl PublicValues {
         Self::try_from_bytes(bytes)
     }
 
-    /// Commit a value as a public output.
-    ///
-    /// Values are serialized with `serde_json` and appended to the on-wire
-    /// buffer. Use [`commit_raw`](Self::commit_raw) when the payload is already
-    /// pre-serialized (for example a precomputed hash).
+    /// Commit a typed value as a public output.
     pub fn commit<T: Serialize>(&mut self, value: &T) -> Result<&mut Self, PublicValuesError> {
         let encoded =
             serde_json::to_vec(value).map_err(|e| PublicValuesError::Serialize(e.to_string()))?;
@@ -103,11 +97,7 @@ impl PublicValues {
         Ok(self)
     }
 
-    /// Read the next JSON-serialized entry.
-    ///
-    /// Use this for entries created with [`commit`](Self::commit). Raw entries
-    /// created with [`commit_raw`](Self::commit_raw) are not deserialized and
-    /// should be consumed with [`read_raw`](Self::read_raw).
+    /// Read the next JSON entry.
     pub fn read<T: DeserializeOwned>(&self) -> Result<T, PublicValuesError> {
         let (start, end) = self.next_entry_bounds()?;
         let value = serde_json::from_slice(&self.buffer[start..end])
@@ -116,10 +106,7 @@ impl PublicValues {
         Ok(value)
     }
 
-    /// Read the exact payload bytes for the next entry without deserializing.
-    ///
-    /// Use this for raw entries, including hash bytes stored by higher-level
-    /// helpers such as `commit_hashed`.
+    /// Read the next entry as raw bytes without deserializing it.
     pub fn read_raw(&self) -> Result<Vec<u8>, PublicValuesError> {
         let (start, end) = self.next_entry_bounds()?;
         let bytes = self.buffer[start..end].to_vec();
@@ -128,10 +115,6 @@ impl PublicValues {
     }
 
     /// Validate that the buffer is a complete sequence of framed entries.
-    ///
-    /// This checks entry framing only: every entry must have a full 4-byte
-    /// length prefix and enough payload bytes to satisfy that prefix. It does
-    /// not deserialize payloads, so raw/hash entries remain valid.
     pub fn validate(&self) -> Result<(), PublicValuesError> {
         let mut offset = 0usize;
         while let Some(end) = checked_entry_end(&self.buffer, offset)? {
@@ -145,14 +128,9 @@ impl PublicValues {
         self.read_cursor.set(0);
     }
 
-    /// Return each entry as `(field_index, wire_bytes)`.
+    /// Return each entry as `(field_index, wire_bytes)` without advancing the cursor.
     ///
-    /// `wire_bytes` includes both the 4-byte length prefix and payload bytes.
-    /// This helper does not advance the sequential read cursor.
-    ///
-    /// This method enumerates only the valid prefix of the buffer. Call
-    /// [`validate`](Self::validate) first when a trailing malformed tail should
-    /// be treated as an error.
+    /// `wire_bytes` includes the 4-byte length prefix and payload.
     #[must_use]
     pub fn entries_raw(&self) -> Vec<(u32, Vec<u8>)> {
         let mut entries = Vec::new();
@@ -172,9 +150,6 @@ impl PublicValues {
     }
 
     /// Count the number of complete entries in the buffer.
-    ///
-    /// This counts only the valid prefix. Call [`validate`](Self::validate)
-    /// first when the buffer came from an untrusted source.
     #[must_use]
     pub fn entry_count(&self) -> u32 {
         let mut count = 0u32;
@@ -192,10 +167,6 @@ impl PublicValues {
     }
 
     /// Compute `SHA-256(buffer)` over the exact on-wire bytes.
-    ///
-    /// The hash covers every 4-byte entry length prefix and payload byte in
-    /// order. For the high-level attestation API, this exact digest is stored
-    /// in `ReportData.payload_hash`.
     #[must_use]
     pub fn commitment_hash(&self) -> [u8; 32] {
         Sha256::digest(&self.buffer).into()

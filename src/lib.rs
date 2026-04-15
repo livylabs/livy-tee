@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 #![warn(missing_docs, missing_debug_implementations, unreachable_pub)]
 #![deny(unsafe_code)]
-//! Intel TDX quote generation and verification.
+//! Intel TDX attestation primitives and the Livy high-level API.
 //!
-//! A TDX quote cryptographically binds:
-//!   { MRTD (TEE binary hash), RTMRs, report_data (our payload hash) }
+//! Most applications use [`Livy`], [`AttestBuilder`], and [`Attestation`].
+//! Lower-level modules stay public for
+//! custom generation, parsing, and verification flows.
 //!
-//! Anyone can verify the quote against Intel's Trust Authority to confirm that
-//! specific code ran inside a genuine TDX Trust Domain.  This is the hardware
-//! root of trust for all Livy provenance claims.
-//!
-//! # Feature flags
+//! # Features
 //!
 //! | Feature      | Default | Description |
 //! |--------------|---------|-------------|

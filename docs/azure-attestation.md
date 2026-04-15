@@ -8,7 +8,6 @@ This document is the Azure-specific reference for `livy-tee`. It explains what
 is different on Azure, what the library stores, what each verification method
 actually guarantees, and what was validated on a real Azure confidential VM.
 
----
 
 ## Why Azure is different
 
@@ -41,7 +40,6 @@ That flow binds two things together:
 So on Azure, the ITA token and a fresh ITA reappraisal are the authoritative
 sources of evidence authenticity. The generic offline raw-quote helper is not.
 
----
 
 ## What `livy-tee` stores on Azure
 
@@ -76,7 +74,6 @@ Without that runtime JSON, a verifier cannot replay the Azure evidence to ITA.
 `raw_quote` is still present as a convenience field, but on Azure it is not a
 self-sufficient verification artifact by itself.
 
----
 
 ## Verification levels
 
@@ -198,7 +195,6 @@ report.require_success().map_err(|report| {
 })?;
 ```
 
----
 
 ## Azure token binding semantics
 
@@ -212,7 +208,6 @@ Instead it validates ITA's Azure-specific claims:
 
 That is the Azure token-side binding contract.
 
----
 
 ## Evidence replay on Azure
 
@@ -249,7 +244,6 @@ before trusting the appraisal result. Fresh evidence verification is therefore
 not just "HTTPS to ITA succeeded"; it also rechecks the token signature and the
 Azure binding claims.
 
----
 
 ## Verification report fields that matter on Azure
 
@@ -301,7 +295,6 @@ such as:
 - `azure_quote_response`
 - `azure_tpm_response_code`
 
----
 
 ## Security interpretation on Azure
 
@@ -320,7 +313,6 @@ If `verify_fresh()` passes on Azure:
 
 That is the strongest Azure statement the library currently makes.
 
----
 
 ## Tests added for Azure
 
@@ -346,7 +338,6 @@ Hash semantics tests also exist for:
 - `commit_hashed(&[u8])`
 - `commit_hashed(String)`
 
----
 
 ## Real Azure validation completed
 
@@ -362,7 +353,6 @@ The live smoke example now uses strict verification and prints:
 ITA JWT, TCB policy, public-value binding, and bundled evidence verified
 ```
 
----
 
 ## What remains outside Azure
 
