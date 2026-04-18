@@ -4,8 +4,8 @@
 //! This path writes caller-supplied 64-byte report data to the Azure vTPM NV
 //! index and requests a quote from Azure's local quote endpoint.
 
+use crate::error::GenerateError;
 use crate::evidence::Evidence;
-use crate::generate::GenerateError;
 use base64::Engine;
 use std::time::Duration;
 

@@ -12,6 +12,7 @@
 //! Verifiers typically parse these 64 bytes, recompute the expected payload
 //! hash, then check `build_id` and `nonce` against their own policy.
 
+use crate::error::BuildIdError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -96,18 +97,6 @@ impl ReportData {
     pub fn verify_payload(&self, expected: &[u8; 32]) -> bool {
         self.payload_hash == *expected
     }
-}
-
-/// Errors returned by [`build_id_from_hash_hex`].
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum BuildIdError {
-    /// The provided hash was shorter than the required 16 hex characters.
-    #[error("hash hex too short: need at least 16 hex chars, got {0}")]
-    TooShort(usize),
-    /// The first 16 characters were not valid hex.
-    #[error("hash hex is not valid: {0}")]
-    InvalidHex(String),
 }
 
 /// Derive a `build_id` from raw binary bytes.

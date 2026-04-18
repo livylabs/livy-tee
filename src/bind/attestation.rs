@@ -5,10 +5,10 @@ use super::local::{
     nonce_and_runtime_hash, verify_quote_report_data_binding, verify_quote_with_public_values,
 };
 use crate::{
-    attest::AttestError,
+    error::{AttestError, LivyEnvError, PublicValuesError, VerifyError},
     evidence::Evidence,
     generate::binary_hash,
-    public_values::{PublicValues, PublicValuesError},
+    public_values::PublicValues,
     report::{build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION},
     verify::{
         codec::{decode_standard_base64, decode_standard_base64_array_64},
@@ -16,7 +16,6 @@ use crate::{
             appraise_evidence_authenticated, default_issuer_for_jwks_url, verify_attestation_token,
             ItaConfig, VerifierNonce, DEFAULT_JWKS_URL,
         },
-        VerifyError,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -181,18 +180,6 @@ impl AttestationVerification {
 #[derive(Debug, Clone)]
 pub struct Livy {
     config: ItaConfig,
-}
-
-/// Errors returned by [`Livy::from_env`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-#[non_exhaustive]
-pub enum LivyEnvError {
-    /// `ITA_API_KEY` is not present in the environment.
-    #[error("ITA_API_KEY environment variable is not set")]
-    MissingApiKey,
-    /// `ITA_API_KEY` is present but empty after trimming whitespace.
-    #[error("ITA_API_KEY is empty")]
-    EmptyApiKey,
 }
 
 impl Livy {
@@ -374,7 +361,7 @@ impl Attestation {
     /// Verify that `public_values` are bound to the raw quote bytes.
     ///
     /// This is a local check. It does not verify the ITA token or policy.
-    pub fn verify_binding(&self) -> Result<bool, crate::verify::extract::ExtractError> {
+    pub fn verify_binding(&self) -> Result<bool, crate::ExtractError> {
         verify_quote_with_public_values(
             &self.raw_quote,
             &self.runtime_data,
