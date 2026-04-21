@@ -9,6 +9,7 @@
 //! - [`try_from_bytes`](Self::try_from_bytes): untrusted raw bytes, validate first
 //! - [`from_base64`](Self::from_base64): transport form, decode and validate
 
+use crate::error::PublicValuesError;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -274,48 +275,6 @@ fn checked_entry_end(buffer: &[u8], offset: usize) -> Result<Option<usize>, Publ
     }
 
     Ok(Some(end))
-}
-
-/// Errors when reading from [`PublicValues`].
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum PublicValuesError {
-    /// Base64 decoding failed.
-    #[error("failed to decode public values base64: {0}")]
-    Base64(String),
-    /// Serializing a committed value failed.
-    #[error("failed to serialize public value: {0}")]
-    Serialize(String),
-    /// A committed payload is too large for the 32-bit wire-format length prefix.
-    #[error("public value is too large for the wire format: {0} bytes")]
-    EntryTooLarge(usize),
-    /// The buffer has no more complete entries to read.
-    #[error("public values buffer exhausted — no more entries to read")]
-    BufferExhausted,
-    /// A trailing fragment does not contain a full 4-byte length prefix.
-    #[error(
-        "public values buffer has {remaining} trailing byte(s) at offset {offset}; expected a 4-byte length prefix"
-    )]
-    TruncatedLengthPrefix {
-        /// Byte offset where the incomplete length prefix starts.
-        offset: usize,
-        /// Number of bytes remaining from that offset to the end of the buffer.
-        remaining: usize,
-    },
-    /// An entry declares more payload bytes than remain in the buffer.
-    #[error(
-        "public values entry at offset {offset} declares {declared_len} payload byte(s), but only {remaining} remain"
-    )]
-    TruncatedEntryPayload {
-        /// Byte offset where the entry's 4-byte length prefix starts.
-        offset: usize,
-        /// Payload length declared by the entry's length prefix.
-        declared_len: usize,
-        /// Payload bytes still available after the 4-byte length prefix.
-        remaining: usize,
-    },
-    /// A value could not be deserialized from the buffer.
-    #[error("failed to deserialize public value: {0}")]
-    Deserialize(String),
 }
 
 #[cfg(test)]

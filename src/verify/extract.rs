@@ -5,35 +5,13 @@
 //! quote signature chain.
 
 use crate::evidence::{Evidence, QUOTE_MIN_LEN};
-use thiserror::Error;
-
 const OFFSET_VERSION: usize = 0;
 const OFFSET_TEE_TYPE: usize = 4;
 const OFFSET_MRTD: usize = 184;
 const OFFSET_REPORT_DATA: usize = 568;
 
 const TEE_TYPE_TDX: u32 = 0x81;
-
-/// Errors returned by [`extract_report_data`] and [`extract_mrtd`].
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum ExtractError {
-    /// Base64 decoding failed while parsing a textual quote/runtime input.
-    #[error("base64 decode failed: {0}")]
-    Base64(String),
-    /// Runtime data did not decode to exactly 64 bytes.
-    #[error("runtime_data must decode to exactly 64 bytes, got {0}")]
-    InvalidRuntimeDataLength(usize),
-    /// Quote buffer is too short to contain the required DCAP fields.
-    #[error("quote too short: need at least {QUOTE_MIN_LEN} bytes, got {0}")]
-    TooShort(usize),
-    /// Quote version is not 4 (the only supported TDX DCAP version).
-    #[error("unsupported quote version {0}: expected 4")]
-    UnsupportedVersion(u16),
-    /// TEE type field is not `0x81` (TDX).
-    #[error("unsupported TEE type 0x{0:08x}: expected 0x81 (TDX)")]
-    UnsupportedTeeType(u32),
-}
+use crate::error::ExtractError;
 
 fn parse_header(evidence: &Evidence) -> Result<(), ExtractError> {
     let raw = evidence.raw();
@@ -99,7 +77,7 @@ mod tests {
 
     #[test]
     fn too_short_returns_error() {
-        use crate::evidence::EvidenceError;
+        use crate::error::EvidenceError;
         let result = Evidence::from_bytes(vec![0u8; 100]);
         assert!(matches!(result, Err(EvidenceError::TooShort(100))));
     }

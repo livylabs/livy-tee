@@ -4,8 +4,8 @@
 //! Requires Linux kernel ≥ 6.7 with the TDX guest driver and configfs-tsm
 //! mounted at `/sys/kernel/config/tsm/report/`.
 
+use crate::error::GenerateError;
 use crate::evidence::Evidence;
-use crate::generate::GenerateError;
 
 pub(crate) fn generate(user_data: &[u8; 64]) -> Result<Evidence, GenerateError> {
     let base = std::path::Path::new("/sys/kernel/config/tsm/report");

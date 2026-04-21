@@ -13,6 +13,5 @@ mod local;
 
 pub use attestation::{
     AttestBuilder, Attestation, AttestationVerification, AttestationVerificationPolicy, Livy,
-    LivyEnvError,
 };
 pub use local::{verify_quote, verify_quote_with_public_values};

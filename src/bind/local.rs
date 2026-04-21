@@ -2,10 +2,8 @@
 //! Local quote/public-values binding helpers.
 
 use crate::{
-    evidence::Evidence,
-    public_values::PublicValues,
-    report::ReportData,
-    verify::extract::{extract_report_data, ExtractError},
+    error::ExtractError, evidence::Evidence, public_values::PublicValues, report::ReportData,
+    verify::extract::extract_report_data,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 

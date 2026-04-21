@@ -8,9 +8,9 @@
 //! [`crate::Attestation::verify_fresh`]. The lower-level appraisal helpers are
 //! for request-scoped flows and custom tooling.
 
+use crate::error::VerifyError;
 use crate::evidence::Evidence;
 use crate::verify::codec::{decode_claim_array_64, decode_standard_base64_array_64};
-use crate::verify::VerifyError;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -925,7 +925,7 @@ mod tests {
         unauthenticated_report_data_hash_from_token, ItaConfig, VerifiedTokenBinding,
         DEFAULT_JWKS_URL,
     };
-    use crate::verify::VerifyError;
+    use crate::error::VerifyError;
     use base64::Engine;
     use serde_json::json;
     use sha2::{Digest, Sha512};

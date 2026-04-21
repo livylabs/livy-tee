@@ -9,16 +9,11 @@
 //! `mock-tee` mode it returns stub evidence and skips the ITA call.
 
 use crate::{
-    evidence::Evidence,
-    generate::{generate_evidence, GenerateError},
-    public_values::PublicValuesError,
-    report::BuildIdError,
-    verify::{ita::ItaConfig, VerifyError},
+    error::AttestError, evidence::Evidence, generate::generate_evidence, verify::ita::ItaConfig,
 };
 
 #[cfg(not(feature = "mock-tee"))]
 use crate::verify::ita::{appraise_evidence_authenticated, get_nonce};
-use thiserror::Error;
 
 /// Output of a combined quote generation and ITA appraisal call.
 #[derive(Debug)]
@@ -43,37 +38,6 @@ pub struct AttestedEvidence {
     pub nonce_iat: Vec<u8>,
     /// Decoded verifier nonce signature bytes. Zeroed in `mock-tee` mode.
     pub nonce_signature: Vec<u8>,
-}
-
-/// Error type for [`generate_and_attest`].
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum AttestError {
-    /// Preparing committed public values failed.
-    #[error("public values commit failed: {0}")]
-    PublicValues(#[from] PublicValuesError),
-    /// Quote generation failed.
-    #[error("quote generation failed: {0}")]
-    Generate(#[from] GenerateError),
-    /// Deriving the REPORTDATA build ID failed.
-    #[error("failed to derive build ID: {0}")]
-    BuildId(#[from] BuildIdError),
-    /// ITA verification call failed.
-    #[error("ITA verification failed: {0}")]
-    Verify(#[from] VerifyError),
-}
-
-impl AttestError {
-    /// Stable machine-readable error code.
-    #[must_use]
-    pub fn code(&self) -> &'static str {
-        match self {
-            Self::PublicValues(_) => "public_values",
-            Self::Generate(err) => err.code(),
-            Self::BuildId(_) => "build_id",
-            Self::Verify(err) => err.code(),
-        }
-    }
 }
 
 /// Generate evidence and appraise it with Intel Trust Authority.

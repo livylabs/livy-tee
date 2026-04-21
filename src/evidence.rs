@@ -1,24 +1,9 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 //! `Evidence` — raw TDX quote bytes with base64 helpers.
 
+use crate::error::EvidenceError;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
-
-/// Errors returned when constructing or decoding [`Evidence`].
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum EvidenceError {
-    /// Quote bytes could not be decoded from base64.
-    #[error("base64 decode failed: {0}")]
-    Base64(String),
-    /// Quote is shorter than the minimum valid DCAP quote size (632 bytes).
-    #[error("quote too short: {0} bytes (minimum 632)")]
-    TooShort(usize),
-    /// Portable evidence JSON could not be parsed.
-    #[error("portable evidence format error: {0}")]
-    PortableFormat(String),
-}
 
 /// Minimum valid DCAP quote size in bytes (matches the mock stub size).
 pub const QUOTE_MIN_LEN: usize = 632;

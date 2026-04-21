@@ -16,6 +16,7 @@
 //! | `ita-verify` | no      | Intel Trust Authority REST API verification |
 
 mod cloud;
+mod error;
 mod evidence;
 mod generate;
 mod parser;
@@ -31,35 +32,34 @@ mod bind;
 
 // ── Core types ─────────────────────────────────────────────────────────────
 pub use cloud::{detect_cloud_provider, CloudProvider};
-pub use evidence::{Evidence, EvidenceError, PortableEvidence, QUOTE_MIN_LEN};
+pub use error::{BuildIdError, EvidenceError, ExtractError, GenerateError, PublicValuesError};
+pub use evidence::{Evidence, PortableEvidence, QUOTE_MIN_LEN};
 pub use parser::parse;
-pub use public_values::{entry_hash, PublicValues, PublicValuesError};
-pub use report::{
-    build_id_from_binary, build_id_from_hash_hex, BuildIdError, ReportData, REPORT_DATA_VERSION,
-};
+pub use public_values::{entry_hash, PublicValues};
+pub use report::{build_id_from_binary, build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION};
 pub use types::Config;
 
 // ── Generation ─────────────────────────────────────────────────────────────
-pub use generate::{binary_hash, generate_evidence, GenerateError};
+pub use generate::{binary_hash, generate_evidence};
 
 // ── Verification — local (always available) ────────────────────────────────
-pub use verify::extract::{extract_mrtd, extract_report_data, ExtractError};
+pub use verify::extract::{extract_mrtd, extract_report_data};
 
+#[cfg(feature = "ita-verify")]
+pub use error::{AttestError, LivyEnvError, VerifyError};
 #[cfg(feature = "ita-verify")]
 pub use verify::ita::{
     appraise_evidence_unauthenticated, default_issuer_for_jwks_url, default_jwks_url_for_api_url,
     get_nonce, ItaConfig, UnauthenticatedAppraisalClaims, VerifierNonce,
 };
-#[cfg(feature = "ita-verify")]
-pub use verify::VerifyError;
 
 #[cfg(feature = "ita-verify")]
-pub use attest::{generate_and_attest, AttestError, AttestedEvidence};
+pub use attest::{generate_and_attest, AttestedEvidence};
 
 #[cfg(feature = "ita-verify")]
 pub use bind::{
     verify_quote, verify_quote_with_public_values, AttestBuilder, Attestation,
-    AttestationVerification, AttestationVerificationPolicy, Livy, LivyEnvError,
+    AttestationVerification, AttestationVerificationPolicy, Livy,
 };
 
 #[cfg(feature = "ita-verify")]

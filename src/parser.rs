@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 //! Parsing helpers for quote input.
 
-use crate::{Config, Evidence, EvidenceError};
+use crate::{error::EvidenceError, Config, Evidence};
 
 /// Parse quote input into [`Evidence`].
 ///
