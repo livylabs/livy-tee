@@ -118,8 +118,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let attestation = rt.block_on(builder.finalize())?;
 
-    if !attestation.verify()? {
-        return Err("livy-tee offline verification failed".into());
+    let verification = rt.block_on(attestation.verify())?;
+    if !verification.all_passed() {
+        return Err(format!("livy-tee attestation verification failed: {verification:?}").into());
     }
 
     let raw_quote = BASE64.decode(&attestation.raw_quote)?;
@@ -143,7 +144,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     println!("  payload_hash: {}", attestation.payload_hash_hex());
-    println!("  livy_tee_offline_verify: ok");
+    println!("  livy_tee_verify: ok");
 
     let output = Command::new(&cli)
         .arg("verify")

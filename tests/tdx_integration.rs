@@ -44,7 +44,7 @@ fn assert_real_tdx_evidence(quote_len: usize) {
 }
 
 fn is_azure_runtime() -> bool {
-    std::path::Path::new("/var/lib/waagent").exists()
+    livy_tee::detect_cloud_provider() == Some(livy_tee::CloudProvider::Azure)
 }
 
 #[test]
@@ -80,7 +80,7 @@ async fn sha512_reportdata_matches_nonce_plus_runtime_data() {
     let bin_hash = binary_hash().unwrap();
     let rd = ReportData::new(
         payload,
-        build_id_from_hash_hex(&bin_hash),
+        build_id_from_hash_hex(&bin_hash).expect("binary_hash returns valid SHA-256 hex"),
         REPORT_DATA_VERSION,
         0,
         1001,
@@ -170,8 +170,8 @@ async fn verify_quote_rejects_tampered_values() {
     let att = builder.finalize().await.expect("finalize failed");
 
     let mut tampered = PublicValues::new();
-    tampered.commit(&"TAMPERED input");
-    tampered.commit(&"real output");
+    tampered.commit(&"TAMPERED input").unwrap();
+    tampered.commit(&"real output").unwrap();
 
     let ok = verify_quote_with_public_values(
         &att.raw_quote,
@@ -212,14 +212,53 @@ async fn proof_verify_correct_and_tampered() {
     builder.commit(&"verify-test");
     let att = builder.finalize().await.expect("finalize failed");
 
+    let report = att.verify().await.expect("verify should not error");
+    let strict_report = att
+        .verify_fresh(&ita_config())
+        .await
+        .expect("verify_fresh should not error");
+    assert!(report.jwt_signature_and_expiry_valid);
+    assert!(report.token_report_data_matches);
+    assert!(report.runtime_data_matches_report);
+    assert!(report.public_values_bound);
+    assert!(report.mrtd_matches_token);
+    assert!(report.tcb_status_matches_token);
     if is_azure_runtime() {
-        assert!(!att.ita_token.is_empty());
+        assert_eq!(report.quote_report_data_matches, None);
     } else {
-        assert!(att.verify().expect("verify should not error"));
+        assert_eq!(report.quote_report_data_matches, Some(true));
     }
+    assert_eq!(
+        strict_report.bundled_evidence_authenticated,
+        Some(true),
+        "strict verification report: {strict_report:#?}"
+    );
+    if strict_report.tcb_status.eq_ignore_ascii_case("UpToDate") {
+        assert!(
+            strict_report.all_passed(),
+            "strict verification report: {strict_report:#?}"
+        );
+    } else {
+        assert_eq!(
+            strict_report.tcb_status, "OutOfDate",
+            "unexpected non-UpToDate status: {strict_report:#?}"
+        );
+        assert!(
+            !strict_report.tcb_status_allowed,
+            "expected policy rejection for non-UpToDate TCB: {strict_report:#?}"
+        );
+        assert!(
+            !strict_report.all_passed(),
+            "non-UpToDate TCB should keep all_passed false under default policy: {strict_report:#?}"
+        );
+    }
+    assert_eq!(
+        report.tcb_status_allowed,
+        report.tcb_status.eq_ignore_ascii_case("UpToDate")
+    );
 
     // Read back and check.
-    let val: String = att.public_values.read();
+    let val: String = att.public_values.read().unwrap();
     assert_eq!(val, "verify-test");
 }
 

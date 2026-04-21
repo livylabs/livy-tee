@@ -1,49 +1,21 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-//! Combined evidence generation + Intel Trust Authority attestation.
+//! Combined evidence generation and ITA appraisal.
 //!
-//! # Why two steps?
+//! Most applications use [`crate::Livy`] and [`crate::AttestBuilder`]. This is
+//! the lower-level helper behind that flow.
 //!
-//! TDX attestation is fundamentally a two-phase operation:
-//!
-//! 1. **Generate** — write REPORTDATA to `/sys/kernel/config/tsm/report/`; the
-//!    kernel's TDX guest driver asks the hardware to produce a DCAP quote and
-//!    writes the raw bytes back.  This is entirely local; no network required.
-//!
-//! 2. **Verify** — send the raw quote to Intel Trust Authority (ITA), which
-//!    checks the full DCAP certificate chain (PCK → Intermediate CA → Intel CA)
-//!    and returns a short, signed JWT (the "attestation token").  The JWT
-//!    contains the MRTD, REPORTDATA, and TCB status, signed by Intel's key.
-//!
-//! # Intel CLI-compatible nonce flow
-//!
-//! Before generating the quote, a verifier nonce is fetched from ITA to prevent
-//! quote relay attacks.  The actual bytes written to TSM configfs are:
-//! `SHA-512(nonce.val ‖ nonce.iat ‖ user_data)`
-//!
-//! The original `user_data` (our structured 64-byte ReportData) is sent to ITA
-//! as `runtime_data`.  ITA verifies the binding server-side.
-//!
-//! # `mock-tee` mode
-//!
-//! When compiled with `--features mock-tee`, the hardware step is replaced by
-//! a correctly-shaped 632-byte stub.  ITA would reject this stub, so
-//! `generate_and_attest` skips the ITA call and returns an empty `ita_token`.
-//! The nonce fields are zeroed (no network call).
+//! In hardware mode it fetches a verifier nonce, hashes it into the quote
+//! binding value, generates evidence, and appraises that evidence with ITA. In
+//! `mock-tee` mode it returns stub evidence and skips the ITA call.
 
 use crate::{
-    evidence::Evidence,
-    generate::{generate_evidence, GenerateError},
-    verify::{ita::ItaConfig, VerifyError},
+    error::AttestError, evidence::Evidence, generate::generate_evidence, verify::ita::ItaConfig,
 };
 
 #[cfg(not(feature = "mock-tee"))]
-use crate::verify::ita::{get_nonce, verify_evidence};
-use thiserror::Error;
+use crate::verify::ita::{appraise_evidence_authenticated, get_nonce};
 
-/// Output of a combined TDX quote generation + ITA attestation call.
-///
-/// In `mock-tee` mode, `ita_token`, `mrtd`, and `tcb_status` are empty,
-/// and nonce fields are zeroed.
+/// Output of a combined quote generation and ITA appraisal call.
 #[derive(Debug)]
 pub struct AttestedEvidence {
     /// Raw DCAP quote bytes (from TSM configfs or mock).
@@ -56,36 +28,19 @@ pub struct AttestedEvidence {
     pub tcb_status: String,
     /// Optional TCB evaluation date (RFC3339 date-time from ITA token claims).
     pub tcb_date: Option<String>,
+    /// Advisory IDs reported by Intel Trust Authority. Empty in `mock-tee` mode.
+    pub advisory_ids: Vec<String>,
     /// The original 64-byte runtime_data (our ReportData struct).
     pub runtime_data: [u8; 64],
     /// Decoded verifier nonce value bytes. Zeroed in `mock-tee` mode.
     pub nonce_val: Vec<u8>,
     /// Decoded verifier nonce issued-at bytes. Zeroed in `mock-tee` mode.
     pub nonce_iat: Vec<u8>,
+    /// Decoded verifier nonce signature bytes. Zeroed in `mock-tee` mode.
+    pub nonce_signature: Vec<u8>,
 }
 
-/// Error type for [`generate_and_attest`].
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum AttestError {
-    /// Quote generation failed.
-    #[error("quote generation failed: {0}")]
-    Generate(#[from] GenerateError),
-    /// ITA verification call failed.
-    #[error("ITA verification failed: {0}")]
-    Verify(#[from] VerifyError),
-}
-
-/// Generate a TDX quote and verify it with Intel Trust Authority (Intel CLI-compatible).
-///
-/// In production (no `mock-tee` feature):
-/// 1. Fetches a verifier nonce from ITA.
-/// 2. Computes `reportdata_for_quote = SHA-512(nonce.val ‖ nonce.iat ‖ user_data)`.
-/// 3. Writes to TSM configfs — hardware produces a DCAP quote.
-/// 4. POSTs quote + runtime_data + nonce to ITA.
-/// 5. Returns both the raw evidence and the ITA-signed JWT.
-///
-/// In `mock-tee` mode: uses zeroed nonces, produces a stub quote, skips ITA.
+/// Generate evidence and appraise it with Intel Trust Authority.
 pub async fn generate_and_attest(
     user_data: &[u8; 64],
     #[cfg_attr(feature = "mock-tee", allow(unused_variables))] config: &ItaConfig,
@@ -93,12 +48,16 @@ pub async fn generate_and_attest(
     use sha2::{Digest, Sha512};
 
     #[cfg(feature = "mock-tee")]
-    let (nonce_val, nonce_iat) = (vec![0u8; 32], vec![0u8; 32]);
+    let (nonce_val, nonce_iat, nonce_signature) = (vec![0u8; 32], vec![0u8; 32], vec![]);
 
     #[cfg(not(feature = "mock-tee"))]
     let nonce = get_nonce(config).await?;
     #[cfg(not(feature = "mock-tee"))]
-    let (nonce_val, nonce_iat) = (nonce.val.clone(), nonce.iat.clone());
+    let (nonce_val, nonce_iat, nonce_signature) = (
+        nonce.val.clone(),
+        nonce.iat.clone(),
+        nonce.signature.clone(),
+    );
 
     let reportdata_for_quote: [u8; 64] = {
         let mut h = Sha512::new();
@@ -118,24 +77,37 @@ pub async fn generate_and_attest(
             mrtd: String::new(),
             tcb_status: String::new(),
             tcb_date: None,
+            advisory_ids: Vec::new(),
             runtime_data: *user_data,
             nonce_val,
             nonce_iat,
+            nonce_signature,
         })
     }
 
     #[cfg(not(feature = "mock-tee"))]
     {
-        let claims = verify_evidence(&evidence, config, user_data, &nonce).await?;
+        let (raw_token, claims) = appraise_evidence_authenticated(
+            &evidence,
+            config,
+            user_data,
+            &nonce,
+            &config.default_jwks_url(),
+            config.expected_token_issuer(),
+            config.expected_token_audience.clone(),
+        )
+        .await?;
         Ok(AttestedEvidence {
             evidence,
-            ita_token: claims.raw_token,
-            mrtd: claims.mrtd,
-            tcb_status: claims.tcb_status,
-            tcb_date: claims.tcb_date,
+            ita_token: raw_token,
+            mrtd: claims.mrtd().to_string(),
+            tcb_status: claims.tcb_status().to_string(),
+            tcb_date: claims.tcb_date().map(str::to_string),
+            advisory_ids: claims.advisory_ids().to_vec(),
             runtime_data: *user_data,
             nonce_val,
             nonce_iat,
+            nonce_signature,
         })
     }
 }

@@ -13,8 +13,8 @@
 //!  [568..632] REPORTDATA  = caller-supplied user_data
 //! ```
 
+use crate::error::GenerateError;
 use crate::evidence::Evidence;
-use crate::generate::GenerateError;
 
 const QUOTE_VERSION: u16 = 4;
 const ATT_KEY_TYPE: u16 = 2;

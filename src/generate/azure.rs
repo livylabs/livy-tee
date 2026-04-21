@@ -4,8 +4,8 @@
 //! This path writes caller-supplied 64-byte report data to the Azure vTPM NV
 //! index and requests a quote from Azure's local quote endpoint.
 
+use crate::error::GenerateError;
 use crate::evidence::Evidence;
-use crate::generate::GenerateError;
 use base64::Engine;
 use std::time::Duration;
 
@@ -18,6 +18,7 @@ const AZ_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) fn generate(report_data: &[u8; 64]) -> Result<Evidence, GenerateError> {
     tpm::ensure_runtime_write_index(AZ_RUNTIME_WRITE_IDX, AZ_RUNTIME_WRITE_SIZE)?;
+    let mut undersized_quote_warning = UndersizedQuoteWarning::default();
 
     // Azure runtime data can lag the NV write briefly, so poll with a
     // bounded retry window before giving up.
@@ -55,7 +56,10 @@ pub(crate) fn generate(report_data: &[u8; 64]) -> Result<Evidence, GenerateError
                 GenerateError::AzureQuoteResponse(format!("quote base64 decode failed: {e}"))
             })?;
 
-        if raw.len() < 632 {
+        if raw.len() < crate::evidence::QUOTE_MIN_LEN {
+            if let Some(message) = undersized_quote_warning.record(raw.len()) {
+                eprintln!("{message}");
+            }
             continue;
         }
 
@@ -70,9 +74,46 @@ pub(crate) fn generate(report_data: &[u8; 64]) -> Result<Evidence, GenerateError
     ))
 }
 
+#[derive(Debug, Default)]
+struct UndersizedQuoteWarning {
+    emitted: bool,
+}
+
+impl UndersizedQuoteWarning {
+    fn record(&mut self, raw_len: usize) -> Option<String> {
+        if self.emitted {
+            return None;
+        }
+        self.emitted = true;
+        Some(format!(
+            "livy-tee: ignoring undersized Azure quote (got {raw_len} bytes, need at least {}); suppressing further short-quote warnings for this attempt",
+            crate::evidence::QUOTE_MIN_LEN
+        ))
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct QuoteResponse {
     quote: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UndersizedQuoteWarning;
+
+    #[test]
+    fn undersized_quote_warning_is_only_emitted_once_per_attempt() {
+        let mut warning = UndersizedQuoteWarning::default();
+
+        let first = warning.record(128);
+        let second = warning.record(256);
+
+        assert!(first.is_some());
+        assert!(first
+            .unwrap()
+            .contains("suppressing further short-quote warnings"));
+        assert!(second.is_none());
+    }
 }
 
 mod runtime {
@@ -497,9 +538,7 @@ mod tpm {
     impl TpmError {
         fn into_generate_error(self) -> GenerateError {
             match self {
-                Self::ResponseCode(code) => GenerateError::AzureCommand(format!(
-                    "TPM command failed with response code 0x{code:08x}"
-                )),
+                Self::ResponseCode(code) => GenerateError::AzureTpmResponseCode(code),
                 Self::Generate(err) => err,
             }
         }

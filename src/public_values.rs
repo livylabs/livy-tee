@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-//! Ordered, typed public values committed by TEE code and read by verifiers.
+//! Ordered public values committed by TEE code and read by verifiers.
 //!
-//! The on-wire format is a sequence of entries encoded as:
-//! `[u32 little-endian payload length][serde_json payload bytes]`.
-//! The full buffer is public and can be independently parsed and hashed.
+//! The wire format is a sequence of `[u32 little-endian length][payload]`
+//! entries. Typed entries use `serde_json`; raw entries keep their bytes as-is.
+//!
+//! Constructor rule:
+//! - [`from_bytes`](Self::from_bytes): trusted local bytes, no validation
+//! - [`try_from_bytes`](Self::try_from_bytes): untrusted raw bytes, validate first
+//! - [`from_base64`](Self::from_base64): transport form, decode and validate
 
+use crate::error::PublicValuesError;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
 
@@ -16,6 +21,25 @@ pub struct PublicValues {
     buffer: Vec<u8>,
     /// Read cursor with interior mutability so reads work on `&self`.
     read_cursor: Cell<usize>,
+}
+
+impl Serialize for PublicValues {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_base64())
+    }
+}
+
+impl<'de> Deserialize<'de> for PublicValues {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        Self::from_base64(&encoded).map_err(serde::de::Error::custom)
+    }
 }
 
 impl PublicValues {
@@ -28,7 +52,10 @@ impl PublicValues {
         }
     }
 
-    /// Reconstruct from a raw byte buffer.
+    /// Reconstruct from raw bytes without validating entry framing.
+    ///
+    /// Use this only for trusted local bytes. For untrusted input, prefer
+    /// [`try_from_bytes`](Self::try_from_bytes) or [`from_base64`](Self::from_base64).
     #[must_use]
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
         Self {
@@ -37,45 +64,42 @@ impl PublicValues {
         }
     }
 
-    /// Reconstruct from a base64-encoded buffer.
-    pub fn from_base64(b64: &str) -> Result<Self, base64::DecodeError> {
-        Ok(Self::from_bytes(BASE64.decode(b64.trim())?))
+    /// Reconstruct from raw bytes after validating the full entry framing.
+    ///
+    /// Use this when the bytes came from an untrusted source but are already decoded.
+    pub fn try_from_bytes(bytes: Vec<u8>) -> Result<Self, PublicValuesError> {
+        let values = Self::from_bytes(bytes);
+        values.validate()?;
+        Ok(values)
     }
 
-    /// Commit a value as a public output.
+    /// Reconstruct from base64 after validating entry framing.
     ///
-    /// Values are serialized with `serde_json` and appended to the on-wire
-    /// buffer. Use [`commit_raw`](Self::commit_raw) when the payload is already
-    /// pre-serialized (for example a precomputed hash).
-    pub fn commit<T: Serialize>(&mut self, value: &T) {
+    /// This is the normal transport constructor and matches `serde` deserialization.
+    pub fn from_base64(b64: &str) -> Result<Self, PublicValuesError> {
+        let bytes = BASE64
+            .decode(b64.trim())
+            .map_err(|e| PublicValuesError::Base64(e.to_string()))?;
+        Self::try_from_bytes(bytes)
+    }
+
+    /// Commit a typed value as a public output.
+    pub fn commit<T: Serialize>(&mut self, value: &T) -> Result<&mut Self, PublicValuesError> {
         let encoded =
-            serde_json::to_vec(value).expect("PublicValues::commit: serialization should not fail");
-        self.commit_raw(&encoded);
+            serde_json::to_vec(value).map_err(|e| PublicValuesError::Serialize(e.to_string()))?;
+        self.commit_raw(&encoded)
     }
 
     /// Commit raw bytes directly (no serialization wrapper).
-    pub fn commit_raw(&mut self, bytes: &[u8]) {
-        let len: u32 = bytes
-            .len()
-            .try_into()
-            .expect("PublicValues entry too large for wire format");
+    pub fn commit_raw(&mut self, bytes: &[u8]) -> Result<&mut Self, PublicValuesError> {
+        let len = entry_len_u32(bytes.len())?;
         self.buffer.extend_from_slice(&len.to_le_bytes());
         self.buffer.extend_from_slice(bytes);
+        Ok(self)
     }
 
-    /// Read the next committed value.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer is exhausted or deserialization fails.
-    /// Use [`try_read`](Self::try_read) for a fallible version.
-    pub fn read<T: DeserializeOwned>(&self) -> T {
-        self.try_read()
-            .expect("PublicValues::read: failed to read next value")
-    }
-
-    /// Try to read the next committed value.
-    pub fn try_read<T: DeserializeOwned>(&self) -> Result<T, PublicValuesError> {
+    /// Read the next JSON entry.
+    pub fn read<T: DeserializeOwned>(&self) -> Result<T, PublicValuesError> {
         let (start, end) = self.next_entry_bounds()?;
         let value = serde_json::from_slice(&self.buffer[start..end])
             .map_err(|e| PublicValuesError::Deserialize(e.to_string()))?;
@@ -83,7 +107,7 @@ impl PublicValues {
         Ok(value)
     }
 
-    /// Read the raw bytes for the next entry payload (without deserializing).
+    /// Read the next entry as raw bytes without deserializing it.
     pub fn read_raw(&self) -> Result<Vec<u8>, PublicValuesError> {
         let (start, end) = self.next_entry_bounds()?;
         let bytes = self.buffer[start..end].to_vec();
@@ -91,15 +115,23 @@ impl PublicValues {
         Ok(bytes)
     }
 
+    /// Validate that the buffer is a complete sequence of framed entries.
+    pub fn validate(&self) -> Result<(), PublicValuesError> {
+        let mut offset = 0usize;
+        while let Some(end) = checked_entry_end(&self.buffer, offset)? {
+            offset = end;
+        }
+        Ok(())
+    }
+
     /// Reset the read cursor to the beginning.
     pub fn reset_cursor(&self) {
         self.read_cursor.set(0);
     }
 
-    /// Return each entry as `(field_index, wire_bytes)`.
+    /// Return each entry as `(field_index, wire_bytes)` without advancing the cursor.
     ///
-    /// `wire_bytes` includes both the 4-byte length prefix and payload bytes.
-    /// This helper does not advance the sequential read cursor.
+    /// `wire_bytes` includes the 4-byte length prefix and payload.
     #[must_use]
     pub fn entries_raw(&self) -> Vec<(u32, Vec<u8>)> {
         let mut entries = Vec::new();
@@ -118,7 +150,7 @@ impl PublicValues {
         entries
     }
 
-    /// Count the number of committed entries in the buffer.
+    /// Count the number of complete entries in the buffer.
     #[must_use]
     pub fn entry_count(&self) -> u32 {
         let mut count = 0u32;
@@ -135,7 +167,7 @@ impl PublicValues {
         count
     }
 
-    /// Compute `SHA-256(buffer)` — the 32-byte commitment hash.
+    /// Compute `SHA-256(buffer)` over the exact on-wire bytes.
     #[must_use]
     pub fn commitment_hash(&self) -> [u8; 32] {
         Sha256::digest(&self.buffer).into()
@@ -179,7 +211,8 @@ impl PublicValues {
 
     fn next_entry_bounds(&self) -> Result<(usize, usize), PublicValuesError> {
         let cursor = self.read_cursor.get();
-        let end = entry_end(&self.buffer, cursor).ok_or(PublicValuesError::BufferExhausted)?;
+        let end =
+            checked_entry_end(&self.buffer, cursor)?.ok_or(PublicValuesError::BufferExhausted)?;
         Ok((cursor + 4, end))
     }
 }
@@ -190,63 +223,121 @@ impl Default for PublicValues {
     }
 }
 
-/// Compute the SHA-256 hash of a raw entry wire payload.
+/// Compute the SHA-256 hash of raw entry wire bytes.
+///
+/// `wire_bytes` should include the 4-byte length prefix followed by the entry
+/// payload, such as the values returned by [`PublicValues::entries_raw`].
 #[must_use]
 pub fn entry_hash(wire_bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(wire_bytes).into()
 }
 
-fn entry_end(buffer: &[u8], offset: usize) -> Option<usize> {
-    if offset + 4 > buffer.len() {
-        return None;
-    }
-
-    let len = u32::from_le_bytes(buffer[offset..offset + 4].try_into().ok()?) as usize;
-    let end = offset + 4 + len;
-    if end > buffer.len() {
-        return None;
-    }
-
-    Some(end)
+fn entry_len_u32(len: usize) -> Result<u32, PublicValuesError> {
+    len.try_into()
+        .map_err(|_| PublicValuesError::EntryTooLarge(len))
 }
 
-/// Errors when reading from [`PublicValues`].
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum PublicValuesError {
-    /// The buffer has no more complete entries to read.
-    #[error("public values buffer exhausted — no more entries to read")]
-    BufferExhausted,
-    /// A value could not be deserialized from the buffer.
-    #[error("failed to deserialize public value: {0}")]
-    Deserialize(String),
+fn entry_end(buffer: &[u8], offset: usize) -> Option<usize> {
+    checked_entry_end(buffer, offset).ok().flatten()
+}
+
+fn checked_entry_end(buffer: &[u8], offset: usize) -> Result<Option<usize>, PublicValuesError> {
+    if offset >= buffer.len() {
+        return Ok(None);
+    }
+
+    let remaining = buffer.len() - offset;
+    if remaining < 4 {
+        return Err(PublicValuesError::TruncatedLengthPrefix { offset, remaining });
+    }
+
+    let len = u32::from_le_bytes(
+        buffer[offset..offset + 4]
+            .try_into()
+            .expect("length prefix is exactly 4 bytes"),
+    ) as usize;
+    let payload_start = offset + 4;
+    let payload_remaining = buffer.len() - payload_start;
+    let end = payload_start
+        .checked_add(len)
+        .ok_or(PublicValuesError::TruncatedEntryPayload {
+            offset,
+            declared_len: len,
+            remaining: payload_remaining,
+        })?;
+
+    if end > buffer.len() {
+        return Err(PublicValuesError::TruncatedEntryPayload {
+            offset,
+            declared_len: len,
+            remaining: payload_remaining,
+        });
+    }
+
+    Ok(Some(end))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::ser::Error as _;
+
+    struct FailingSerialize;
+
+    impl serde::Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(S::Error::custom("intentional serialization failure"))
+        }
+    }
+
+    fn malformed_with_truncated_payload_tail() -> (PublicValues, usize) {
+        let mut prefix = PublicValues::new();
+        prefix.commit(&"ok").unwrap();
+
+        let tail_offset = prefix.len();
+        let mut bytes = prefix.into_bytes();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.push(b'x');
+
+        (PublicValues::from_bytes(bytes), tail_offset)
+    }
+
+    fn malformed_with_truncated_length_prefix_tail() -> (PublicValues, usize) {
+        let mut prefix = PublicValues::new();
+        prefix.commit(&"ok").unwrap();
+
+        let tail_offset = prefix.len();
+        let mut bytes = prefix.into_bytes();
+        bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+
+        (PublicValues::from_bytes(bytes), tail_offset)
+    }
 
     #[test]
     fn commit_and_read_roundtrip() {
         let mut pv = PublicValues::new();
-        pv.commit(&42u64);
-        pv.commit(&"hello world".to_string());
-        pv.commit(&[1u8, 2, 3, 4]);
+        pv.commit(&42u64).unwrap();
+        pv.commit(&"hello world".to_string()).unwrap();
+        pv.commit(&[1u8, 2, 3, 4]).unwrap();
 
         let reader = PublicValues::from_bytes(pv.into_bytes());
-        assert_eq!(reader.read::<u64>(), 42);
-        assert_eq!(reader.read::<String>(), "hello world");
-        assert_eq!(reader.read::<Vec<u8>>(), vec![1, 2, 3, 4]);
+        assert_eq!(reader.read::<u64>().unwrap(), 42);
+        assert_eq!(reader.read::<String>().unwrap(), "hello world");
+        assert_eq!(reader.read::<Vec<u8>>().unwrap(), vec![1, 2, 3, 4]);
     }
 
     #[test]
     fn commitment_hash_is_deterministic() {
         let mut a = PublicValues::new();
-        a.commit(&100i64);
-        a.commit(&"test");
+        a.commit(&100i64).unwrap();
+        a.commit(&"test").unwrap();
 
         let mut b = PublicValues::new();
-        b.commit(&100i64);
-        b.commit(&"test");
+        b.commit(&100i64).unwrap();
+        b.commit(&"test").unwrap();
 
         assert_eq!(a.commitment_hash(), b.commitment_hash());
     }
@@ -254,10 +345,10 @@ mod tests {
     #[test]
     fn commitment_hash_changes_with_different_values() {
         let mut a = PublicValues::new();
-        a.commit(&1u32);
+        a.commit(&1u32).unwrap();
 
         let mut b = PublicValues::new();
-        b.commit(&2u32);
+        b.commit(&2u32).unwrap();
 
         assert_ne!(a.commitment_hash(), b.commitment_hash());
     }
@@ -265,12 +356,12 @@ mod tests {
     #[test]
     fn commitment_hash_changes_with_order() {
         let mut a = PublicValues::new();
-        a.commit(&1u32);
-        a.commit(&2u32);
+        a.commit(&1u32).unwrap();
+        a.commit(&2u32).unwrap();
 
         let mut b = PublicValues::new();
-        b.commit(&2u32);
-        b.commit(&1u32);
+        b.commit(&2u32).unwrap();
+        b.commit(&1u32).unwrap();
 
         assert_ne!(a.commitment_hash(), b.commitment_hash());
     }
@@ -278,7 +369,7 @@ mod tests {
     #[test]
     fn verify_commitment_passes() {
         let mut pv = PublicValues::new();
-        pv.commit(&"payload");
+        pv.commit(&"payload").unwrap();
         let hash = pv.commitment_hash();
         assert!(pv.verify_commitment(&hash));
     }
@@ -286,33 +377,33 @@ mod tests {
     #[test]
     fn verify_commitment_rejects_wrong_hash() {
         let mut pv = PublicValues::new();
-        pv.commit(&"payload");
+        pv.commit(&"payload").unwrap();
         assert!(!pv.verify_commitment(&[0u8; 32]));
     }
 
     #[test]
     fn read_exhausted_returns_error() {
         let pv = PublicValues::new();
-        assert!(pv.try_read::<u32>().is_err());
+        assert_eq!(pv.read::<u32>(), Err(PublicValuesError::BufferExhausted));
     }
 
     #[test]
     fn base64_roundtrip() {
         let mut pv = PublicValues::new();
-        pv.commit(&99u64);
-        pv.commit(&"b64 test");
+        pv.commit(&99u64).unwrap();
+        pv.commit(&"b64 test").unwrap();
 
         let b64 = pv.to_base64();
         let restored = PublicValues::from_base64(&b64).unwrap();
-        assert_eq!(restored.read::<u64>(), 99);
-        assert_eq!(restored.read::<String>(), "b64 test");
+        assert_eq!(restored.read::<u64>().unwrap(), 99);
+        assert_eq!(restored.read::<String>().unwrap(), "b64 test");
         assert_eq!(pv.commitment_hash(), restored.commitment_hash());
     }
 
     #[test]
     fn raw_commit_and_read() {
         let mut pv = PublicValues::new();
-        pv.commit_raw(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        pv.commit_raw(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
 
         let reader = PublicValues::from_bytes(pv.into_bytes());
         let raw = reader.read_raw().unwrap();
@@ -320,24 +411,45 @@ mod tests {
     }
 
     #[test]
+    fn commit_reports_serialization_failures() {
+        let mut pv = PublicValues::new();
+
+        assert!(matches!(
+            pv.commit(&FailingSerialize),
+            Err(PublicValuesError::Serialize(message))
+                if message == "intentional serialization failure"
+        ));
+    }
+
+    #[test]
+    fn commit_raw_rejects_entries_larger_than_u32_wire_limit() {
+        let oversized_len = u32::MAX as usize + 1;
+
+        assert_eq!(
+            entry_len_u32(oversized_len),
+            Err(PublicValuesError::EntryTooLarge(oversized_len))
+        );
+    }
+
+    #[test]
     fn reset_cursor_allows_rereading() {
         let mut pv = PublicValues::new();
-        pv.commit(&7u32);
+        pv.commit(&7u32).unwrap();
 
         let reader = PublicValues::from_bytes(pv.into_bytes());
-        assert_eq!(reader.read::<u32>(), 7);
-        assert!(reader.try_read::<u32>().is_err());
+        assert_eq!(reader.read::<u32>().unwrap(), 7);
+        assert!(reader.read::<u32>().is_err());
 
         reader.reset_cursor();
-        assert_eq!(reader.read::<u32>(), 7);
+        assert_eq!(reader.read::<u32>().unwrap(), 7);
     }
 
     #[test]
     fn entries_raw_returns_entry_boundaries_and_indices() {
         let mut values = PublicValues::new();
-        values.commit(&"alpha");
-        values.commit(&42u32);
-        values.commit(&vec!["x", "y"]);
+        values.commit(&"alpha").unwrap();
+        values.commit(&42u32).unwrap();
+        values.commit(&vec!["x", "y"]).unwrap();
 
         let entries = values.entries_raw();
         assert_eq!(entries.len(), 3);
@@ -362,9 +474,9 @@ mod tests {
     #[test]
     fn entry_hash_is_stable_for_identical_values_and_changes_for_different_values() {
         let mut values = PublicValues::new();
-        values.commit(&"same");
-        values.commit(&"same");
-        values.commit(&"different");
+        values.commit(&"same").unwrap();
+        values.commit(&"same").unwrap();
+        values.commit(&"different").unwrap();
 
         let entries = values.entries_raw();
         let first = entry_hash(&entries[0].1);
@@ -380,9 +492,9 @@ mod tests {
         let mut values = PublicValues::new();
         assert_eq!(values.entry_count(), 0);
 
-        values.commit(&"one");
-        values.commit(&"two");
-        values.commit(&3u8);
+        values.commit(&"one").unwrap();
+        values.commit(&"two").unwrap();
+        values.commit(&3u8).unwrap();
 
         assert_eq!(values.entry_count(), 3);
     }
@@ -390,9 +502,9 @@ mod tests {
     #[test]
     fn entry_count_survives_from_bytes_and_from_base64() {
         let mut values = PublicValues::new();
-        values.commit(&"one");
-        values.commit(&"two");
-        values.commit(&3u8);
+        values.commit(&"one").unwrap();
+        values.commit(&"two").unwrap();
+        values.commit(&3u8).unwrap();
 
         let from_bytes = PublicValues::from_bytes(values.as_bytes().to_vec());
         let from_base64 = PublicValues::from_base64(&values.to_base64()).unwrap();
@@ -406,22 +518,34 @@ mod tests {
     #[test]
     fn entries_raw_does_not_advance_the_read_cursor() {
         let mut values = PublicValues::new();
-        values.commit(&"first");
-        values.commit(&"second");
+        values.commit(&"first").unwrap();
+        values.commit(&"second").unwrap();
 
         let _ = values.entries_raw();
-        let first: String = values.read();
-        let second: String = values.read();
+        let first: String = values.read().unwrap();
+        let second: String = values.read().unwrap();
 
         assert_eq!(first, "first");
         assert_eq!(second, "second");
     }
 
     #[test]
+    fn read_preserves_cursor_on_deserialize_error() {
+        let mut values = PublicValues::new();
+        values.commit(&7u32).unwrap();
+
+        assert!(matches!(
+            values.read::<String>(),
+            Err(PublicValuesError::Deserialize(_))
+        ));
+        assert_eq!(values.read::<u32>().unwrap(), 7);
+    }
+
+    #[test]
     fn base64_roundtrip_preserves_entries() {
         let mut values = PublicValues::new();
-        values.commit(&"alpha");
-        values.commit(&7u32);
+        values.commit(&"alpha").unwrap();
+        values.commit(&7u32).unwrap();
 
         let encoded = values.to_base64();
         let decoded = PublicValues::from_base64(&encoded).unwrap();
@@ -431,11 +555,138 @@ mod tests {
     }
 
     #[test]
+    fn from_base64_rejects_invalid_base64() {
+        assert!(matches!(
+            PublicValues::from_base64("not-base64"),
+            Err(PublicValuesError::Base64(_))
+        ));
+    }
+
+    #[test]
+    fn from_base64_rejects_malformed_tail() {
+        let (values, tail_offset) = malformed_with_truncated_payload_tail();
+        let encoded = values.to_base64();
+        let expected = PublicValuesError::TruncatedEntryPayload {
+            offset: tail_offset,
+            declared_len: 3,
+            remaining: 1,
+        };
+
+        assert_eq!(PublicValues::from_base64(&encoded).unwrap_err(), expected);
+        assert_eq!(
+            PublicValues::try_from_bytes(values.into_bytes()).unwrap_err(),
+            expected
+        );
+
+        let deserialization_error =
+            serde_json::from_str::<PublicValues>(&format!("\"{encoded}\"")).unwrap_err();
+        assert!(deserialization_error
+            .to_string()
+            .contains("public values entry at offset"));
+    }
+
+    #[test]
     fn truncated_buffer_has_zero_visible_entries() {
         let values = PublicValues::from_bytes(vec![5, 0, 0, 0, b'a']);
 
         assert_eq!(values.entry_count(), 0);
         assert!(values.entries_raw().is_empty());
-        assert!(values.try_read::<String>().is_err());
+        assert_eq!(
+            values.read::<String>(),
+            Err(PublicValuesError::TruncatedEntryPayload {
+                offset: 0,
+                declared_len: 5,
+                remaining: 1,
+            })
+        );
+        assert_eq!(
+            values.validate(),
+            Err(PublicValuesError::TruncatedEntryPayload {
+                offset: 0,
+                declared_len: 5,
+                remaining: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_raw_and_typed_entries() {
+        let mut values = PublicValues::new();
+        values.commit(&"alpha").unwrap();
+        values.commit_raw(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+        values.commit(&42u32).unwrap();
+
+        assert!(values.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_truncated_payload_tail_after_valid_prefix() {
+        let (values, tail_offset) = malformed_with_truncated_payload_tail();
+
+        assert_eq!(values.entry_count(), 1);
+        assert_eq!(values.entries_raw().len(), 1);
+        assert_eq!(
+            values.validate(),
+            Err(PublicValuesError::TruncatedEntryPayload {
+                offset: tail_offset,
+                declared_len: 3,
+                remaining: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_truncated_length_prefix_tail_after_valid_prefix() {
+        let (values, tail_offset) = malformed_with_truncated_length_prefix_tail();
+
+        assert_eq!(values.entry_count(), 1);
+        assert_eq!(values.entries_raw().len(), 1);
+        assert_eq!(
+            values.validate(),
+            Err(PublicValuesError::TruncatedLengthPrefix {
+                offset: tail_offset,
+                remaining: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn try_from_bytes_rejects_malformed_tail() {
+        let (values, tail_offset) = malformed_with_truncated_payload_tail();
+
+        assert_eq!(
+            PublicValues::try_from_bytes(values.into_bytes()).unwrap_err(),
+            PublicValuesError::TruncatedEntryPayload {
+                offset: tail_offset,
+                declared_len: 3,
+                remaining: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn read_and_read_raw_report_malformed_tail_instead_of_exhaustion() {
+        let (values, tail_offset) = malformed_with_truncated_payload_tail();
+
+        assert_eq!(values.read::<String>().unwrap(), "ok");
+        assert_eq!(
+            values.read::<String>(),
+            Err(PublicValuesError::TruncatedEntryPayload {
+                offset: tail_offset,
+                declared_len: 3,
+                remaining: 1,
+            })
+        );
+
+        values.reset_cursor();
+        assert_eq!(values.read::<String>().unwrap(), "ok");
+        assert_eq!(
+            values.read_raw(),
+            Err(PublicValuesError::TruncatedEntryPayload {
+                offset: tail_offset,
+                declared_len: 3,
+                remaining: 1,
+            })
+        );
     }
 }
