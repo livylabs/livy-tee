@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! TDX evidence generation via TSM configfs.
 //!
 //! Requires Linux kernel ≥ 6.7 with the TDX guest driver and configfs-tsm

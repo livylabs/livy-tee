@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! Deterministic signed-token verification tests.
 //!
 //! Run with: cargo test --test signed_verification --features ita-verify

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! Tests that require both `mock-tee` and `ita-verify` features.
 //!
 //! Run with: cargo test --features mock-tee,ita-verify

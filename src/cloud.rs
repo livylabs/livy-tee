@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! Runtime cloud-provider detection shared by quote generation and ITA routing.
 
 /// Cloud provider detected from the guest runtime.

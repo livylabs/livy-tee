@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! Shared public error types for the crate.
 
 use crate::evidence::QUOTE_MIN_LEN;

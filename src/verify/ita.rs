@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! Intel Trust Authority HTTP helpers.
 //!
 //! This module fetches verifier nonces, submits evidence to ITA, and validates

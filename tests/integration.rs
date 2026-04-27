@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 use base64::Engine;
 use livy_tee::{
     binary_hash, build_id_from_hash_hex, Evidence, EvidenceError, GenerateError, ReportData,

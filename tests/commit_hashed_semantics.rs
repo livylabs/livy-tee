@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! commit_hashed interoperability and wire-contract tests.
 //!
 //! Run with: cargo test --test commit_hashed_semantics --features mock-tee,ita-verify

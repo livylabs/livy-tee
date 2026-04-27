@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! `Evidence` — raw TDX quote bytes with base64 helpers.
 
 use crate::error::EvidenceError;

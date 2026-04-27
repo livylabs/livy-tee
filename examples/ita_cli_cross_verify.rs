@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! Generate an attestation with livy-tee and verify its ITA token with
 //! Intel Trust Authority CLI.
 //!

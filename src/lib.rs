@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 #![warn(missing_docs, missing_debug_implementations, unreachable_pub)]
 #![deny(unsafe_code)]
 //! Intel TDX attestation primitives and the Livy high-level API.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! livy-tee TDX smoke test — exercises the full primitive chain on real hardware.
 //!
 //! Build (production):

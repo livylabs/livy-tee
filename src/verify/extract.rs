@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! Local extraction of fields from a raw TDX DCAP quote.
 //!
 //! This module parses fixed offsets from the quote body. It does not verify the

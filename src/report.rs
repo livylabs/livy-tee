@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! `ReportData` is the 64-byte `runtime_data` payload bound into a TDX attestation.
 //!
 //! Wire layout, all big-endian:

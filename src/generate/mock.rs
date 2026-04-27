@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! Mock TDX evidence — a correctly-shaped 632-byte DCAP quote stub.
 //!
 //! The buffer follows the TDX DCAP v4 layout so `extract_report_data` works

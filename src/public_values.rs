@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! Ordered public values committed by TEE code and read by verifiers.
 //!
 //! The wire format is a sequence of `[u32 little-endian length][payload]`

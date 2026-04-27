@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! Azure TDX quote generation via vTPM/paravisor.
 //!
 //! This path writes caller-supplied 64-byte report data to the Azure vTPM NV

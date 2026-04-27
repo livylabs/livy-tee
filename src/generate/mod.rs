@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! TDX evidence generation.
 //!
 //! Azure CVMs use the Azure vTPM/paravisor path. Other Linux TDX guests use

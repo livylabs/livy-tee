@@ -1,6 +1,6 @@
 # livy-tee
 
-[![License: PolyForm Noncommercial](https://img.shields.io/badge/license-PolyForm--Noncommercial-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 `livy-tee` is a Rust library for generating Intel TDX attestations, binding
 application-visible values into them, and verifying the resulting Intel Trust
@@ -444,9 +444,4 @@ livy-tee
 
 ## License
 
-livy-tee is source-available under the
-[PolyForm Noncommercial License 1.0.0](LICENSE).
-
-Free for personal use, research, education, non-profit organizations, and
-government institutions. Commercial use requires a separate license —
-contact [license@livylabs.xyz](mailto:license@livylabs.xyz).
+livy-tee is released under the [MIT License](LICENSE).

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! Parsing helpers for quote input.
 
 use crate::{error::EvidenceError, Config, Evidence};

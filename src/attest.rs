@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// SPDX-License-Identifier: MIT
 //! Combined evidence generation and ITA appraisal.
 //!
 //! Most applications use [`crate::Livy`] and [`crate::AttestBuilder`]. This is
