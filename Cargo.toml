@@ -1,6 +1,6 @@
 [package]
 name = "livy-tee"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Intel TDX quote generation and verification for the Livy provenance system. Open-source so users can independently verify TEE execution claims."
 license = "MIT"
