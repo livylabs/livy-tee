@@ -35,21 +35,3 @@ pub fn generate_evidence(user_data: &[u8; 64]) -> Result<Evidence, GenerateError
         mock::generate(user_data)
     }
 }
-
-/// SHA-256 of the current binary on disk.
-///
-/// In `mock-tee` mode returns a stable placeholder string.
-pub fn binary_hash() -> Result<String, GenerateError> {
-    #[cfg(not(feature = "mock-tee"))]
-    {
-        use sha2::{Digest, Sha256};
-        let exe = std::env::current_exe().map_err(GenerateError::BinaryRead)?;
-        let bytes = std::fs::read(&exe).map_err(GenerateError::BinaryRead)?;
-        Ok(hex::encode(Sha256::digest(&bytes)))
-    }
-
-    #[cfg(feature = "mock-tee")]
-    {
-        Ok("0000000000000000000000000000000000000000000000000000000000000000".to_string())
-    }
-}

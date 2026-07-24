@@ -24,37 +24,10 @@ fn main() {
         }
     };
 
-    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("<unknown>"));
-    println!("  binary: {}", exe.display());
-
-    let binary_hash = match livy_tee::binary_hash() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("  FAIL  binary_hash: {e}");
-            std::process::exit(1);
-        }
-    };
-    println!(
-        "  binary_hash: {}...  ({} hex chars)",
-        &binary_hash[..binary_hash.len().min(6)],
-        binary_hash.len(),
-    );
-    println!();
-
     // [1/5] Generate TDX evidence
     println!("[1/5] Generating TDX evidence via runtime quote provider...");
 
-    use sha2::{Digest, Sha256};
-    let payload_hash: [u8; 32] = Sha256::digest(b"livy-tee smoke test v1").into();
-    let build_id = match livy_tee::build_id_from_hash_hex(&binary_hash) {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!("  FAIL  build_id_from_hash_hex: {e}");
-            std::process::exit(1);
-        }
-    };
-    let rd = livy_tee::ReportData::new(payload_hash, build_id, livy_tee::REPORT_DATA_VERSION, 0, 0);
-    let rd_bytes = rd.to_bytes();
+    let rd_bytes = [0x5au8; 64];
 
     let evidence = match livy_tee::generate_evidence(&rd_bytes) {
         Ok(e) => {
@@ -165,7 +138,6 @@ fn main() {
                 } else {
                     match livy_tee::verify_quote_with_public_values(
                         &att.raw_quote,
-                        &att.runtime_data,
                         &att.verifier_nonce_val,
                         &att.verifier_nonce_iat,
                         &att.public_values,

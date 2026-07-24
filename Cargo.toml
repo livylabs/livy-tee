@@ -2,7 +2,7 @@
 name = "livy-tee"
 version = "0.1.0"
 edition = "2021"
-description = "Intel TDX quote generation and verification for the Livy provenance system. Open-source so users can independently verify TEE execution claims."
+description = "Intel TDX and Google Confidential Space attestation for the Livy provenance system."
 license = "MIT"
 keywords     = ["tdx", "attestation", "tee", "intel", "provenance"]
 categories   = ["cryptography", "hardware-support", "api-bindings", "authentication"]
@@ -36,8 +36,12 @@ tokio      = { version = "1.48", features = ["full"] }
 # For development without hardware: cargo build --features mock-tee
 default    = []
 mock-tee   = []
+# Shared HTTP/JWT plumbing for remote attestation providers.
+attestation = ["dep:reqwest", "dep:jsonwebtoken"]
 # ita-verify: Intel Trust Authority REST API verification
-ita-verify = ["dep:reqwest", "dep:jsonwebtoken"]
+ita-verify = ["attestation"]
+# confidential-space: Google Confidential Space launcher and token verification
+confidential-space = ["attestation"]
 
 [[example]]
 name = "ita_cli_cross_verify"
@@ -46,3 +50,11 @@ required-features = ["ita-verify"]
 [[example]]
 name = "getting_started"
 required-features = ["ita-verify"]
+
+[[example]]
+name = "confidential_space_attest"
+required-features = ["confidential-space"]
+
+[[example]]
+name = "confidential_space_verify"
+required-features = ["confidential-space"]

@@ -1,447 +1,288 @@
 # livy-tee
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+Intel TDX attestation primitives and higher-level attestation artifacts for the
+Livy provenance system.
 
-`livy-tee` is a Rust library for generating Intel TDX attestations, binding
-application-visible values into them, and verifying the resulting Intel Trust
-Authority (ITA) token.
+The crate supports two distinct security models:
 
-It exposes two layers:
+- **Instance attestation** uses a raw TDX quote plus Intel Trust Authority
+  appraisal. It binds `SHA-256(public_values)` into hardware REPORTDATA.
+- **Google Confidential Space** obtains Google, Intel, or dual OIDC tokens from
+  the Confidential Space launcher. Signed container claims identify the exact
+  workload image and its launch configuration.
 
-1. High-level API: [`Livy`], [`AttestBuilder`], [`Attestation`]
-2. Low-level API: [`Evidence`], [`ReportData`], quote extraction helpers, and
-   ITA helpers
+These models deliberately make different identity claims. An instance MRTD is
+a platform/VM launch measurement that requires an externally supplied reference
+policy. It does **not** independently identify the application currently
+running inside that VM. Confidential Space workload identity comes from the
+signed container image and configuration claims.
 
-## Trust model
+## Features
 
-`livy-tee` proves TDX-backed computation integrity, not input authenticity.
+| Feature | Description |
+|---|---|
+| *(none)* | Low-level quote generation, parsing, and extraction |
+| `mock-tee` | Correctly shaped local quote stub |
+| `ita-verify` | Instance quote appraisal and JWT verification with Intel Trust Authority |
+| `confidential-space` | Confidential Space launcher client and strict OIDC workload verification |
+| `attestation` | Shared HTTP/JWKS plumbing enabled by the two attestation features |
 
-At a high level:
+The minimum supported Rust version is 1.75.
 
-- the TDX measurement (`mrtd`) identifies which binary ran
-- `public_values` and `report_data.nonce` identify what was bound into the attestation
-- the ITA token reports the TCB status and advisory set for that attestation
+## Commitment model
 
-What it does not prove:
+`PublicValues` stores ordered, length-prefixed values. The sole
+application-controlled attestation input is:
 
-- that an input came from a real device or user
-- that an external system stored or delivered the attestation correctly
+```text
+commitment = SHA-256(public_values wire bytes)    // 32 bytes
+```
 
-Verification modes:
+There is no self-reported build ID, build number, version, or application
+nonce. Application identity must come from an independently trusted source,
+not from bytes that the application writes about itself.
 
-- `verify()` trusts the stored signed ITA token and checks local bindings
-- `verify_fresh()` also reappraises the bundled evidence artifact with ITA
+For instance attestation, Intel Trust Authority supplies a verifier nonce and
+the hardware REPORTDATA field remains 64 bytes:
 
-## What the library proves
+```text
+REPORTDATA = SHA-512(nonce.val || nonce.iat || commitment)
+```
 
-At a high level, `livy-tee` lets you prove:
+The low-level `generate_evidence(&[u8; 64])` and
+`extract_report_data(...) -> [u8; 64]` APIs remain available because TDX
+hardware REPORTDATA is intrinsically 64 bytes.
 
-- which TDX-measured binary ran (`mrtd`)
-- which public values were committed (`public_values`)
-- which application nonce was embedded (`report_data.nonce`)
-- which ITA TCB status and advisory set were observed
+## Instance attestation
 
-It does **not** prove that an input itself is authentic. For example, a photo
-being signed by a real camera or device needs additional trust anchors above
-this library.
-
-## Feature flags
-
-| Feature | Default | Description |
-|---------|---------|-------------|
-| *(none)* | yes | Runtime provider auto-detection: Azure vTPM/paravisor or Linux TSM configfs |
-| `mock-tee` | no | Correctly-shaped quote stub for local development |
-| `ita-verify` | no | High-level attestation API and Intel Trust Authority integration |
-
-## Runtime behavior
-
-No cloud-provider flag is needed. `livy-tee` auto-detects the runtime:
-
-- Azure CVMs use the native Azure vTPM/paravisor path
-- other Linux TDX guests use TSM configfs
-
-Azure-specific notes:
-
-- no `tpm2-tools` or `curl` dependency is required
-- `Evidence` preserves Azure runtime JSON
-- `verify()` uses Azure-specific ITA token binding claims
-- `verify_fresh()` is the strict path for authenticating bundled Azure evidence
-
-Non-Azure Linux TDX notes:
-
-- quote generation uses `/sys/kernel/config/tsm/report`
-- local offline binding is available via `verify_binding()` and
-  `verify_quote_with_public_values()`
-
-### Running without `sudo` on Linux TDX guests
-
-On GCP and other non-Azure Linux TDX guests, the VM may expose
-`/dev/tdx_guest` and `/sys/kernel/config/tsm/report` as root-owned. The
-practical non-`sudo` setup is:
-
-- create a dedicated group such as `tdx-attest`
-- grant `/dev/tdx_guest` to that group with a udev rule
-- reapply group ownership and write permissions to
-  `/sys/kernel/config/tsm/report` at boot with a small systemd unit
-
-That keeps the application process unprivileged. A stricter production option
-is a small privileged quote-broker service on a Unix socket.
-
-## Quick start
-
-Add to `Cargo.toml`:
+Enable `ita-verify`:
 
 ```toml
 [dependencies]
 livy-tee = { version = "0.1", features = ["ita-verify"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
-Example:
+Generate an artifact:
 
-```rust
+```rust,no_run
 use livy_tee::Livy;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let livy = Livy::from_env()?;
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let livy = Livy::new(std::env::var("ITA_API_KEY")?);
+let mut builder = livy.attest();
+builder.commit(&123_u64).commit(&369_u64);
 
-    let input = 123u64;
-    let output = input * 3;
-
-    let mut builder = livy.attest();
-    builder.commit(&input).commit(&output).nonce(1);
-
-    let attestation = builder.finalize().await?;
-
-    let report = attestation.verify().await?;
-    report.require_success()?;
-
-    let committed_input: u64 = attestation.public_values.read()?;
-    let committed_output: u64 = attestation.public_values.read()?;
-
-    assert_eq!(committed_input, 123);
-    assert_eq!(committed_output, 369);
-    Ok(())
-}
+let attestation = builder.finalize().await?;
+println!("commitment: {}", attestation.payload_hash_hex());
+# Ok(())
+# }
 ```
 
-Run inside a TDX VM:
+Verify a stored artifact:
 
-```bash
-ITA_API_KEY=<your-key> cargo run --release
-```
-
-## High-level API
-
-### `Livy`
-
-`Livy` holds an `ItaConfig` and starts the attestation flow:
-
-```rust
-use livy_tee::{ItaConfig, Livy};
-
-let livy = Livy::from_env()?;
-let livy = Livy::new("your-ita-api-key");
-let livy = Livy::with_config(ItaConfig {
-    api_key: "your-ita-api-key".to_string(),
-    ..ItaConfig::default()
-});
-```
-
-### `AttestBuilder`
-
-Use `livy.attest()` to create a builder, then:
-
-- `commit(&value)` for public typed values
-- `commit_hashed(&value)` for `SHA-256(serde_json(value))`
-- `commit_raw(bytes)` for raw bytes
-- `nonce(n)` for the application nonce
-- `finalize().await` to generate the attestation
-
-Important: `.commit()` stores plaintext. Only commit values that are intended
-to be public.
-
-### `Attestation`
-
-`finalize().await` returns an [`Attestation`] that can be stored, serialized,
-transmitted, and verified later.
-
-Key fields:
-
-| Field | Meaning |
-|-------|---------|
-| `ita_token` | ITA-signed JWT |
-| `jwks_url` | JWKS URL associated with the token region |
-| `mrtd` | Hex-encoded TDX measurement |
-| `tcb_status` / `tcb_date` / `advisory_ids` | ITA appraisal result |
-| `evidence` | Portable evidence artifact; Azure includes runtime JSON |
-| `raw_quote` | Base64 raw quote |
-| `runtime_data` | Base64 encoded 64-byte `ReportData` |
-| `verifier_nonce_*` | Stored ITA verifier nonce fields |
-| `report_data` | Parsed `ReportData` |
-| `public_values` | Ordered public-values buffer |
-
-## Verification model
-
-| Method | What it checks | Network |
-|--------|----------------|---------|
-| `verify_binding()` | Local quote/runtime/public-values binding only | No |
-| `verify()` | ITA JWT/JWKS + policy + local binding where portable | Yes |
-| `verify_fresh()` | `verify()` plus fresh ITA reappraisal of bundled evidence | Yes |
-
-### `verify_binding()`
-
-Offline helper for local quote binding:
-
-```rust
-let ok = attestation.verify_binding()?;
-assert!(ok);
-```
-
-Use this only when you want the local quote/runtime/public-values relationship.
-It does not verify the ITA token or TCB policy.
-
-### `verify()`
-
-Normal full verifier:
-
-```rust
+```rust,no_run
+# async fn example(attestation: livy_tee::Attestation) -> Result<(), Box<dyn std::error::Error>> {
 let report = attestation.verify().await?;
-report.require_success()?;
+report
+    .require_success()
+    .map_err(|report| format!("verification failed: {report:?}"))?;
+# Ok(())
+# }
 ```
 
-This validates:
+`verify()` authenticates the stored ITA token and recomputes the binding from
+`public_values`. `verify_fresh()` additionally sends the bundled evidence back
+to ITA for a fresh appraisal.
 
-- ITA JWT signature and registered time claims
-- token-side binding to the stored nonce and `runtime_data`
-- local quote binding where that is portable
-- `public_values` commitment
-- default TCB policy (`UpToDate`)
+For non-Azure TDX quotes, the local helper verifies the raw quote binding:
 
-### `verify_fresh()`
-
-Strict path:
-
-```rust
-let verify_config = livy_tee::ItaConfig {
-    api_key: std::env::var("ITA_API_KEY")?,
-    ..livy_tee::ItaConfig::default()
-};
-
-let report = attestation.verify_fresh(&verify_config).await?;
-report.require_success()?;
-```
-
-This reappraises the bundled evidence artifact with ITA and sets
-`bundled_evidence_authenticated`.
-
-## Policies
-
-Use [`AttestationVerificationPolicy`] when you need to pin token metadata or
-relax the default `UpToDate` policy intentionally.
-
-```rust
-use livy_tee::{AttestationVerificationPolicy, binary_hash, build_id_from_hash_hex};
-
-let mut policy = AttestationVerificationPolicy::default();
-policy.expected_mrtd = Some(expected_mrtd.to_string());
-policy.expected_build_id = Some(build_id_from_hash_hex(&binary_hash()?)?);
-policy.expected_nonce = Some(expected_nonce);
-policy.expected_token_issuer =
-    livy_tee::default_issuer_for_jwks_url(&attestation.jwks_url);
-policy.expected_token_audience = Some("your-verifier".to_string());
-
-let report = attestation.verify_with_policy(&policy).await?;
-report.require_success()?;
-```
-
-For an environment that currently appraises as `OutOfDate`, pin the exact
-advisory set you intend to allow:
-
-```rust
-let mut policy = AttestationVerificationPolicy::default();
-policy.accepted_tcb_statuses = vec!["OutOfDate".to_string()];
-policy.expected_advisory_ids = Some(vec![
-    "INTEL-SA-01192".to_string(),
-    "INTEL-SA-01245".to_string(),
-    "INTEL-SA-01312".to_string(),
-    "INTEL-SA-01313".to_string(),
-]);
-
-let report = attestation.verify_with_policy(&policy).await?;
-report.require_success()?;
-```
-
-Use the exact advisory IDs returned by your target environment. Treat that
-allowlist as operational policy, not a fixed library constant.
-
-## Public values
-
-`PublicValues` is the ordered buffer behind `commit`, `commit_hashed`, and
-`commit_raw`.
-
-Read values back in commit order:
-
-```rust
-let input: u64 = attestation.public_values.read()?;
-let output: u64 = attestation.public_values.read()?;
-let hash = attestation.public_values.read_raw()?;
-```
-
-Important semantics:
-
-- `commit(&value)` stores `serde_json(value)` as a framed entry
-- `commit_hashed(&value)` stores `SHA-256(serde_json(value))` as a raw 32-byte entry
-- `read()` is for JSON entries
-- `read_raw()` is for raw/hash entries
-
-Transport and reconstruction:
-
-- `from_bytes()` for trusted local bytes
-- `try_from_bytes()` for untrusted decoded bytes
-- `from_base64()` for transport form
-
-## Low-level API
-
-### `ReportData`
-
-`ReportData` is the 64-byte `runtime_data` payload sent to ITA.
-
-```rust
-use livy_tee::{binary_hash, build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION};
-
-let rd = ReportData::new(
-    payload_hash,
-    build_id_from_hash_hex(&binary_hash()?)?,
-    REPORT_DATA_VERSION,
-    0,
-    nonce,
-);
-
-let bytes = rd.to_bytes();
-let parsed = ReportData::from_bytes(&bytes);
-assert!(parsed.verify_payload(&payload_hash));
-```
-
-### Quote generation
-
-```rust
-use livy_tee::generate_evidence;
-
-let evidence = generate_evidence(&rd.to_bytes())?;
-```
-
-### Local extraction
-
-```rust
-use livy_tee::{extract_mrtd, extract_report_data};
-
-let report_data = extract_report_data(&evidence)?;
-let mrtd = extract_mrtd(&evidence)?;
-```
-
-### Offline quote verification
-
-If you already have the expected payload hash:
-
-```rust
-use livy_tee::verify_quote;
-
-let ok = verify_quote(
-    &raw_quote_b64,
-    &runtime_data_b64,
-    &nonce_val_b64,
-    &nonce_iat_b64,
-    &expected_payload_hash,
-)?;
-assert!(ok);
-```
-
-If you want the hash derived from `PublicValues`:
-
-```rust
-use livy_tee::verify_quote_with_public_values;
-
-let ok = verify_quote_with_public_values(
+```rust,no_run
+# fn example(attestation: &livy_tee::Attestation) -> Result<(), livy_tee::ExtractError> {
+let valid = livy_tee::verify_quote_with_public_values(
     &attestation.raw_quote,
-    &attestation.runtime_data,
     &attestation.verifier_nonce_val,
     &attestation.verifier_nonce_iat,
     &attestation.public_values,
 )?;
-assert!(ok);
+assert!(valid);
+# Ok(())
+# }
 ```
 
-### Low-level ITA helpers
+Azure uses ITA's signed `attester_held_data` and
+`attester_runtime_data.user-data` claims instead of exposing the same portable
+raw-quote check. See [Azure attestation](docs/azure-attestation.md).
 
-`generate_and_attest()` combines quote generation and ITA appraisal:
+### Instance artifact schema
 
-```rust
-use livy_tee::{generate_and_attest, ItaConfig};
+Version 2 contains:
 
-let config = ItaConfig {
-    api_key: std::env::var("ITA_API_KEY")?,
-    ..ItaConfig::default()
+| Field | Meaning |
+|---|---|
+| `schema_version` | Required integer `2` |
+| `ita_token` | ITA-signed appraisal JWT |
+| `jwks_url` | Regional ITA JWKS location used when generated |
+| `mrtd`, `tcb_status`, `tcb_date`, `advisory_ids` | Public copies checked against authenticated token claims |
+| `evidence` | Portable low-level evidence, including Azure runtime JSON where needed |
+| `raw_quote` | Base64 raw quote |
+| `verifier_nonce_*` | ITA verifier nonce material |
+| `public_values` | Values from which the 32-byte commitment is derived |
+
+The artifact does not store a duplicate `runtime_data` value or a structured
+`report_data` object. Missing, version-1, or unknown schema versions are
+rejected. Legacy artifacts must be verified with the library version that
+created them.
+
+## Confidential Space
+
+Enable `confidential-space`:
+
+```toml
+[dependencies]
+livy-tee = { version = "0.1", features = ["confidential-space"] }
+```
+
+Inside a Confidential Space workload:
+
+```rust,no_run
+use livy_tee::{
+    ConfidentialSpace, ConfidentialSpaceAttesterMode, ConfidentialSpaceConfig,
+    PublicValues,
 };
 
-let attested = generate_and_attest(&rd.to_bytes(), &config).await?;
-println!("mrtd = {}", attested.mrtd);
-println!("tcb_status = {}", attested.tcb_status);
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let mut values = PublicValues::new();
+values.commit(&"input")?.commit(&"output")?;
+
+let config = ConfidentialSpaceConfig::new(
+    "https://relying-party.example",
+    ConfidentialSpaceAttesterMode::Dual,
+);
+let client = ConfidentialSpace::new(config);
+let artifact = client.attest(values).await?;
+# let _ = artifact;
+# Ok(())
+# }
 ```
 
-If you need raw token-side binding inspection without authenticating the JWT:
+The client connects to `/run/container_launcher/teeserver.sock` and requests
+OIDC tokens from:
 
-```rust
-use livy_tee::unauthenticated_report_data_hash_from_token;
+- Google: `POST /v1/token`
+- Intel: `POST /v1/intel/token`
 
-if let Some(binding_hash) = unauthenticated_report_data_hash_from_token(&ita_token)? {
-    println!("{}", hex::encode(binding_hash));
+Each request has exactly one nonce:
+
+```json
+{
+  "audience": "https://relying-party.example",
+  "token_type": "OIDC",
+  "nonces": ["BASE64URL_NO_PAD_SHA256_PUBLIC_VALUES"]
 }
 ```
 
-That helper is for low-level inspection only. It does not verify the JWT.
+The relying party must supply both the expected audience and exact image
+digest:
+
+```rust,no_run
+use livy_tee::ConfidentialSpaceVerificationPolicy;
+
+# async fn example(
+#     artifact: livy_tee::ConfidentialSpaceAttestation,
+# ) -> Result<(), Box<dyn std::error::Error>> {
+let policy = ConfidentialSpaceVerificationPolicy::new(
+    "https://relying-party.example",
+    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+);
+let report = artifact.verify(&policy).await?;
+report
+    .require_success()
+    .map_err(|report| format!("verification failed: {report:?}"))?;
+# Ok(())
+# }
+```
+
+Strict verification requires:
+
+- a valid OIDC signature, expiration, not-before time, fixed issuer, and exact
+  audience;
+- exactly one `eat_nonce` equal to the encoded commitment;
+- the exact verifier-supplied `sha256:…` container image digest;
+- `swname == "CONFIDENTIAL_SPACE"`;
+- a production image, Secure Boot, `GCP_INTEL_TDX`, `STABLE` support, and
+  memory monitoring disabled;
+- empty `cmd_override` and `env_override`.
+
+Dual mode independently verifies both tokens and then requires equality of
+their common workload and posture claims, including the full signed container
+environment. Image-defined environment variables are allowed because valid
+Confidential Space tokens normally include them; the pinned image must retain
+the default `allow_env_override=false` launch policy. A partial dual result is
+never returned by generation, and a missing or disagreeing token fails
+`all_passed()`.
+
+See [Confidential Space support](docs/confidential-space.md) for the complete
+contract and a digest-pinned TDX deployment walkthrough. Runnable examples are
+provided for the
+[workload](examples/confidential_space_attest.rs) and
+[relying party](examples/confidential_space_verify.rs), together with a
+[production-oriented Dockerfile](examples/confidential-space/Dockerfile).
+
+## Low-level quote API
+
+```rust,no_run
+let hardware_reportdata = [0x42_u8; 64];
+let evidence = livy_tee::generate_evidence(&hardware_reportdata)?;
+let extracted = livy_tee::extract_report_data(&evidence)?;
+assert_eq!(extracted, hardware_reportdata);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Local extraction parses quote fields; it does not validate the DCAP signature
+chain. Use ITA appraisal or another trusted quote verifier for authenticity.
+
+## Public values
+
+```rust
+use livy_tee::PublicValues;
+
+let mut values = PublicValues::new();
+values.commit(&123_u64).unwrap();
+values.commit_raw(b"bytes").unwrap();
+
+let commitment = values.commitment_hash();
+assert!(values.verify_commitment(&commitment));
+
+let first: u64 = values.read().unwrap();
+let second = values.read_raw().unwrap();
+assert_eq!(first, 123);
+assert_eq!(second, b"bytes");
+```
+
+`AttestBuilder::commit_hashed` hashes the `serde_json` representation of a
+value before storing the 32-byte digest. It is useful when the original value
+must not be embedded in the public artifact.
 
 ## Development
 
 ```bash
-# Local development without hardware
-cargo build --features mock-tee
+cargo fmt --check
 cargo test --features mock-tee
-
-# Full library tests
-cargo test
 cargo test --features mock-tee,ita-verify
-
-# Rustdoc
-cargo rustdoc --all-features --lib -- -D missing-docs
+cargo test --features ita-verify
+cargo test --features confidential-space
+cargo test --all-features
+cargo clippy --all-targets --all-features
 ```
 
-In `mock-tee` mode, evidence generation returns a correctly-shaped stub quote.
-Real ITA appraisal is skipped.
+The live hardware tests are ignored by default. Run them on a TDX guest with
+`ITA_API_KEY` configured:
 
-## Architecture
-
-```text
-livy-tee
-├── bind/
-│   ├── mod.rs            High-level API entry point
-│   ├── attestation.rs    Livy, AttestBuilder, Attestation, verification
-│   └── local.rs          Local quote/public-values binding helpers
-├── report.rs             ReportData wire format + build_id helpers
-├── evidence.rs           Evidence type + portable transport
-├── generate/
-│   ├── mod.rs            generate_evidence, binary_hash
-│   ├── azure.rs          Azure vTPM/paravisor path
-│   ├── tsm.rs            Linux TSM configfs path
-│   └── mock.rs           Mock quote stub
-├── attest.rs             generate_and_attest
-└── verify/
-    ├── extract.rs        Local quote field extraction
-    ├── codec.rs          Shared decoding helpers
-    └── ita.rs            Intel Trust Authority helpers
+```bash
+cargo test --features ita-verify --test tdx_integration -- \
+    --ignored --test-threads=1
 ```
 
 ## License
 
-livy-tee is released under the [MIT License](LICENSE).
+MIT

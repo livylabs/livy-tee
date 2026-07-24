@@ -30,8 +30,6 @@ pub struct AttestedEvidence {
     pub tcb_date: Option<String>,
     /// Advisory IDs reported by Intel Trust Authority. Empty in `mock-tee` mode.
     pub advisory_ids: Vec<String>,
-    /// The original 64-byte runtime_data (our ReportData struct).
-    pub runtime_data: [u8; 64],
     /// Decoded verifier nonce value bytes. Zeroed in `mock-tee` mode.
     pub nonce_val: Vec<u8>,
     /// Decoded verifier nonce issued-at bytes. Zeroed in `mock-tee` mode.
@@ -42,7 +40,7 @@ pub struct AttestedEvidence {
 
 /// Generate evidence and appraise it with Intel Trust Authority.
 pub async fn generate_and_attest(
-    user_data: &[u8; 64],
+    user_data: &[u8; 32],
     #[cfg_attr(feature = "mock-tee", allow(unused_variables))] config: &ItaConfig,
 ) -> Result<AttestedEvidence, AttestError> {
     use sha2::{Digest, Sha512};
@@ -78,7 +76,6 @@ pub async fn generate_and_attest(
             tcb_status: String::new(),
             tcb_date: None,
             advisory_ids: Vec::new(),
-            runtime_data: *user_data,
             nonce_val,
             nonce_iat,
             nonce_signature,
@@ -104,7 +101,6 @@ pub async fn generate_and_attest(
             tcb_status: claims.tcb_status().to_string(),
             tcb_date: claims.tcb_date().map(str::to_string),
             advisory_ids: claims.advisory_ids().to_vec(),
-            runtime_data: *user_data,
             nonce_val,
             nonce_iat,
             nonce_signature,

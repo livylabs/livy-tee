@@ -14,6 +14,7 @@
 //! | *(none)*     | yes     | Runtime provider auto-detection: TSM configfs or Azure vTPM/paravisor |
 //! | `mock-tee`   | no      | Correctly-shaped 632-byte stub — no hardware required |
 //! | `ita-verify` | no      | Intel Trust Authority REST API verification |
+//! | `confidential-space` | no | Google Confidential Space launcher and OIDC verification |
 
 mod cloud;
 mod error;
@@ -21,7 +22,6 @@ mod evidence;
 mod generate;
 mod parser;
 mod public_values;
-mod report;
 mod types;
 mod verify;
 
@@ -29,18 +29,19 @@ mod verify;
 mod attest;
 #[cfg(feature = "ita-verify")]
 mod bind;
+#[cfg(feature = "confidential-space")]
+mod confidential_space;
 
 // ── Core types ─────────────────────────────────────────────────────────────
 pub use cloud::{detect_cloud_provider, CloudProvider};
-pub use error::{BuildIdError, EvidenceError, ExtractError, GenerateError, PublicValuesError};
+pub use error::{EvidenceError, ExtractError, GenerateError, PublicValuesError};
 pub use evidence::{Evidence, PortableEvidence, QUOTE_MIN_LEN};
 pub use parser::parse;
 pub use public_values::{entry_hash, PublicValues};
-pub use report::{build_id_from_binary, build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION};
 pub use types::Config;
 
 // ── Generation ─────────────────────────────────────────────────────────────
-pub use generate::{binary_hash, generate_evidence};
+pub use generate::generate_evidence;
 
 // ── Verification — local (always available) ────────────────────────────────
 pub use verify::extract::{extract_mrtd, extract_report_data};
@@ -59,8 +60,17 @@ pub use attest::{generate_and_attest, AttestedEvidence};
 #[cfg(feature = "ita-verify")]
 pub use bind::{
     verify_quote, verify_quote_with_public_values, AttestBuilder, Attestation,
-    AttestationVerification, AttestationVerificationPolicy, Livy,
+    AttestationVerification, AttestationVerificationPolicy, Livy, ATTESTATION_SCHEMA_VERSION,
 };
 
 #[cfg(feature = "ita-verify")]
 pub use verify::ita::unauthenticated_report_data_hash_from_token;
+
+#[cfg(feature = "confidential-space")]
+pub use confidential_space::{
+    ConfidentialSpace, ConfidentialSpaceAttestation, ConfidentialSpaceAttesterMode,
+    ConfidentialSpaceConfig, ConfidentialSpaceError, ConfidentialSpaceIssuer,
+    ConfidentialSpaceIssuerVerification, ConfidentialSpaceTokens, ConfidentialSpaceVerification,
+    ConfidentialSpaceVerificationPolicy, CONFIDENTIAL_SPACE_ATTESTATION_SCHEMA_VERSION,
+    CONFIDENTIAL_SPACE_GOOGLE_ISSUER, CONFIDENTIAL_SPACE_INTEL_ISSUER,
+};

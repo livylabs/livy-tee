@@ -27,11 +27,10 @@
 //! raw_quote_b64_prefix: BAACAIEAAAAAAAAAk5pyM/ecTKmUCg2z
 //! mrtd: 273828c46252fcbdd8ad2dd907130222b03466d52a2911d70c1a5950895d6bd1ae451d382d5a9b1b4c0ed0e5ae9a3dbd
 //! tcb_status: UpToDate
-//! verify(): jwt=true token_binding=true public_values=true
+//! verify(): jwt=true token_binding=true
 //! verify_binding(): skipped on Azure; use verify_fresh() for strict bundled-evidence authentication
 //! committed_input: 123
 //! committed_output: 369
-//! application_nonce: 1
 //! ```
 
 use std::error::Error;
@@ -49,7 +48,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut builder = livy.attest();
     builder.commit(&input).commit(&output);
-    builder.nonce(1);
 
     let attestation = builder.finalize().await?;
 
@@ -80,10 +78,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!("mrtd: {}", attestation.mrtd);
         println!("tcb_status: {}", report.tcb_status);
         println!(
-            "verify(): jwt={} token_binding={} public_values={}",
-            report.jwt_signature_and_expiry_valid,
-            report.token_report_data_matches,
-            report.public_values_bound
+            "verify(): jwt={} token_binding={}",
+            report.jwt_signature_and_expiry_valid, report.token_report_data_matches
         );
 
         if provider != Some(CloudProvider::Azure) {
@@ -103,7 +99,5 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     println!("committed_input: {committed_input}");
     println!("committed_output: {committed_output}");
-    println!("application_nonce: {}", attestation.report_data.nonce);
-
     Ok(())
 }

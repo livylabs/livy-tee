@@ -56,12 +56,10 @@ mod tests {
     #[cfg(feature = "mock-tee")]
     use crate::generate::generate_evidence;
     #[cfg(feature = "mock-tee")]
-    use crate::report::ReportData;
-
     #[cfg(feature = "mock-tee")]
     #[test]
     fn extract_roundtrip_mock() {
-        let user_data = ReportData::new([1u8; 32], [2u8; 8], 1, 0, 99).to_bytes();
+        let user_data = [1u8; 64];
         let evidence = generate_evidence(&user_data).unwrap();
         let extracted = extract_report_data(&evidence).unwrap();
         assert_eq!(extracted, user_data);

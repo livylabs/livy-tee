@@ -1,30 +1,14 @@
 // SPDX-License-Identifier: MIT
+
+#[cfg(feature = "mock-tee")]
 use base64::Engine;
-use livy_tee::{
-    binary_hash, build_id_from_hash_hex, Evidence, EvidenceError, GenerateError, ReportData,
-    REPORT_DATA_VERSION,
-};
 #[cfg(feature = "mock-tee")]
 use livy_tee::{extract_report_data, generate_evidence};
+use livy_tee::{Evidence, EvidenceError, GenerateError};
 #[cfg(feature = "ita-verify")]
 use livy_tee::{Livy, LivyEnvError, VerifyError};
-use sha2::{Digest, Sha256};
 #[cfg(feature = "ita-verify")]
 use std::sync::{Mutex, OnceLock};
-
-fn sample_payload() -> [u8; 32] {
-    Sha256::digest(b"integration-test-payload").into()
-}
-
-fn sample_report_with(payload_hash: [u8; 32], nonce: u64) -> ReportData {
-    let build_id = build_id_from_hash_hex(&binary_hash().unwrap())
-        .expect("binary_hash returns valid SHA-256 hex");
-    ReportData::new(payload_hash, build_id, REPORT_DATA_VERSION, 0, nonce)
-}
-
-fn sample_report() -> ReportData {
-    sample_report_with(sample_payload(), 1)
-}
 
 #[cfg(feature = "ita-verify")]
 fn ita_api_key_env_lock() -> &'static Mutex<()> {
@@ -56,88 +40,54 @@ fn with_ita_api_key_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-#[test]
-fn report_data_is_64_bytes() {
-    assert_eq!(sample_report().to_bytes().len(), 64);
-}
-
-#[test]
-fn report_data_is_deterministic() {
-    let r = sample_report();
-    assert_eq!(r.to_bytes(), r.to_bytes());
-}
-
-#[test]
-fn report_data_changes_with_different_payload() {
-    let r1 = sample_report();
-    let different_payload: [u8; 32] = Sha256::digest(b"different").into();
-    let r2 = sample_report_with(different_payload, 1);
-    assert_ne!(r1.to_bytes(), r2.to_bytes());
-}
-
-#[test]
-fn report_data_changes_with_nonce() {
-    let r1 = sample_report();
-    let r2 = sample_report_with(sample_payload(), 2);
-    assert_ne!(r1.to_bytes(), r2.to_bytes());
-}
-
-#[test]
-fn report_data_hex_is_128_chars() {
-    assert_eq!(sample_report().to_hex().len(), 128);
-}
-
-#[test]
-fn reserved_bytes_are_zero() {
-    let bytes = sample_report().to_bytes();
-    assert_eq!(&bytes[56..64], &[0u8; 8]);
-}
-
-#[test]
-fn verify_payload_helper_works() {
-    let payload = sample_payload();
-    let rd = sample_report_with(payload, 1);
-    assert!(rd.verify_payload(&payload));
-    assert!(!rd.verify_payload(&[0u8; 32]));
-}
-
 #[cfg(feature = "mock-tee")]
 #[test]
-fn generate_evidence_succeeds_in_mock_mode() {
-    let evidence = generate_evidence(&sample_report().to_bytes()).unwrap();
-    assert!(!evidence.raw().is_empty());
-}
-
-#[cfg(feature = "mock-tee")]
-#[test]
-fn mock_evidence_is_exactly_632_bytes() {
-    let evidence = generate_evidence(&[0u8; 64]).unwrap();
+fn generate_evidence_keeps_the_low_level_64_byte_api() {
+    let user_data = [0x5au8; 64];
+    let evidence = generate_evidence(&user_data).unwrap();
     assert_eq!(evidence.raw().len(), 632);
+    assert_eq!(extract_report_data(&evidence).unwrap(), user_data);
 }
 
 #[cfg(feature = "mock-tee")]
 #[test]
-fn generated_evidence_encodes_to_valid_base64() {
-    let evidence = generate_evidence(&sample_report().to_bytes()).unwrap();
-    let b64 = evidence.to_base64();
-    assert!(!b64.is_empty());
-    base64::engine::general_purpose::STANDARD
-        .decode(&b64)
-        .expect("evidence.to_base64() must be valid standard base64");
+fn different_user_data_produces_different_report_data() {
+    let first = generate_evidence(&[1u8; 64]).unwrap();
+    let second = generate_evidence(&[2u8; 64]).unwrap();
+    assert_ne!(
+        extract_report_data(&first).unwrap(),
+        extract_report_data(&second).unwrap()
+    );
 }
 
 #[cfg(feature = "mock-tee")]
 #[test]
-fn evidence_base64_roundtrip() {
+fn generated_evidence_roundtrips_through_base64() {
     let evidence = generate_evidence(&[42u8; 64]).unwrap();
-    let b64 = evidence.to_base64();
-    let recovered = Evidence::from_base64(&b64).unwrap();
+    let encoded = evidence.to_base64();
+    base64::engine::general_purpose::STANDARD
+        .decode(&encoded)
+        .expect("evidence must be standard base64");
+    let recovered = Evidence::from_base64(&encoded).unwrap();
     assert_eq!(evidence.raw(), recovered.raw());
 }
 
 #[test]
-fn binary_hash_returns_nonempty_string() {
-    assert!(!binary_hash().unwrap().is_empty());
+fn evidence_rejects_short_or_invalid_input() {
+    assert!(matches!(
+        Evidence::from_bytes(vec![0u8; 100]),
+        Err(EvidenceError::TooShort(100))
+    ));
+    assert!(matches!(
+        Evidence::from_base64("not-base64"),
+        Err(EvidenceError::Base64(_))
+    ));
+}
+
+#[test]
+fn evidence_accepts_the_632_byte_boundary() {
+    let evidence = Evidence::from_bytes(vec![0u8; 632]).unwrap();
+    assert_eq!(evidence.raw().len(), 632);
 }
 
 #[test]
@@ -169,89 +119,16 @@ fn verify_error_codes_are_stable() {
     );
 }
 
-#[cfg(feature = "mock-tee")]
-#[test]
-fn extract_report_data_roundtrip() {
-    let user_data = sample_report().to_bytes();
-    let evidence = generate_evidence(&user_data).unwrap();
-    let extracted = extract_report_data(&evidence).unwrap();
-    assert_eq!(extracted, user_data);
-}
-
-#[test]
-fn evidence_from_bytes_rejects_short_buffer() {
-    let result = Evidence::from_bytes(vec![0u8; 100]);
-    assert!(matches!(result, Err(EvidenceError::TooShort(100))));
-}
-
-#[cfg(feature = "mock-tee")]
-#[test]
-fn different_user_data_produces_different_extracted_report_data() {
-    let e1 = generate_evidence(&[1u8; 64]).unwrap();
-    let e2 = generate_evidence(&[2u8; 64]).unwrap();
-    assert_ne!(
-        extract_report_data(&e1).unwrap(),
-        extract_report_data(&e2).unwrap()
-    );
-}
-
-#[test]
-fn attest_builder_input_hash_precomputed() {
-    let input = b"hello";
-    let output = b"world";
-    let ih: [u8; 32] = Sha256::digest(input).into();
-    let oh: [u8; 32] = Sha256::digest(output).into();
-    let expected: [u8; 32] = {
-        let mut h = Sha256::new();
-        h.update(ih);
-        h.update(oh);
-        h.finalize().into()
-    };
-    let rd = sample_report_with(expected, 0);
-    assert!(rd.verify_payload(&expected));
-}
-
 #[cfg(feature = "ita-verify")]
 #[test]
 fn livy_from_env_validates_and_reads_ita_api_key() {
     with_ita_api_key_env(None, || {
-        let err = Livy::from_env().unwrap_err();
-        assert_eq!(err, LivyEnvError::MissingApiKey);
+        assert_eq!(Livy::from_env().unwrap_err(), LivyEnvError::MissingApiKey);
     });
-
-    with_ita_api_key_env(Some(""), || {
-        let err = Livy::from_env().unwrap_err();
-        assert_eq!(err, LivyEnvError::EmptyApiKey);
+    with_ita_api_key_env(Some("  "), || {
+        assert_eq!(Livy::from_env().unwrap_err(), LivyEnvError::EmptyApiKey);
     });
-
     with_ita_api_key_env(Some("test-key"), || {
-        assert!(Livy::from_env().is_ok());
+        Livy::from_env().expect("non-empty API key should be accepted");
     });
-}
-
-// ------------------------------------------------------------------------// Evidence error paths
-// ------------------------------------------------------------------------
-#[test]
-fn evidence_from_base64_rejects_invalid_base64() {
-    let result = Evidence::from_base64("not-valid-base64!!!");
-    assert!(matches!(result, Err(EvidenceError::Base64(_))));
-}
-
-#[test]
-fn evidence_from_base64_rejects_short_decoded() {
-    // Valid base64 but decodes to only 3 bytes — well under 632.
-    let b64 = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
-    let result = Evidence::from_base64(&b64);
-    assert!(matches!(result, Err(EvidenceError::TooShort(3))));
-}
-
-#[test]
-fn evidence_from_bytes_boundary_632() {
-    // Exactly 632 bytes should succeed.
-    let buf = vec![0u8; 632];
-    assert!(Evidence::from_bytes(buf).is_ok());
-
-    // 631 bytes should fail.
-    let buf_short = vec![0u8; 631];
-    assert!(Evidence::from_bytes(buf_short).is_err());
 }

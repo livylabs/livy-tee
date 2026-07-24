@@ -12,9 +12,14 @@ pub(crate) fn decode_standard_base64(name: &str, value: &str) -> Result<Vec<u8>,
         .map_err(|e| format!("{name} base64: {e}"))
 }
 
-pub(crate) fn decode_standard_base64_array_64(name: &str, value: &str) -> Result<[u8; 64], String> {
+pub(crate) fn decode_standard_base64_array_32(name: &str, value: &str) -> Result<[u8; 32], String> {
     let bytes = decode_standard_base64(name, value)?;
-    to_array_64(name, bytes)
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        format!(
+            "{name} has unexpected length: {} bytes (expected 32)",
+            bytes.len()
+        )
+    })
 }
 
 pub(crate) fn decode_claim_array_64(name: &str, value: &str) -> Result<[u8; 64], String> {

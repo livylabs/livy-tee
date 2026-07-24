@@ -1,27 +1,29 @@
 // SPDX-License-Identifier: MIT
-//! High-level attestation builder and verifier API.
+//! High-level instance attestation builder and verifier API.
 
 use super::local::{
-    nonce_and_runtime_hash, verify_quote_report_data_binding, verify_quote_with_public_values,
+    nonce_and_commitment_hash, verify_quote_report_data_binding, verify_quote_with_public_values,
 };
 use crate::{
     error::{AttestError, LivyEnvError, PublicValuesError, VerifyError},
     evidence::Evidence,
-    generate::binary_hash,
     public_values::PublicValues,
-    report::{build_id_from_hash_hex, ReportData, REPORT_DATA_VERSION},
     verify::{
-        codec::{decode_standard_base64, decode_standard_base64_array_64},
+        codec::decode_standard_base64,
         ita::{
             appraise_evidence_authenticated, default_issuer_for_jwks_url, verify_attestation_token,
             ItaConfig, VerifierNonce, DEFAULT_JWKS_URL,
         },
     },
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
 
-/// Policy for [`Attestation::verify_with_policy`] and [`Attestation::verify_fresh_with_policy`].
+/// The only supported serialized [`Attestation`] schema version.
+pub const ATTESTATION_SCHEMA_VERSION: u32 = 2;
+
+/// Policy for [`Attestation::verify_with_policy`] and
+/// [`Attestation::verify_fresh_with_policy`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct AttestationVerificationPolicy {
@@ -44,11 +46,10 @@ pub struct AttestationVerificationPolicy {
     /// Matching is case-insensitive and order-insensitive.
     pub expected_advisory_ids: Option<Vec<String>>,
     /// Optional expected MRTD, as a 96-character hex string.
+    ///
+    /// MRTD is a platform launch measurement. It is not, by itself, a
+    /// measurement of the application running in the VM.
     pub expected_mrtd: Option<String>,
-    /// Optional expected build ID from [`ReportData::build_id`].
-    pub expected_build_id: Option<[u8; 8]>,
-    /// Optional expected application nonce from [`ReportData::nonce`].
-    pub expected_nonce: Option<u64>,
 }
 
 impl Default for AttestationVerificationPolicy {
@@ -61,20 +62,11 @@ impl Default for AttestationVerificationPolicy {
             accepted_tcb_statuses: vec!["UpToDate".to_string()],
             expected_advisory_ids: None,
             expected_mrtd: None,
-            expected_build_id: None,
-            expected_nonce: None,
         }
     }
 }
 
-/// Diagnostic report returned by attestation verification.
-///
-/// Read this in three groups:
-/// - token trust: `jwt_signature_and_expiry_valid`, `token_verification_error`
-/// - binding checks: `token_report_data_matches`, `quote_report_data_matches`,
-///   `runtime_data_matches_report`, `public_values_bound`
-/// - policy / identity checks: `*_matches_token`, `tcb_status_allowed`,
-///   `expected_*`
+/// Diagnostic report returned by instance attestation verification.
 ///
 /// `Ok(report)` is still diagnostic. Use [`require_success`](Self::require_success)
 /// or [`all_passed`](Self::all_passed) for a strict verdict.
@@ -85,21 +77,15 @@ pub struct AttestationVerification {
     /// `true` when the ITA JWT passed signature and registered time validation.
     pub jwt_signature_and_expiry_valid: bool,
     /// Why token validation failed, when it failed non-fatally.
-    ///
-    /// When this is `Some(_)`, the report still describes local checks, but the
-    /// token-derived checks should be treated as untrusted.
     pub token_verification_error: Option<VerifyError>,
-    /// `true` when the signed token binding matches this attestation's nonce and runtime data.
+    /// `true` when the signed token binding matches the verifier nonce and
+    /// `SHA-256(public_values)` commitment.
     pub token_report_data_matches: bool,
-    /// Local raw-quote binding result, when this attestation format exposes it portably.
+    /// Local raw-quote binding result, when this attestation format exposes it.
     ///
-    /// `None` means this check is not available for the stored artifact format,
-    /// which is the normal Azure case.
+    /// `None` is the normal Azure case because its stored quote does not expose
+    /// the same portable binding surface.
     pub quote_report_data_matches: Option<bool>,
-    /// `true` when the stored `runtime_data` decodes to the stored `report_data`.
-    pub runtime_data_matches_report: bool,
-    /// `true` when `SHA-256(public_values)` matches `report_data.payload_hash`.
-    pub public_values_bound: bool,
     /// `true` when the public `mrtd` field matches the verified token claim.
     pub mrtd_matches_token: bool,
     /// `true` when the public `tcb_status` field matches the verified token claim.
@@ -118,40 +104,21 @@ pub struct AttestationVerification {
     pub advisory_ids: Vec<String>,
     /// MRTD extracted from the verified token.
     pub mrtd: String,
-    /// Result of comparing the token advisory IDs to the policy's expected set.
-    ///
-    /// `None` means the policy did not pin advisory IDs.
+    /// Result of comparing token advisory IDs to the policy's expected set.
     pub expected_advisory_ids_matches: Option<bool>,
-    /// Result of comparing the token MRTD to the policy's expected MRTD.
-    ///
-    /// `None` means the policy did not pin MRTD.
+    /// Result of comparing token MRTD to the policy's expected MRTD.
     pub expected_mrtd_matches: Option<bool>,
-    /// Result of comparing the report build ID to the policy's expected build ID.
-    ///
-    /// `None` means the policy did not pin build ID.
-    pub expected_build_id_matches: Option<bool>,
-    /// Result of comparing the report nonce to the policy's expected nonce.
-    ///
-    /// `None` means the policy did not pin an application nonce.
-    pub expected_nonce_matches: Option<bool>,
     /// Result of fresh ITA appraisal of the bundled evidence, when performed.
-    ///
-    /// `None` means verification was run without a fresh ITA reappraisal.
     pub bundled_evidence_authenticated: Option<bool>,
 }
 
 impl AttestationVerification {
     /// Return `true` when every required verification check passed.
-    ///
-    /// Fields that are `None` because the check was not requested or not
-    /// applicable are treated as pass-through.
     #[must_use]
     pub fn all_passed(&self) -> bool {
         self.jwt_signature_and_expiry_valid
             && self.token_report_data_matches
             && self.quote_report_data_matches.unwrap_or(true)
-            && self.runtime_data_matches_report
-            && self.public_values_bound
             && self.mrtd_matches_token
             && self.tcb_status_matches_token
             && self.tcb_date_matches_token
@@ -159,14 +126,10 @@ impl AttestationVerification {
             && self.tcb_status_allowed
             && self.expected_advisory_ids_matches.unwrap_or(true)
             && self.expected_mrtd_matches.unwrap_or(true)
-            && self.expected_build_id_matches.unwrap_or(true)
-            && self.expected_nonce_matches.unwrap_or(true)
             && self.bundled_evidence_authenticated.unwrap_or(true)
     }
 
     /// Enforce the strict verification contract while preserving diagnostics.
-    ///
-    /// Returns `Ok(())` only when [`all_passed`](Self::all_passed) is `true`.
     pub fn require_success(&self) -> Result<(), &Self> {
         if self.all_passed() {
             Ok(())
@@ -176,7 +139,7 @@ impl AttestationVerification {
     }
 }
 
-/// Client entry point for TDX-backed attestation.
+/// Client entry point for instance-based TDX attestation.
 #[derive(Debug, Clone)]
 pub struct Livy {
     config: ItaConfig,
@@ -212,28 +175,21 @@ impl Livy {
         AttestBuilder {
             config: &self.config,
             public_values: PublicValues::new(),
-            nonce: 0,
             pending_public_values_error: None,
         }
     }
 }
 
-/// Builder for a single TDX attestation.
-///
-/// Obtained from [`Livy::attest`].
+/// Builder for a single instance-based TDX attestation.
 #[derive(Debug, Clone)]
 pub struct AttestBuilder<'a> {
     config: &'a ItaConfig,
     public_values: PublicValues,
-    nonce: u64,
     pending_public_values_error: Option<PublicValuesError>,
 }
 
 impl<'a> AttestBuilder<'a> {
     /// Commit a typed value as a public output.
-    ///
-    /// Values are stored in plain text. Use [`commit_hashed`](Self::commit_hashed)
-    /// when a value should be bound by hash only.
     pub fn commit<T: Serialize>(&mut self, value: &T) -> &mut Self {
         let result = self.public_values.commit(value).map(|_| ());
         self.record_public_values_result(result);
@@ -260,12 +216,6 @@ impl<'a> AttestBuilder<'a> {
         self
     }
 
-    /// Set the application nonce stored in [`ReportData::nonce`].
-    pub fn nonce(&mut self, n: u64) -> &mut Self {
-        self.nonce = n;
-        self
-    }
-
     /// Generate a TDX quote and obtain an ITA attestation token.
     pub async fn finalize(self) -> Result<Attestation, AttestError> {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -274,16 +224,11 @@ impl<'a> AttestBuilder<'a> {
             return Err(AttestError::PublicValues(err));
         }
 
-        let payload_hash = self.public_values.commitment_hash();
-
-        let binary_hash_hex = binary_hash().map_err(AttestError::Generate)?;
-        let build_id = build_id_from_hash_hex(&binary_hash_hex)?;
-        let rd = ReportData::new(payload_hash, build_id, REPORT_DATA_VERSION, 0, self.nonce);
-        let rd_bytes = rd.to_bytes();
-
-        let attested = crate::attest::generate_and_attest(&rd_bytes, self.config).await?;
+        let commitment = self.public_values.commitment_hash();
+        let attested = crate::attest::generate_and_attest(&commitment, self.config).await?;
 
         Ok(Attestation {
+            schema_version: ATTESTATION_SCHEMA_VERSION,
             ita_token: attested.ita_token,
             jwks_url: self.config.default_jwks_url(),
             mrtd: attested.mrtd,
@@ -292,11 +237,9 @@ impl<'a> AttestBuilder<'a> {
             advisory_ids: attested.advisory_ids,
             evidence: attested.evidence.to_transport_string(),
             raw_quote: BASE64.encode(attested.evidence.raw()),
-            runtime_data: BASE64.encode(attested.runtime_data),
             verifier_nonce_val: BASE64.encode(&attested.nonce_val),
             verifier_nonce_iat: BASE64.encode(&attested.nonce_iat),
             verifier_nonce_signature: BASE64.encode(&attested.nonce_signature),
-            report_data: rd,
             public_values: self.public_values,
         })
     }
@@ -310,61 +253,112 @@ impl<'a> AttestBuilder<'a> {
     }
 }
 
-/// A TDX attestation plus its committed public values.
+/// A version-2 instance TDX attestation plus its committed public values.
 ///
-/// `public_values` are public. Use [`AttestBuilder::commit_hashed`] for values
-/// that should be bound by hash rather than stored in plain text.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The only application-controlled quote input is
+/// `SHA-256(public_values)`. MRTD describes the VM launch measurement and does
+/// not independently identify the application running inside the instance.
+#[derive(Debug, Clone, Serialize)]
 pub struct Attestation {
+    /// Required artifact schema version. Must equal [`ATTESTATION_SCHEMA_VERSION`].
+    pub schema_version: u32,
     /// ITA-signed JWT.
     pub ita_token: String,
     /// JWKS endpoint that matches the ITA region used to mint `ita_token`.
     pub jwks_url: String,
-    /// Hex-encoded MRTD (96 chars = 48 bytes).
+    /// Hex-encoded platform launch MRTD (96 chars = 48 bytes).
     pub mrtd: String,
     /// TCB status from Intel Trust Authority.
     pub tcb_status: String,
     /// Optional TCB assessment date from Intel Trust Authority claims.
     pub tcb_date: Option<String>,
     /// Advisory IDs reported by Intel Trust Authority.
-    #[serde(default)]
     pub advisory_ids: Vec<String>,
     /// Portable low-level evidence artifact.
-    ///
-    /// This is the self-contained evidence transport string produced by
-    /// `Evidence::to_transport_string()`. On Azure it includes the runtime JSON
-    /// needed to reappraise the bundled evidence with ITA.
     pub evidence: String,
     /// Base64-encoded raw DCAP quote.
     pub raw_quote: String,
-    /// Base64-encoded original 64-byte ReportData struct.
-    pub runtime_data: String,
     /// Base64-encoded verifier nonce value bytes.
     pub verifier_nonce_val: String,
     /// Base64-encoded verifier nonce issued-at bytes.
     pub verifier_nonce_iat: String,
     /// Base64-encoded verifier nonce signature bytes.
     pub verifier_nonce_signature: String,
-    /// Structured REPORTDATA parsed from `runtime_data`.
-    pub report_data: ReportData,
-    /// The committed public values — read with `.public_values.read::<T>()?`.
+    /// The committed public values.
     pub public_values: PublicValues,
 }
 
+#[derive(Deserialize)]
+struct AttestationWire {
+    #[serde(default)]
+    schema_version: Option<u32>,
+    ita_token: String,
+    jwks_url: String,
+    mrtd: String,
+    tcb_status: String,
+    tcb_date: Option<String>,
+    #[serde(default)]
+    advisory_ids: Vec<String>,
+    evidence: String,
+    raw_quote: String,
+    verifier_nonce_val: String,
+    verifier_nonce_iat: String,
+    verifier_nonce_signature: String,
+    public_values: PublicValues,
+}
+
+impl<'de> Deserialize<'de> for Attestation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AttestationWire::deserialize(deserializer)?;
+        let version = wire.schema_version.ok_or_else(|| {
+            D::Error::custom(
+                "unsupported legacy attestation artifact: schema_version is required; only version 2 is supported",
+            )
+        })?;
+        if version != ATTESTATION_SCHEMA_VERSION {
+            return Err(D::Error::custom(format!(
+                "unsupported attestation schema version {version}; only version 2 is supported"
+            )));
+        }
+
+        Ok(Self {
+            schema_version: version,
+            ita_token: wire.ita_token,
+            jwks_url: wire.jwks_url,
+            mrtd: wire.mrtd,
+            tcb_status: wire.tcb_status,
+            tcb_date: wire.tcb_date,
+            advisory_ids: wire.advisory_ids,
+            evidence: wire.evidence,
+            raw_quote: wire.raw_quote,
+            verifier_nonce_val: wire.verifier_nonce_val,
+            verifier_nonce_iat: wire.verifier_nonce_iat,
+            verifier_nonce_signature: wire.verifier_nonce_signature,
+            public_values: wire.public_values,
+        })
+    }
+}
+
 impl Attestation {
-    /// Hex-encoded 32-byte commitment hash.
+    /// Hex-encoded 32-byte public-values commitment.
     #[must_use]
     pub fn payload_hash_hex(&self) -> String {
-        hex::encode(self.report_data.payload_hash)
+        hex::encode(self.public_values.commitment_hash())
+    }
+
+    /// Return the 32-byte public-values commitment bound by this artifact.
+    #[must_use]
+    pub fn commitment_hash(&self) -> [u8; 32] {
+        self.public_values.commitment_hash()
     }
 
     /// Verify that `public_values` are bound to the raw quote bytes.
-    ///
-    /// This is a local check. It does not verify the ITA token or policy.
     pub fn verify_binding(&self) -> Result<bool, crate::ExtractError> {
         verify_quote_with_public_values(
             &self.raw_quote,
-            &self.runtime_data,
             &self.verifier_nonce_val,
             &self.verifier_nonce_iat,
             &self.public_values,
@@ -372,9 +366,6 @@ impl Attestation {
     }
 
     /// Verify the ITA token and local bindings against the default policy.
-    ///
-    /// This does not reappraise the bundled evidence. Use [`verify_fresh`](Self::verify_fresh)
-    /// when that stronger check is required.
     pub async fn verify(&self) -> Result<AttestationVerification, VerifyError> {
         let policy = self.default_policy();
         self.verify_with_policy(&policy).await
@@ -390,9 +381,6 @@ impl Attestation {
     }
 
     /// Verify the ITA token and local bindings against an explicit policy.
-    ///
-    /// `Ok(report)` is still diagnostic. Call
-    /// [`AttestationVerification::require_success`] or check [`AttestationVerification::all_passed`].
     pub async fn verify_with_policy(
         &self,
         policy: &AttestationVerificationPolicy,
@@ -404,6 +392,8 @@ impl Attestation {
         &self,
         policy: &AttestationVerificationPolicy,
     ) -> Result<VerificationContext, VerifyError> {
+        self.require_schema_v2()?;
+
         let expected_token_issuer = resolved_expected_token_issuer(policy);
         let (token, token_verification_error) = match verify_attestation_token(
             &self.ita_token,
@@ -419,24 +409,22 @@ impl Attestation {
         };
         let jwt_valid = token.is_some();
 
-        let runtime_data = decode_standard_base64_array_64("runtime_data", &self.runtime_data)
-            .map_err(VerifyError::InvalidAttestation)?;
         let nonce_val = decode_standard_base64("verifier_nonce_val", &self.verifier_nonce_val)
             .map_err(VerifyError::InvalidAttestation)?;
         let nonce_iat = decode_standard_base64("verifier_nonce_iat", &self.verifier_nonce_iat)
             .map_err(VerifyError::InvalidAttestation)?;
+        let commitment = self.public_values.commitment_hash();
         let expected_token_report_data =
-            nonce_and_runtime_hash(&nonce_val, &nonce_iat, &runtime_data);
+            nonce_and_commitment_hash(&nonce_val, &nonce_iat, &commitment);
         let offline_quote_report_data_matches =
             verify_quote_report_data_binding(&self.raw_quote, &expected_token_report_data)
                 .map_err(|err| VerifyError::InvalidAttestation(format!("raw_quote: {err}")))?;
 
-        let parsed_report = ReportData::from_bytes(&runtime_data);
-        let tcb_status_allowed = token.as_ref().is_some_and(|t| {
+        let tcb_status_allowed = token.as_ref().is_some_and(|token| {
             policy
                 .accepted_tcb_statuses
                 .iter()
-                .any(|status| status.eq_ignore_ascii_case(t.tcb_status()))
+                .any(|status| status.eq_ignore_ascii_case(token.tcb_status()))
         });
 
         let quote_report_data_matches = match token.as_ref() {
@@ -453,68 +441,58 @@ impl Attestation {
         let report = AttestationVerification {
             jwt_signature_and_expiry_valid: jwt_valid,
             token_verification_error,
-            token_report_data_matches: token
-                .as_ref()
-                .is_some_and(|t| t.binding_matches(&runtime_data, &expected_token_report_data)),
+            token_report_data_matches: token.as_ref().is_some_and(|token| {
+                token.binding_matches(&commitment, &expected_token_report_data)
+            }),
             quote_report_data_matches,
-            runtime_data_matches_report: parsed_report == self.report_data,
-            public_values_bound: self
-                .public_values
-                .verify_commitment(&parsed_report.payload_hash),
             mrtd_matches_token: token
                 .as_ref()
-                .is_some_and(|t| self.mrtd.eq_ignore_ascii_case(t.mrtd())),
+                .is_some_and(|token| self.mrtd.eq_ignore_ascii_case(token.mrtd())),
             tcb_status_matches_token: token
                 .as_ref()
-                .is_some_and(|t| self.tcb_status == t.tcb_status()),
+                .is_some_and(|token| self.tcb_status == token.tcb_status()),
             tcb_date_matches_token: token
                 .as_ref()
-                .is_some_and(|t| self.tcb_date.as_deref() == t.tcb_date()),
-            advisory_ids_match_token: token
-                .as_ref()
-                .is_some_and(|t| advisory_id_sets_match(&self.advisory_ids, t.advisory_ids())),
+                .is_some_and(|token| self.tcb_date.as_deref() == token.tcb_date()),
+            advisory_ids_match_token: token.as_ref().is_some_and(|token| {
+                advisory_id_sets_match(&self.advisory_ids, token.advisory_ids())
+            }),
             tcb_status_allowed,
             tcb_status: token
                 .as_ref()
-                .map_or_else(String::new, |t| t.tcb_status().to_string()),
+                .map_or_else(String::new, |token| token.tcb_status().to_string()),
             tcb_date: token
                 .as_ref()
-                .and_then(|t| t.tcb_date().map(str::to_string)),
+                .and_then(|token| token.tcb_date().map(str::to_string)),
             advisory_ids: token
                 .as_ref()
-                .map_or_else(Vec::new, |t| t.advisory_ids().to_vec()),
+                .map_or_else(Vec::new, |token| token.advisory_ids().to_vec()),
             mrtd: token
                 .as_ref()
-                .map_or_else(String::new, |t| t.mrtd().to_string()),
+                .map_or_else(String::new, |token| token.mrtd().to_string()),
             expected_advisory_ids_matches: policy.expected_advisory_ids.as_ref().map(|expected| {
                 token
                     .as_ref()
-                    .is_some_and(|t| advisory_id_sets_match(expected, t.advisory_ids()))
+                    .is_some_and(|token| advisory_id_sets_match(expected, token.advisory_ids()))
             }),
             expected_mrtd_matches: policy.expected_mrtd.as_ref().map(|expected| {
                 token
                     .as_ref()
-                    .is_some_and(|t| expected.eq_ignore_ascii_case(t.mrtd()))
+                    .is_some_and(|token| expected.eq_ignore_ascii_case(token.mrtd()))
             }),
-            expected_build_id_matches: policy
-                .expected_build_id
-                .map(|expected| parsed_report.build_id == expected),
-            expected_nonce_matches: policy
-                .expected_nonce
-                .map(|expected| parsed_report.nonce == expected),
             bundled_evidence_authenticated: None,
         };
 
         Ok(VerificationContext {
             report,
-            runtime_data,
+            commitment,
             nonce: StoredVerifierNonce {
                 val: nonce_val,
                 iat: nonce_iat,
             },
             token_requires_azure_runtime_evidence: token
                 .as_ref()
-                .is_some_and(|t| !t.supports_offline_quote_report_data_binding()),
+                .is_some_and(|token| !token.supports_offline_quote_report_data_binding()),
         })
     }
 
@@ -528,7 +506,7 @@ impl Attestation {
 
         let VerificationContext {
             mut report,
-            runtime_data,
+            commitment,
             nonce,
             token_requires_azure_runtime_evidence,
         } = self.verify_with_policy_context(policy).await?;
@@ -544,7 +522,7 @@ impl Attestation {
         let (_fresh_token, fresh) = appraise_evidence_authenticated(
             &evidence,
             config,
-            &runtime_data,
+            &commitment,
             &nonce,
             &policy.jwks_url,
             expected_token_issuer,
@@ -564,14 +542,15 @@ impl Attestation {
         Ok(report)
     }
 
-    /// Check that `SHA-256(public_values)` matches `report_data.payload_hash`.
-    ///
-    /// This is a self-consistency check only. It does not prove the quote
-    /// itself matches the stored `report_data`.
-    #[must_use]
-    pub fn verify_public_values_commitment(&self) -> bool {
-        self.public_values
-            .verify_commitment(&self.report_data.payload_hash)
+    fn require_schema_v2(&self) -> Result<(), VerifyError> {
+        if self.schema_version == ATTESTATION_SCHEMA_VERSION {
+            Ok(())
+        } else {
+            Err(VerifyError::InvalidAttestation(format!(
+                "unsupported attestation schema version {}; only version 2 is supported",
+                self.schema_version
+            )))
+        }
     }
 
     fn stored_evidence(&self) -> Result<Evidence, VerifyError> {
@@ -626,7 +605,7 @@ impl Attestation {
 
 struct VerificationContext {
     report: AttestationVerification,
-    runtime_data: [u8; 64],
+    commitment: [u8; 32],
     nonce: StoredVerifierNonce,
     token_requires_azure_runtime_evidence: bool,
 }

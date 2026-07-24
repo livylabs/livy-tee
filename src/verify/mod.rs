@@ -16,3 +16,6 @@ pub(crate) mod codec;
 
 #[cfg(feature = "ita-verify")]
 pub(crate) mod ita;
+
+#[cfg(any(feature = "ita-verify", feature = "confidential-space"))]
+pub(crate) mod oidc;

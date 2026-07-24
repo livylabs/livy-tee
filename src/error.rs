@@ -21,7 +21,7 @@ pub enum EvidenceError {
     PortableFormat(String),
 }
 
-/// Errors returned by [`crate::generate_evidence`] and [`crate::binary_hash`].
+/// Errors returned by [`crate::generate_evidence`].
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum GenerateError {
@@ -31,9 +31,6 @@ pub enum GenerateError {
     /// I/O error during configfs read/write.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    /// Failed to read the current executable binary from disk.
-    #[error("failed to read binary for hash: {0}")]
-    BinaryRead(std::io::Error),
     /// Azure adapter prerequisites are missing.
     #[error("Azure quote adapter prerequisite missing: {0}")]
     AzurePrerequisite(String),
@@ -58,7 +55,6 @@ impl GenerateError {
         match self {
             Self::TsmNotAvailable => "tsm_not_available",
             Self::Io(_) => "io",
-            Self::BinaryRead(_) => "binary_read",
             Self::AzurePrerequisite(_) => "azure_prerequisite",
             Self::AzureCommand(_) => "azure_command",
             Self::AzureTpmResponseCode(_) => "azure_tpm_response_code",
@@ -75,9 +71,6 @@ pub enum ExtractError {
     /// Base64 decoding failed while parsing a textual quote/runtime input.
     #[error("base64 decode failed: {0}")]
     Base64(String),
-    /// Runtime data did not decode to exactly 64 bytes.
-    #[error("runtime_data must decode to exactly 64 bytes, got {0}")]
-    InvalidRuntimeDataLength(usize),
     /// Quote buffer is too short to contain the required DCAP fields.
     #[error("quote too short: need at least {QUOTE_MIN_LEN} bytes, got {0}")]
     TooShort(usize),
@@ -131,18 +124,6 @@ pub enum PublicValuesError {
     Deserialize(String),
 }
 
-/// Errors returned by [`crate::build_id_from_hash_hex`].
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[non_exhaustive]
-pub enum BuildIdError {
-    /// The provided hash was shorter than the required 16 hex characters.
-    #[error("hash hex too short: need at least 16 hex chars, got {0}")]
-    TooShort(usize),
-    /// The first 16 characters were not valid hex.
-    #[error("hash hex is not valid: {0}")]
-    InvalidHex(String),
-}
-
 /// Errors returned by Intel Trust Authority verification calls.
 #[cfg(feature = "ita-verify")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
@@ -160,8 +141,8 @@ pub enum VerifyError {
     /// The high-level [`crate::Attestation`] artifact itself is malformed.
     ///
     /// This variant is emitted by the high-level attestation verification flow
-    /// when locally stored fields such as `raw_quote`, `runtime_data`, or the
-    /// verifier nonce encodings cannot be decoded or do not have the expected
+    /// when locally stored fields such as `raw_quote` or the verifier nonce
+    /// encodings cannot be decoded or do not have the expected
     /// shape. Low-level ITA appraisal helpers do not construct this variant.
     #[error("invalid attestation: {0}")]
     InvalidAttestation(String),
@@ -209,9 +190,6 @@ pub enum AttestError {
     /// Quote generation failed.
     #[error("quote generation failed: {0}")]
     Generate(#[from] GenerateError),
-    /// Deriving the REPORTDATA build ID failed.
-    #[error("failed to derive build ID: {0}")]
-    BuildId(#[from] BuildIdError),
     /// ITA verification call failed.
     #[error("ITA verification failed: {0}")]
     Verify(#[from] VerifyError),
@@ -225,7 +203,6 @@ impl AttestError {
         match self {
             Self::PublicValues(_) => "public_values",
             Self::Generate(err) => err.code(),
-            Self::BuildId(_) => "build_id",
             Self::Verify(err) => err.code(),
         }
     }

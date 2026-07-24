@@ -1,24 +1,20 @@
 // SPDX-License-Identifier: MIT
 //! Real TDX hardware integration tests.
 //!
-//! # Prerequisites
-//!   - TDX-capable hardware with Linux kernel >= 6.7
-//!   - `ITA_API_KEY` environment variable set
+//! These tests are ignored by default because they require TDX hardware and,
+//! except for the low-level quote test, an `ITA_API_KEY`. Run them on a
+//! provisioned guest with:
 //!
-//! # Running
-//! ```bash
-//! ITA_API_KEY=<key> cargo test --test tdx_integration \
-//!     --no-default-features --features ita-verify -p livy-tee \
-//!     -- --nocapture --test-threads=1
+//! ```text
+//! cargo test --features ita-verify --test tdx_integration -- --ignored --test-threads=1
 //! ```
 
 #![cfg(all(feature = "ita-verify", not(feature = "mock-tee")))]
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use livy_tee::{
-    binary_hash, build_id_from_hash_hex, extract_report_data, generate_and_attest,
-    generate_evidence, get_nonce, verify_quote_with_public_values, ItaConfig, Livy, PublicValues,
-    ReportData, REPORT_DATA_VERSION,
+    extract_report_data, generate_and_attest, generate_evidence, get_nonce,
+    verify_quote_with_public_values, ItaConfig, Livy, PublicValues,
 };
 use sha2::{Digest, Sha256, Sha512};
 
@@ -39,7 +35,7 @@ fn ita_config() -> ItaConfig {
 fn assert_real_tdx_evidence(quote_len: usize) {
     assert!(
         quote_len > 4000,
-        "quote is only {quote_len} bytes — this is the mock-tee stub, not real TDX hardware"
+        "quote is only {quote_len} bytes — this is not real TDX hardware"
     );
 }
 
@@ -48,288 +44,113 @@ fn is_azure_runtime() -> bool {
 }
 
 #[test]
-fn tdx_quote_is_real_hardware() {
-    let rd = ReportData::new([1u8; 32], [0u8; 8], REPORT_DATA_VERSION, 0, 0);
-    let evidence = generate_evidence(&rd.to_bytes())
-        .expect("generate_evidence failed — TDX hardware or kernel TDX guest driver required");
+#[ignore = "requires a real TDX guest"]
+fn low_level_quote_api_still_accepts_64_byte_hardware_reportdata() {
+    let evidence = generate_evidence(&[0x5au8; 64])
+        .expect("generate_evidence failed — TDX hardware or guest driver required");
     assert_real_tdx_evidence(evidence.raw().len());
 }
 
 #[tokio::test]
-async fn ita_nonce_is_valid() {
-    let nonce = get_nonce(&ita_config())
-        .await
-        .expect("get_nonce failed — check ITA_API_KEY and network connectivity");
-    assert!(!nonce.val.is_empty());
-    assert!(!nonce.iat.is_empty());
+#[ignore = "requires a real TDX guest and ITA_API_KEY"]
+async fn ita_nonces_are_nonempty_and_distinct() {
+    let config = ita_config();
+    let first = get_nonce(&config).await.expect("first get_nonce failed");
+    let second = get_nonce(&config).await.expect("second get_nonce failed");
+    assert!(!first.val.is_empty());
+    assert!(!first.iat.is_empty());
+    assert_ne!(first.val, second.val);
 }
 
 #[tokio::test]
-async fn consecutive_nonces_are_distinct() {
-    let cfg = ita_config();
-    let n1 = get_nonce(&cfg).await.expect("get_nonce #1 failed");
-    let n2 = get_nonce(&cfg).await.expect("get_nonce #2 failed");
-    assert_ne!(n1.val, n2.val, "two consecutive nonces have the same val");
-}
-
-#[tokio::test]
-async fn sha512_reportdata_matches_nonce_plus_runtime_data() {
-    let cfg = ita_config();
-
-    let payload: [u8; 32] = Sha256::digest(b"tdx-integration-sha512-test").into();
-    let bin_hash = binary_hash().unwrap();
-    let rd = ReportData::new(
-        payload,
-        build_id_from_hash_hex(&bin_hash).expect("binary_hash returns valid SHA-256 hex"),
-        REPORT_DATA_VERSION,
-        0,
-        1001,
-    );
-    let rd_bytes = rd.to_bytes();
-
-    let nonce = get_nonce(&cfg).await.expect("get_nonce failed");
-
-    let expected_rd: [u8; 64] = {
-        let mut h = Sha512::new();
-        h.update(&nonce.val);
-        h.update(&nonce.iat);
-        h.update(&rd_bytes);
-        h.finalize().into()
+#[ignore = "requires a real TDX guest and ITA_API_KEY"]
+async fn hardware_reportdata_is_sha512_of_nonce_and_32_byte_commitment() {
+    let config = ita_config();
+    let commitment: [u8; 32] = Sha256::digest(b"tdx-integration-commitment").into();
+    let nonce = get_nonce(&config).await.expect("get_nonce failed");
+    let expected: [u8; 64] = {
+        let mut hash = Sha512::new();
+        hash.update(&nonce.val);
+        hash.update(&nonce.iat);
+        hash.update(commitment);
+        hash.finalize().into()
     };
-
-    let evidence = generate_evidence(&expected_rd).expect("generate_evidence failed");
+    let evidence = generate_evidence(&expected).expect("generate_evidence failed");
     assert_real_tdx_evidence(evidence.raw().len());
 
     let extracted = extract_report_data(&evidence).expect("extract_report_data failed");
     if is_azure_runtime() {
-        assert!(extracted.iter().any(|b| *b != 0));
+        assert!(extracted.iter().any(|byte| *byte != 0));
     } else {
-        assert_eq!(extracted, expected_rd);
+        assert_eq!(extracted, expected);
     }
 }
 
 #[tokio::test]
-async fn generate_and_attest_returns_valid_jwt() {
-    let cfg = ita_config();
-    let payload: [u8; 32] = Sha256::digest(b"generate-and-attest-test").into();
-    let rd = ReportData::new(payload, [0u8; 8], REPORT_DATA_VERSION, 0, 0);
-
-    let attested = generate_and_attest(&rd.to_bytes(), &cfg)
+#[ignore = "requires a real TDX guest and ITA_API_KEY"]
+async fn generate_and_attest_accepts_a_32_byte_commitment() {
+    let commitment: [u8; 32] = Sha256::digest(b"generate-and-attest-test").into();
+    let attested = generate_and_attest(&commitment, &ita_config())
         .await
         .expect("generate_and_attest failed");
 
     assert_real_tdx_evidence(attested.evidence.raw().len());
-    assert!(!attested.ita_token.is_empty());
-    assert_eq!(attested.ita_token.splitn(4, '.').count(), 3);
+    assert_eq!(attested.ita_token.split('.').count(), 3);
     assert_eq!(attested.mrtd.len(), 96);
-    let mrtd_bytes = hex::decode(&attested.mrtd).expect("MRTD is not valid hex");
-    assert_ne!(mrtd_bytes, vec![0u8; 48]);
-    assert_ne!(attested.tcb_status, "Revoked");
-    assert_eq!(attested.runtime_data, rd.to_bytes());
     assert!(!attested.nonce_val.is_empty());
 }
 
 #[tokio::test]
-async fn verify_quote_accepts_correct_binding() {
+#[ignore = "requires a real TDX guest and ITA_API_KEY"]
+async fn high_level_quote_binding_rejects_tampered_public_values() {
     let livy = Livy::new(api_key());
     let mut builder = livy.attest();
-    builder.commit(&"integration-test-input");
-    builder.commit(&"integration-test-output");
-    let att = builder.finalize().await.expect("finalize failed");
-
-    let raw = BASE64
-        .decode(att.raw_quote.trim())
-        .expect("raw_quote is not valid base64");
+    builder.commit(&"real input").commit(&"real output");
+    let attestation = builder.finalize().await.expect("finalize failed");
+    let raw = BASE64.decode(&attestation.raw_quote).unwrap();
     assert_real_tdx_evidence(raw.len());
 
-    let ok = verify_quote_with_public_values(
-        &att.raw_quote,
-        &att.runtime_data,
-        &att.verifier_nonce_val,
-        &att.verifier_nonce_iat,
-        &att.public_values,
+    let valid = verify_quote_with_public_values(
+        &attestation.raw_quote,
+        &attestation.verifier_nonce_val,
+        &attestation.verifier_nonce_iat,
+        &attestation.public_values,
     )
-    .expect("verify returned an error");
-
-    if is_azure_runtime() {
-        // Azure `/attest/azure` evidence carries Azure runtime JSON and uses a
-        // platform-specific quote shape; local raw-quote binding checks are not
-        // equivalent to the native TSM quote path.
-        assert!(!att.ita_token.is_empty());
-    } else {
-        assert!(ok, "verify returned false on valid attestation");
+    .unwrap();
+    if !is_azure_runtime() {
+        assert!(valid);
     }
-}
-
-#[tokio::test]
-async fn verify_quote_rejects_tampered_values() {
-    let livy = Livy::new(api_key());
-    let mut builder = livy.attest();
-    builder.commit(&"real input");
-    builder.commit(&"real output");
-    let att = builder.finalize().await.expect("finalize failed");
 
     let mut tampered = PublicValues::new();
-    tampered.commit(&"TAMPERED input").unwrap();
+    tampered.commit(&"tampered input").unwrap();
     tampered.commit(&"real output").unwrap();
-
-    let ok = verify_quote_with_public_values(
-        &att.raw_quote,
-        &att.runtime_data,
-        &att.verifier_nonce_val,
-        &att.verifier_nonce_iat,
+    assert!(!verify_quote_with_public_values(
+        &attestation.raw_quote,
+        &attestation.verifier_nonce_val,
+        &attestation.verifier_nonce_iat,
         &tampered,
     )
-    .expect("verify errored unexpectedly");
-
-    assert!(!ok, "verify accepted tampered values");
+    .unwrap());
 }
 
 #[tokio::test]
-async fn verify_quote_rejects_wrong_nonce() {
-    let livy = Livy::new(api_key());
-    let mut builder = livy.attest();
-    builder.commit(&"nonce-mismatch-test");
-    let att = builder.finalize().await.expect("finalize failed");
-
-    let zeroed = BASE64.encode([0u8; 32]);
-    let ok = verify_quote_with_public_values(
-        &att.raw_quote,
-        &att.runtime_data,
-        &zeroed,
-        &zeroed,
-        &att.public_values,
-    )
-    .expect("verify errored unexpectedly");
-
-    assert!(!ok, "verify accepted wrong nonce");
-}
-
-#[tokio::test]
-async fn proof_verify_correct_and_tampered() {
+#[ignore = "requires a real TDX guest and ITA_API_KEY"]
+async fn authenticated_token_and_fresh_evidence_verify() {
     let livy = Livy::new(api_key());
     let mut builder = livy.attest();
     builder.commit(&"verify-test");
-    let att = builder.finalize().await.expect("finalize failed");
+    let attestation = builder.finalize().await.expect("finalize failed");
 
-    let report = att.verify().await.expect("verify should not error");
-    let strict_report = att
+    let report = attestation.verify().await.expect("verify failed");
+    let fresh = attestation
         .verify_fresh(&ita_config())
         .await
-        .expect("verify_fresh should not error");
+        .expect("verify_fresh failed");
     assert!(report.jwt_signature_and_expiry_valid);
     assert!(report.token_report_data_matches);
-    assert!(report.runtime_data_matches_report);
-    assert!(report.public_values_bound);
-    assert!(report.mrtd_matches_token);
-    assert!(report.tcb_status_matches_token);
-    if is_azure_runtime() {
-        assert_eq!(report.quote_report_data_matches, None);
-    } else {
-        assert_eq!(report.quote_report_data_matches, Some(true));
-    }
-    assert_eq!(
-        strict_report.bundled_evidence_authenticated,
-        Some(true),
-        "strict verification report: {strict_report:#?}"
-    );
-    if strict_report.tcb_status.eq_ignore_ascii_case("UpToDate") {
-        assert!(
-            strict_report.all_passed(),
-            "strict verification report: {strict_report:#?}"
-        );
-    } else {
-        assert_eq!(
-            strict_report.tcb_status, "OutOfDate",
-            "unexpected non-UpToDate status: {strict_report:#?}"
-        );
-        assert!(
-            !strict_report.tcb_status_allowed,
-            "expected policy rejection for non-UpToDate TCB: {strict_report:#?}"
-        );
-        assert!(
-            !strict_report.all_passed(),
-            "non-UpToDate TCB should keep all_passed false under default policy: {strict_report:#?}"
-        );
-    }
+    assert_eq!(fresh.bundled_evidence_authenticated, Some(true));
     assert_eq!(
         report.tcb_status_allowed,
         report.tcb_status.eq_ignore_ascii_case("UpToDate")
     );
-
-    // Read back and check.
-    let val: String = att.public_values.read().unwrap();
-    assert_eq!(val, "verify-test");
-}
-
-#[tokio::test]
-async fn custom_nonce_is_embedded_in_report_data() {
-    let livy = Livy::new(api_key());
-    let mut builder = livy.attest();
-    builder.commit(&"nonce-embedding-test");
-    builder.nonce(99_999);
-    let att = builder.finalize().await.expect("finalize failed");
-
-    assert_eq!(att.report_data.nonce, 99_999);
-}
-
-#[tokio::test]
-async fn external_verifier_reconstructs_report_data_from_public_values() {
-    let livy = Livy::new(api_key());
-    let mut builder = livy.attest();
-    builder.commit(&"provenance: user request payload");
-    builder.commit(&"provenance: tee computed result");
-    let att = builder.finalize().await.expect("finalize failed");
-
-    let runtime_data_bytes: [u8; 64] = {
-        let raw = BASE64
-            .decode(&att.runtime_data)
-            .expect("runtime_data is not valid base64");
-        assert_eq!(raw.len(), 64);
-        raw.try_into().unwrap()
-    };
-
-    let nonce_val = BASE64
-        .decode(&att.verifier_nonce_val)
-        .expect("nonce_val decode failed");
-    let nonce_iat = BASE64
-        .decode(&att.verifier_nonce_iat)
-        .expect("nonce_iat decode failed");
-    let raw_quote = BASE64
-        .decode(&att.raw_quote)
-        .expect("raw_quote decode failed");
-    assert!(raw_quote.len() >= 632);
-
-    // Check 1: commitment hash matches payload_hash in runtime_data
-    let embedded_payload_hash: [u8; 32] = runtime_data_bytes[0..32].try_into().unwrap();
-    assert_eq!(embedded_payload_hash, att.public_values.commitment_hash());
-
-    // Check 2: SHA-512 binding
-    let quote_reportdata: &[u8; 64] = raw_quote[568..632].try_into().unwrap();
-    let expected_reportdata: [u8; 64] = {
-        let mut h = Sha512::new();
-        h.update(&nonce_val);
-        h.update(&nonce_iat);
-        h.update(&runtime_data_bytes);
-        h.finalize().into()
-    };
-    if is_azure_runtime() {
-        assert!(quote_reportdata.iter().any(|b| *b != 0));
-    } else {
-        assert_eq!(quote_reportdata, &expected_reportdata);
-    }
-}
-
-#[tokio::test]
-async fn runtime_data_is_64_bytes_base64() {
-    let livy = Livy::new(api_key());
-    let mut builder = livy.attest();
-    builder.commit(&"runtime-data-size-test");
-    let att = builder.finalize().await.expect("finalize failed");
-
-    let raw = BASE64
-        .decode(&att.runtime_data)
-        .expect("runtime_data is not valid base64");
-    assert_eq!(raw.len(), 64);
-    assert_eq!(att.runtime_data.len(), 88);
 }

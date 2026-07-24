@@ -10,10 +10,9 @@
 
 use crate::error::VerifyError;
 use crate::evidence::Evidence;
-use crate::verify::codec::{decode_claim_array_64, decode_standard_base64_array_64};
+use crate::verify::codec::{decode_claim_array_64, decode_standard_base64_array_32};
+use crate::verify::oidc::{http_client, verify_jwt_with_jwks, OidcError};
 use serde::Deserialize;
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 
 /// Default Intel Trust Authority token-signing JWKS endpoint.
 pub(crate) const DEFAULT_JWKS_URL: &str = "https://portal.trustauthority.intel.com/certs";
@@ -114,7 +113,7 @@ fn default_jwks_url_from_api_url(api_url: reqwest::Url) -> Option<String> {
 
 /// ITA verifier nonce — anti-replay token fetched from GET /appraisal/v2/nonce.
 ///
-/// Used to compute `REPORTDATA = SHA-512(nonce.val ‖ nonce.iat ‖ runtime_data)`.
+/// Used to compute `REPORTDATA = SHA-512(nonce.val ‖ nonce.iat ‖ user_data)`.
 #[derive(Debug, Clone)]
 pub struct VerifierNonce {
     /// Decoded nonce value bytes (used in SHA-512 computation).
@@ -150,8 +149,8 @@ pub struct UnauthenticatedAppraisalClaims {
     pub mrtd: String,
     /// Raw 64-byte REPORTDATA extracted from the JWT.
     pub report_data: [u8; 64],
-    /// The 64-byte `runtime_data` submitted in the appraisal request.
-    pub runtime_data: [u8; 64],
+    /// The 32-byte `user_data` commitment submitted in the appraisal request.
+    pub user_data: [u8; 32],
     /// TCB status string from ITA.
     pub tcb_status: String,
     /// Optional TCB assessment date from ITA token claims.
@@ -174,13 +173,13 @@ struct AppraisalClaimsCore {
 impl AppraisalClaimsCore {
     fn into_unauthenticated_appraisal(
         self,
-        runtime_data: [u8; 64],
+        user_data: [u8; 32],
         raw_token: String,
     ) -> UnauthenticatedAppraisalClaims {
         UnauthenticatedAppraisalClaims {
             mrtd: self.mrtd,
             report_data: self.report_data,
-            runtime_data,
+            user_data,
             tcb_status: self.tcb_status,
             tcb_date: self.tcb_date,
             advisory_ids: self.advisory_ids,
@@ -216,7 +215,7 @@ impl VerifiedTokenClaims {
 
     pub(crate) fn binding_matches(
         &self,
-        runtime_data: &[u8; 64],
+        user_data: &[u8; 32],
         expected_runtime_hash: &[u8; 64],
     ) -> bool {
         match &self.binding {
@@ -226,7 +225,7 @@ impl VerifiedTokenClaims {
             VerifiedTokenBinding::AzureRuntime {
                 held_data,
                 user_data_hash,
-            } => held_data == runtime_data && user_data_hash == expected_runtime_hash,
+            } => held_data == user_data && user_data_hash == expected_runtime_hash,
         }
     }
 
@@ -236,11 +235,11 @@ impl VerifiedTokenClaims {
 
     fn into_unauthenticated_appraisal(
         self,
-        runtime_data: [u8; 64],
+        user_data: [u8; 32],
         raw_token: String,
     ) -> UnauthenticatedAppraisalClaims {
         self.claims
-            .into_unauthenticated_appraisal(runtime_data, raw_token)
+            .into_unauthenticated_appraisal(user_data, raw_token)
     }
 }
 
@@ -248,7 +247,7 @@ impl VerifiedTokenClaims {
 pub(crate) enum VerifiedTokenBinding {
     StandardReportData,
     AzureRuntime {
-        held_data: [u8; 64],
+        held_data: [u8; 32],
         user_data_hash: [u8; 64],
     },
 }
@@ -424,30 +423,6 @@ impl ItaClaims {
     }
 }
 
-fn http_client(request_timeout_secs: u64) -> Result<reqwest::Client, VerifyError> {
-    static CLIENTS: OnceLock<Mutex<HashMap<u64, reqwest::Client>>> = OnceLock::new();
-
-    let clients = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
-    // The cache is only an optimization. If another thread panicked while
-    // holding the lock, recover the inner map rather than failing or aborting.
-    let mut clients = match clients.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if let Some(client) = clients.get(&request_timeout_secs).cloned() {
-        return Ok(client);
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(request_timeout_secs))
-        .build()
-        .map_err(|e| VerifyError::Network(e.to_string()))?;
-
-    clients.insert(request_timeout_secs, client.clone());
-
-    Ok(client)
-}
-
 /// Verify an ITA attestation token against a JWKS endpoint.
 ///
 /// This is the authenticated low-level entry point. Most callers should prefer
@@ -459,63 +434,16 @@ pub(crate) async fn verify_attestation_token(
     expected_issuer: Option<&str>,
     expected_audience: Option<&str>,
 ) -> Result<VerifiedTokenClaims, VerifyError> {
-    use jsonwebtoken::jwk::JwkSet;
-    use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+    use jsonwebtoken::Algorithm;
 
-    let jwt = normalized_jwt(jwt)?;
-
-    let header =
-        decode_header(jwt).map_err(|e| VerifyError::InvalidToken(format!("JWT header: {e}")))?;
-    let algorithm = match header.alg {
-        Algorithm::PS384 | Algorithm::RS256 => header.alg,
-        other => {
-            return Err(VerifyError::InvalidToken(format!(
-                "unsupported ITA token signing algorithm: {other:?}"
-            )))
-        }
-    };
-    let kid = header
-        .kid
-        .as_deref()
-        .ok_or_else(|| VerifyError::InvalidToken("JWT header missing kid".to_string()))?;
-
-    let client = http_client(request_timeout_secs)?;
-    let response = client
-        .get(jwks_url)
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .map_err(|e| VerifyError::Network(e.to_string()))?;
-
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| VerifyError::Network(e.to_string()))?;
-    if !status.is_success() {
-        return Err(VerifyError::ItaApi(format!(
-            "ITA JWKS endpoint returned HTTP {status}: {body}"
-        )));
-    }
-
-    let jwks: JwkSet = serde_json::from_str(&body)
-        .map_err(|e| VerifyError::InvalidToken(format!("JWKS JSON: {e}")))?;
-    let jwk = jwks
-        .keys
-        .iter()
-        .find(|jwk| jwk.common.key_id.as_deref() == Some(kid))
-        .ok_or_else(|| VerifyError::InvalidToken(format!("JWKS has no key for kid {kid}")))?;
-    let key = DecodingKey::from_jwk(jwk)
-        .map_err(|e| VerifyError::InvalidToken(format!("JWKS key for kid {kid}: {e}")))?;
-
-    let mut validation = Validation::new(algorithm);
-    validation.validate_exp = true;
-    validation.validate_nbf = true;
-    validation.validate_aud = false;
-
-    let token = decode::<ItaClaims>(jwt, &key, &validation)
-        .map_err(|e| VerifyError::InvalidToken(format!("JWT validation: {e}")))?;
-    let claims = token.claims;
+    let claims = verify_jwt_with_jwks::<ItaClaims>(
+        jwt,
+        jwks_url,
+        request_timeout_secs,
+        &[Algorithm::PS384, Algorithm::RS256],
+    )
+    .await
+    .map_err(verify_error_from_oidc)?;
     validate_expected_issuer(&claims, expected_issuer)?;
     validate_expected_audience(&claims, expected_audience)?;
     parse_verified_claims(claims)
@@ -543,7 +471,7 @@ pub async fn get_nonce(config: &ItaConfig) -> Result<VerifierNonce, VerifyError>
 
     let url = format!("{}/appraisal/v2/nonce", config.api_url);
 
-    let client = http_client(config.request_timeout_secs)?;
+    let client = http_client(config.request_timeout_secs).map_err(verify_error_from_oidc)?;
     let response = client
         .get(&url)
         .header("x-api-key", &config.api_key)
@@ -599,7 +527,7 @@ pub async fn get_nonce(config: &ItaConfig) -> Result<VerifierNonce, VerifyError>
 pub async fn appraise_evidence_unauthenticated(
     evidence: &Evidence,
     config: &ItaConfig,
-    runtime_data: &[u8; 64],
+    user_data: &[u8; 32],
     nonce: &VerifierNonce,
 ) -> Result<UnauthenticatedAppraisalClaims, VerifyError> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL;
@@ -620,7 +548,7 @@ pub async fn appraise_evidence_unauthenticated(
         })?;
         let quote_b64 = BASE64.encode(evidence.raw());
         let runtime_json_b64 = BASE64.encode(runtime_json);
-        let user_data_b64 = BASE64.encode(runtime_data);
+        let user_data_b64 = BASE64.encode(user_data);
         serde_json::json!({
             "tdx": {
                 "quote": quote_b64,
@@ -635,7 +563,7 @@ pub async fn appraise_evidence_unauthenticated(
         })
     } else {
         let quote_b64url = BASE64URL.encode(evidence.raw());
-        let runtime_data_b64 = BASE64.encode(runtime_data);
+        let runtime_data_b64 = BASE64.encode(user_data);
         serde_json::json!({
             "tdx": {
                 "quote": quote_b64url,
@@ -651,7 +579,7 @@ pub async fn appraise_evidence_unauthenticated(
 
     let url = format!("{}{}", config.api_url, path);
 
-    let client = http_client(config.request_timeout_secs)?;
+    let client = http_client(config.request_timeout_secs).map_err(verify_error_from_oidc)?;
     let response = client
         .post(&url)
         .header("x-api-key", &config.api_key)
@@ -700,19 +628,19 @@ pub async fn appraise_evidence_unauthenticated(
     let claims = decode_jwt_claims(&jwt)?;
     let verified = parse_verified_claims(claims)?;
 
-    Ok(verified.into_unauthenticated_appraisal(*runtime_data, jwt))
+    Ok(verified.into_unauthenticated_appraisal(*user_data, jwt))
 }
 
 pub(crate) async fn appraise_evidence_authenticated(
     evidence: &Evidence,
     config: &ItaConfig,
-    runtime_data: &[u8; 64],
+    user_data: &[u8; 32],
     nonce: &VerifierNonce,
     jwks_url: &str,
     expected_issuer: Option<String>,
     expected_audience: Option<String>,
 ) -> Result<(String, VerifiedTokenClaims), VerifyError> {
-    let claims = appraise_evidence_unauthenticated(evidence, config, runtime_data, nonce).await?;
+    let claims = appraise_evidence_unauthenticated(evidence, config, user_data, nonce).await?;
     let raw_token = claims.raw_token.clone();
     let verified = verify_attestation_token(
         &raw_token,
@@ -722,10 +650,10 @@ pub(crate) async fn appraise_evidence_authenticated(
         expected_audience.as_deref(),
     )
     .await?;
-    let expected_runtime_hash = runtime_hash(&nonce.val, &nonce.iat, runtime_data);
-    if !verified.binding_matches(runtime_data, &expected_runtime_hash) {
+    let expected_runtime_hash = runtime_hash(&nonce.val, &nonce.iat, user_data);
+    if !verified.binding_matches(user_data, &expected_runtime_hash) {
         return Err(VerifyError::InvalidTokenClaims(
-            "authenticated ITA token binding does not match the provided runtime_data and verifier nonce"
+            "authenticated ITA token binding does not match the provided 32-byte user_data commitment and verifier nonce"
                 .to_string(),
         ));
     }
@@ -754,7 +682,7 @@ fn parse_verified_claims(claims: ItaClaims) -> Result<VerifiedTokenClaims, Verif
         AppraisalBindingKind::Standard => VerifiedTokenBinding::StandardReportData,
         AppraisalBindingKind::Azure => {
             let held_data =
-                decode_standard_base64_array_64("attester_held_data", claims.attester_held_data())
+                decode_standard_base64_array_32("attester_held_data", claims.attester_held_data())
                     .map_err(VerifyError::InvalidTokenClaims)?;
             let user_data_hash = decode_claim_array_64(
                 "attester_runtime_data.user-data",
@@ -787,7 +715,7 @@ fn parse_verified_claims(claims: ItaClaims) -> Result<VerifiedTokenClaims, Verif
 /// Extract the raw `tdx_report_data` claim from a JWT without authenticating it.
 ///
 /// This is a low-level inspection helper. The returned value is the token-side
-/// binding hash, not the raw [`crate::report::ReportData`].
+/// binding hash, not the raw 32-byte commitment.
 pub fn unauthenticated_report_data_hash_from_token(
     jwt: &str,
 ) -> Result<Option<[u8; 64]>, VerifyError> {
@@ -900,14 +828,30 @@ fn validate_expected_audience(
     }
 }
 
-fn runtime_hash(nonce_val: &[u8], nonce_iat: &[u8], runtime_data: &[u8; 64]) -> [u8; 64] {
+fn runtime_hash(nonce_val: &[u8], nonce_iat: &[u8], user_data: &[u8; 32]) -> [u8; 64] {
     use sha2::{Digest, Sha512};
 
     let mut h = Sha512::new();
     h.update(nonce_val);
     h.update(nonce_iat);
-    h.update(runtime_data);
+    h.update(user_data);
     h.finalize().into()
+}
+
+fn verify_error_from_oidc(error: OidcError) -> VerifyError {
+    match error {
+        OidcError::Network(message) => VerifyError::Network(message),
+        OidcError::Http {
+            endpoint,
+            status,
+            body,
+        } => VerifyError::ItaApi(format!("{endpoint} returned HTTP {status}: {body}")),
+        #[cfg(feature = "confidential-space")]
+        OidcError::Discovery(message) => {
+            VerifyError::InvalidToken(format!("OIDC discovery: {message}"))
+        }
+        OidcError::Token(message) => VerifyError::InvalidToken(message),
+    }
 }
 
 fn normalized_jwt(jwt: &str) -> Result<&str, VerifyError> {
@@ -941,14 +885,14 @@ mod tests {
 
     #[test]
     fn parse_verified_claims_azure_uses_held_data_and_runtime_hash_binding() {
-        let runtime_data = [0x5au8; 64];
+        let user_data = [0x5au8; 32];
         let nonce_val = [0x11u8; 32];
         let nonce_iat = [0x22u8; 32];
         let user_data_hash: [u8; 64] = {
             let mut h = Sha512::new();
             h.update(nonce_val);
             h.update(nonce_iat);
-            h.update(runtime_data);
+            h.update(user_data);
             h.finalize().into()
         };
 
@@ -959,7 +903,7 @@ mod tests {
                 "tdx_report_data": format!("{}{}", "aa".repeat(32), "00".repeat(32)),
                 "attester_tcb_status": "UpToDate",
                 "attester_tcb_date": "2026-02-11T00:00:00Z",
-                "attester_held_data": base64::engine::general_purpose::STANDARD.encode(runtime_data),
+                "attester_held_data": base64::engine::general_purpose::STANDARD.encode(user_data),
                 "attester_runtime_data": {
                     "user-data": hex::encode(user_data_hash),
                 }
@@ -973,9 +917,9 @@ mod tests {
                 held_data,
                 user_data_hash: actual_hash,
             } => {
-                assert_eq!(held_data, runtime_data);
+                assert_eq!(held_data, user_data);
                 assert_eq!(actual_hash, user_data_hash);
-                assert!(verified.binding_matches(&runtime_data, &user_data_hash));
+                assert!(verified.binding_matches(&user_data, &user_data_hash));
             }
             VerifiedTokenBinding::StandardReportData => {
                 panic!("expected Azure runtime binding")
@@ -991,7 +935,7 @@ mod tests {
                 "tdx_mrtd": sample_mrtd(),
                 "tdx_report_data": "00".repeat(64),
                 "attester_tcb_status": "UpToDate",
-                "attester_held_data": base64::engine::general_purpose::STANDARD.encode([0u8; 64]),
+                "attester_held_data": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
                 "attester_runtime_data": {}
             }
         }))
@@ -1011,7 +955,7 @@ mod tests {
                 "tdx_mrtd": sample_mrtd(),
                 "tdx_report_data": "00".repeat(64),
                 "attester_tcb_status": "UpToDate",
-                "attester_held_data": base64::engine::general_purpose::STANDARD.encode([0x12u8; 64]),
+                "attester_held_data": base64::engine::general_purpose::STANDARD.encode([0x12u8; 32]),
                 "attester_runtime_data": {
                     "user-data": "34".repeat(64),
                 }
@@ -1033,7 +977,7 @@ mod tests {
                 "tdx_mrtd": sample_mrtd(),
                 "tdx_report_data": "00".repeat(64),
                 "attester_tcb_status": "UpToDate",
-                "attester_held_data": base64::engine::general_purpose::STANDARD.encode([0u8; 64]),
+                "attester_held_data": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
             }
         }))
         .expect("claims JSON should deserialize");
@@ -1053,7 +997,7 @@ mod tests {
                 "tdx_mrtd": sample_mrtd(),
                 "tdx_report_data": "00".repeat(64),
                 "attester_tcb_status": "UpToDate",
-                "attester_held_data": base64::engine::general_purpose::STANDARD.encode([0u8; 64]),
+                "attester_held_data": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
                 "attester_runtime_data": {
                     "user-data": "11".repeat(64),
                 }
@@ -1078,7 +1022,7 @@ mod tests {
                 "attester_tcb_status": "OutOfDate",
                 "attester_tcb_date": "2025-05-14T00:00:00Z",
                 "attester_advisory_ids": ["INTEL-SA-00828"],
-                "attester_held_data": base64::engine::general_purpose::STANDARD.encode([0x12u8; 64]),
+                "attester_held_data": base64::engine::general_purpose::STANDARD.encode([0x12u8; 32]),
                 "attester_runtime_data": {
                     "user-data": "34".repeat(64),
                 }

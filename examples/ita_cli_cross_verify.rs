@@ -113,9 +113,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut builder = livy.attest();
     builder.commit(&"livy-tee ita-cli cross verification input");
     builder.commit(&"livy-tee ita-cli cross verification output");
-    // Demo replay counter; production callers should supply a monotonic value.
-    builder.nonce(20260413);
-
     let attestation = rt.block_on(builder.finalize())?;
 
     let verification = rt.block_on(attestation.verify())?;
@@ -124,11 +121,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let raw_quote = BASE64.decode(&attestation.raw_quote)?;
-    let runtime_data = BASE64.decode(&attestation.runtime_data)?;
+    let commitment = attestation.commitment_hash();
     let tdx_claims = token_tdx_claims(&attestation.ita_token)?;
     println!("livy-tee attestation generated");
     println!("  quote_bytes: {}", raw_quote.len());
-    println!("  runtime_data_bytes: {}", runtime_data.len());
+    println!("  commitment_bytes: {}", commitment.len());
     println!("  mrtd: {}", attestation.mrtd);
     println!("  tcb_status: {}", attestation.tcb_status);
     for key in [
