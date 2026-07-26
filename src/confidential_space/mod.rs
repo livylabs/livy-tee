@@ -9,6 +9,7 @@ use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 /// Confidential Space launcher Unix socket.
@@ -25,6 +26,8 @@ const GOOGLE_DISCOVERY_URL: &str =
 const INTEL_DISCOVERY_URL: &str =
     "https://portal.trustauthority.intel.com/.well-known/openid-configuration";
 const MAX_AUDIENCE_BYTES: usize = 512;
+const DEFAULT_MAX_TOKEN_AGE_SECS: u64 = 300;
+const TOKEN_CLOCK_SKEW_SECS: u64 = 60;
 
 /// Which Confidential Space attestation service must mint the artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -501,6 +504,18 @@ pub struct ConfidentialSpaceVerificationPolicy {
     pub expected_audience: String,
     /// Exact required canonical `sha256:…` container image digest.
     pub expected_image_digest: String,
+    /// Accepted signed TDX TCB status values.
+    #[serde(default = "default_accepted_tcb_statuses")]
+    pub accepted_tcb_statuses: Vec<String>,
+    /// Optional minimum signed TDX TCB date in canonical UTC form.
+    #[serde(default)]
+    pub minimum_tcb_date: Option<String>,
+    /// Optional minimum Confidential Space image version (`YYMM##` or `YYYYMM##`).
+    #[serde(default)]
+    pub minimum_confidential_space_version: Option<String>,
+    /// Maximum age of the signed `iat` claim, allowing 60 seconds of clock skew.
+    #[serde(default = "default_max_token_age_secs")]
+    pub max_token_age_secs: u64,
     /// OIDC discovery/JWKS timeout in seconds.
     pub request_timeout_secs: u64,
     /// Optional trusted Google JWKS mirror or test endpoint.
@@ -525,6 +540,10 @@ impl ConfidentialSpaceVerificationPolicy {
         Self {
             expected_audience: expected_audience.into(),
             expected_image_digest: expected_image_digest.into(),
+            accepted_tcb_statuses: default_accepted_tcb_statuses(),
+            minimum_tcb_date: None,
+            minimum_confidential_space_version: None,
+            max_token_age_secs: default_max_token_age_secs(),
             request_timeout_secs: 30,
             google_jwks_url: None,
             intel_jwks_url: None,
@@ -548,6 +567,39 @@ impl ConfidentialSpaceVerificationPolicy {
         if self.request_timeout_secs == 0 {
             return Err(ConfidentialSpaceError::InvalidConfiguration(
                 "request_timeout_secs must be greater than zero".to_string(),
+            ));
+        }
+        if self.max_token_age_secs == 0 {
+            return Err(ConfidentialSpaceError::InvalidConfiguration(
+                "max_token_age_secs must be greater than zero".to_string(),
+            ));
+        }
+        if self.accepted_tcb_statuses.is_empty()
+            || self
+                .accepted_tcb_statuses
+                .iter()
+                .any(|status| status.trim().is_empty())
+        {
+            return Err(ConfidentialSpaceError::InvalidConfiguration(
+                "accepted_tcb_statuses must contain at least one non-empty value".to_string(),
+            ));
+        }
+        if self
+            .minimum_tcb_date
+            .as_deref()
+            .is_some_and(|date| parse_tcb_date(date).is_none())
+        {
+            return Err(ConfidentialSpaceError::InvalidConfiguration(
+                "minimum_tcb_date must use canonical YYYY-MM-DDThh:mm:ssZ UTC form".to_string(),
+            ));
+        }
+        if self
+            .minimum_confidential_space_version
+            .as_deref()
+            .is_some_and(|version| parse_confidential_space_version(version).is_none())
+        {
+            return Err(ConfidentialSpaceError::InvalidConfiguration(
+                "minimum_confidential_space_version must use YYMM## or YYYYMM## form".to_string(),
             ));
         }
         Ok(())
@@ -585,6 +637,8 @@ pub struct ConfidentialSpaceIssuerVerification {
     pub token_present: bool,
     /// JWT signature, expiry, and not-before checks passed.
     pub jwt_signature_and_time_valid: bool,
+    /// Signed `iat` is present, not materially in the future, and recent enough.
+    pub token_fresh: bool,
     /// Token `iss` exactly matches the fixed trusted issuer.
     pub issuer_matches: bool,
     /// Token `aud` exactly matches the relying-party policy.
@@ -601,6 +655,14 @@ pub struct ConfidentialSpaceIssuerVerification {
     pub secure_boot_enabled: bool,
     /// Hardware model is Google Cloud Intel TDX.
     pub intel_tdx: bool,
+    /// The signed TCB root identifies Intel.
+    pub intel_tcb_attester: bool,
+    /// The signed TDX TCB status is accepted by policy.
+    pub tcb_status_allowed: bool,
+    /// The signed TDX TCB date is canonical and meets the optional policy minimum.
+    pub tcb_date_allowed: bool,
+    /// The signed Confidential Space version is canonical and meets the optional minimum.
+    pub confidential_space_version_allowed: bool,
     /// Confidential Space image carries the `STABLE` support attribute.
     pub stable_support: bool,
     /// Memory monitoring is explicitly disabled.
@@ -609,6 +671,12 @@ pub struct ConfidentialSpaceIssuerVerification {
     pub cmd_override_empty: bool,
     /// No operator environment override is present.
     pub env_override_empty: bool,
+    /// Signed TDX TCB status, if unambiguously present.
+    pub tcb_status: String,
+    /// Signed TDX TCB date, if unambiguously present.
+    pub tcb_date: Option<String>,
+    /// Signed Confidential Space image version, if unambiguously present.
+    pub confidential_space_version: Option<String>,
     /// Signature/JWKS/claim parsing failure, if one occurred.
     pub verification_error: Option<String>,
 }
@@ -619,6 +687,7 @@ impl ConfidentialSpaceIssuerVerification {
             issuer,
             token_present,
             jwt_signature_and_time_valid: false,
+            token_fresh: false,
             issuer_matches: false,
             audience_matches: false,
             commitment_nonce_matches: false,
@@ -627,10 +696,17 @@ impl ConfidentialSpaceIssuerVerification {
             production_image: false,
             secure_boot_enabled: false,
             intel_tdx: false,
+            intel_tcb_attester: false,
+            tcb_status_allowed: false,
+            tcb_date_allowed: false,
+            confidential_space_version_allowed: false,
             stable_support: false,
             memory_monitoring_disabled: false,
             cmd_override_empty: false,
             env_override_empty: false,
+            tcb_status: String::new(),
+            tcb_date: None,
+            confidential_space_version: None,
             verification_error: Some(message),
         }
     }
@@ -640,6 +716,7 @@ impl ConfidentialSpaceIssuerVerification {
     pub fn all_passed(&self) -> bool {
         self.token_present
             && self.jwt_signature_and_time_valid
+            && self.token_fresh
             && self.issuer_matches
             && self.audience_matches
             && self.commitment_nonce_matches
@@ -648,6 +725,10 @@ impl ConfidentialSpaceIssuerVerification {
             && self.production_image
             && self.secure_boot_enabled
             && self.intel_tdx
+            && self.intel_tcb_attester
+            && self.tcb_status_allowed
+            && self.tcb_date_allowed
+            && self.confidential_space_version_allowed
             && self.stable_support
             && self.memory_monitoring_disabled
             && self.cmd_override_empty
@@ -713,6 +794,10 @@ struct ConfidentialSpaceClaims {
     #[serde(default)]
     aud: serde_json::Value,
     #[serde(default)]
+    iat: Option<u64>,
+    #[serde(default)]
+    attester_tcb: Vec<String>,
+    #[serde(default)]
     eat_nonce: serde_json::Value,
     #[serde(default)]
     dbgstat: String,
@@ -727,7 +812,17 @@ struct ConfidentialSpaceClaims {
     #[serde(default)]
     swversion: Vec<String>,
     #[serde(default)]
+    tdx: serde_json::Value,
+    #[serde(default)]
     submods: SubmodsClaims,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct TdxClaims {
+    #[serde(default)]
+    gcp_attester_tcb_status: String,
+    #[serde(default)]
+    gcp_attester_tcb_date: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -853,10 +948,53 @@ async fn verify_issuer_token(
         .iter()
         .cloned()
         .collect();
+    let tdx = exactly_one_tdx_claim(&claims.tdx);
+    let tcb_status = tdx
+        .as_ref()
+        .map(|claims| claims.gcp_attester_tcb_status.trim())
+        .filter(|status| !status.is_empty())
+        .map(str::to_string);
+    let tcb_date = tdx
+        .as_ref()
+        .map(|claims| claims.gcp_attester_tcb_date.trim())
+        .filter(|date| !date.is_empty())
+        .map(str::to_string);
+    let confidential_space_version = exactly_one_confidential_space_version(&claims.swversion);
+    let token_fresh = claims
+        .iat
+        .is_some_and(|issued_at| token_is_fresh(issued_at, policy.max_token_age_secs));
+    let tcb_status_allowed = tcb_status.as_deref().is_some_and(|status| {
+        policy
+            .accepted_tcb_statuses
+            .iter()
+            .any(|accepted| accepted.trim().eq_ignore_ascii_case(status))
+    });
+    let tcb_date_allowed = tcb_date.as_deref().is_some_and(|date| {
+        parse_tcb_date(date).is_some_and(|actual| {
+            policy
+                .minimum_tcb_date
+                .as_deref()
+                .and_then(parse_tcb_date)
+                .map_or(true, |minimum| actual >= minimum)
+        })
+    });
+    let confidential_space_version_allowed =
+        confidential_space_version
+            .as_deref()
+            .is_some_and(|version| {
+                parse_confidential_space_version(version).is_some_and(|actual| {
+                    policy
+                        .minimum_confidential_space_version
+                        .as_deref()
+                        .and_then(parse_confidential_space_version)
+                        .map_or(true, |minimum| actual >= minimum)
+                })
+            });
     let result = ConfidentialSpaceIssuerVerification {
         issuer,
         token_present: true,
         jwt_signature_and_time_valid: true,
+        token_fresh,
         issuer_matches: claims.iss == issuer.expected_issuer(),
         audience_matches: claims.aud.as_str() == Some(policy.expected_audience.as_str()),
         commitment_nonce_matches: nonce.as_deref() == Some(expected_nonce),
@@ -865,11 +1003,18 @@ async fn verify_issuer_token(
         production_image: claims.dbgstat == "disabled-since-boot",
         secure_boot_enabled: claims.secboot == Some(true),
         intel_tdx: claims.hwmodel == "GCP_INTEL_TDX",
+        intel_tcb_attester: claims.attester_tcb.as_slice() == ["INTEL"],
+        tcb_status_allowed,
+        tcb_date_allowed,
+        confidential_space_version_allowed,
         stable_support: support_attributes.contains("STABLE"),
         memory_monitoring_disabled: claims.submods.confidential_space.monitoring_enabled.memory
             == Some(false),
         cmd_override_empty: claims.submods.container.cmd_override.is_empty(),
         env_override_empty: claims.submods.container.env_override.is_empty(),
+        tcb_status: tcb_status.unwrap_or_default(),
+        tcb_date,
+        confidential_space_version,
         verification_error: None,
     };
     let common = nonce.map(|commitment_nonce| CommonWorkloadClaims {
@@ -906,4 +1051,106 @@ fn exactly_one_nonce(value: &serde_json::Value) -> Option<String> {
             .map(str::to_string),
         _ => None,
     }
+}
+
+fn default_accepted_tcb_statuses() -> Vec<String> {
+    vec!["UpToDate".to_string()]
+}
+
+const fn default_max_token_age_secs() -> u64 {
+    DEFAULT_MAX_TOKEN_AGE_SECS
+}
+
+fn token_is_fresh(issued_at: u64, max_age_secs: u64) -> bool {
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    let now = now.as_secs();
+    issued_at <= now.saturating_add(TOKEN_CLOCK_SKEW_SECS)
+        && now
+            <= issued_at
+                .saturating_add(max_age_secs)
+                .saturating_add(TOKEN_CLOCK_SKEW_SECS)
+}
+
+fn exactly_one_tdx_claim(value: &serde_json::Value) -> Option<TdxClaims> {
+    match value {
+        serde_json::Value::Object(_) => serde_json::from_value(value.clone()).ok(),
+        serde_json::Value::Array(claims) if claims.len() == 1 => {
+            serde_json::from_value(claims[0].clone()).ok()
+        }
+        _ => None,
+    }
+}
+
+fn exactly_one_confidential_space_version(versions: &[String]) -> Option<String> {
+    if versions.len() != 1 {
+        return None;
+    }
+    let version = versions[0].trim();
+    (!version.is_empty()).then(|| version.to_string())
+}
+
+fn parse_confidential_space_version(version: &str) -> Option<(u16, u8, u8)> {
+    let bytes = version.as_bytes();
+    if !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let (year, month, revision) = match bytes.len() {
+        6 => (
+            2_000 + parse_ascii_number::<u16>(&bytes[0..2])?,
+            parse_ascii_number::<u8>(&bytes[2..4])?,
+            parse_ascii_number::<u8>(&bytes[4..6])?,
+        ),
+        8 => (
+            parse_ascii_number::<u16>(&bytes[0..4])?,
+            parse_ascii_number::<u8>(&bytes[4..6])?,
+            parse_ascii_number::<u8>(&bytes[6..8])?,
+        ),
+        _ => return None,
+    };
+    (year > 0 && (1..=12).contains(&month)).then_some((year, month, revision))
+}
+
+fn parse_tcb_date(date: &str) -> Option<(u16, u8, u8, u8, u8, u8)> {
+    let bytes = date.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return None;
+    }
+    let year = parse_ascii_number::<u16>(&bytes[0..4])?;
+    let month = parse_ascii_number::<u8>(&bytes[5..7])?;
+    let day = parse_ascii_number::<u8>(&bytes[8..10])?;
+    let hour = parse_ascii_number::<u8>(&bytes[11..13])?;
+    let minute = parse_ascii_number::<u8>(&bytes[14..16])?;
+    let second = parse_ascii_number::<u8>(&bytes[17..19])?;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => return None,
+    };
+    (year > 0 && (1..=days_in_month).contains(&day) && hour <= 23 && minute <= 59 && second <= 59)
+        .then_some((year, month, day, hour, minute, second))
+}
+
+fn parse_ascii_number<T>(bytes: &[u8]) -> Option<T>
+where
+    T: std::str::FromStr,
+{
+    if !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+const fn is_leap_year(year: u16) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }

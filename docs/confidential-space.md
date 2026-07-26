@@ -81,23 +81,52 @@ let policy = livy_tee::ConfidentialSpaceVerificationPolicy::new(
 Both values come from trusted relying-party configuration. The artifact is not
 allowed to choose its own audience or acceptable image digest.
 
+The default policy also requires an `UpToDate` signed TDX TCB status and limits
+the signed `iat` age to five minutes, with 60 seconds of clock-skew tolerance.
+Relying parties can additionally pin minimum platform and Confidential Space
+versions:
+
+```rust,no_run
+let mut policy = livy_tee::ConfidentialSpaceVerificationPolicy::new(
+    "https://relying-party.example",
+    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+);
+policy.minimum_tcb_date = Some("2025-05-14T00:00:00Z".to_string());
+policy.minimum_confidential_space_version = Some("260600".to_string());
+```
+
+`minimum_tcb_date` uses canonical `YYYY-MM-DDThh:mm:ssZ` UTC form.
+Confidential Space versions accept the six-digit launcher form (`YYMM##`) and
+the expanded documentation form (`YYYYMM##`).
+
 ## Strict issuer checks
 
 Each token must satisfy every check:
 
 1. signature, expiry, and not-before validation;
-2. exact fixed issuer;
-3. exact policy audience;
-4. exactly one `eat_nonce`, equal to
+2. a present, recent signed `iat`;
+3. exact fixed issuer;
+4. exact policy audience;
+5. exactly one `eat_nonce`, equal to
    `BASE64URL_NO_PAD(SHA-256(public_values))`;
-5. exact canonical lowercase `sha256:…` image digest;
-6. `swname == "CONFIDENTIAL_SPACE"`;
-7. `dbgstat == "disabled-since-boot"`;
-8. `secboot == true`;
-9. `hwmodel == "GCP_INTEL_TDX"`;
-10. `STABLE` support;
-11. memory monitoring explicitly disabled;
-12. empty `cmd_override` and `env_override`.
+6. exact canonical lowercase `sha256:…` image digest;
+7. `swname == "CONFIDENTIAL_SPACE"`;
+8. `dbgstat == "disabled-since-boot"`;
+9. `secboot == true`;
+10. `hwmodel == "GCP_INTEL_TDX"`;
+11. exactly one Intel entry in `attester_tcb`;
+12. one unambiguous TDX claim object;
+13. an accepted `gcp_attester_tcb_status`;
+14. a canonical `gcp_attester_tcb_date` meeting the optional minimum;
+15. one canonical Confidential Space `swversion` meeting the optional minimum;
+16. `STABLE` support;
+17. memory monitoring explicitly disabled;
+18. empty `cmd_override` and `env_override`.
+
+Google's documented token schema describes `tdx` as a single-element array,
+while production Google tokens have also used a direct object. The verifier
+accepts either unambiguous representation and rejects empty or multi-entry
+arrays.
 
 The `container.env` claim is not required to be empty. Confidential Space
 includes image-defined and launcher-provided values such as `PATH` and
@@ -122,7 +151,25 @@ signed claims, including:
 - common GCE identity/configuration claims.
 
 Issuer-specific timestamps, issuer strings, and appraisal-specific TCB claims
-are not compared.
+are not compared. Each issuer's freshness and TCB claims must independently
+pass policy.
+
+## Freshness and replay
+
+The JWT `exp` and `nbf` checks bound token validity. The additional `iat` policy
+reduces the acceptance window for a captured token. It does not provide
+single-use semantics.
+
+The sole `eat_nonce` commits to `public_values`. A relying party that needs
+request freshness should include its own random challenge, ephemeral
+handshake key, or TLS channel binding in those public values and maintain any
+required used-nonce registry. The library intentionally remains stateless and
+cannot detect replay by itself.
+
+The signed `gcp_attester_tcb_status` is an appraisal signal, not proof that the
+Google fleet still matches Intel's real-time reference values. A minimum TCB
+date is an additional relying-party floor, not a replacement for provider
+security advisories and key revocation.
 
 ## Workload identity
 

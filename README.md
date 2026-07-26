@@ -204,13 +204,16 @@ report
 
 Strict verification requires:
 
-- a valid OIDC signature, expiration, not-before time, fixed issuer, and exact
-  audience;
+- a valid OIDC signature, expiration, not-before time, fixed issuer, exact
+  audience, and a signed `iat` no more than five minutes old by default;
 - exactly one `eat_nonce` equal to the encoded commitment;
 - the exact verifier-supplied `sha256:…` container image digest;
 - `swname == "CONFIDENTIAL_SPACE"`;
-- a production image, Secure Boot, `GCP_INTEL_TDX`, `STABLE` support, and
+- a production image, Secure Boot, `GCP_INTEL_TDX`, an Intel TCB root,
+  an accepted TDX TCB status, a canonical TCB date, `STABLE` support, and
   memory monitoring disabled;
+- one canonical Confidential Space software version, optionally constrained by
+  a relying-party minimum;
 - empty `cmd_override` and `env_override`.
 
 Dual mode independently verifies both tokens and then requires equality of
@@ -219,7 +222,8 @@ environment. Image-defined environment variables are allowed because valid
 Confidential Space tokens normally include them; the pinned image must retain
 the default `allow_env_override=false` launch policy. A partial dual result is
 never returned by generation, and a missing or disagreeing token fails
-`all_passed()`.
+`all_passed()`. Issuer-specific TCB claims are enforced independently rather
+than compared.
 
 See [Confidential Space support](docs/confidential-space.md) for the complete
 contract and a digest-pinned TDX deployment walkthrough. Runnable examples are

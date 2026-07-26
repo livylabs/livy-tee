@@ -64,6 +64,7 @@ fn valid_claims(issuer: &str, commitment: [u8; 32]) -> Value {
         "iat": now - 60,
         "nbf": now - 60,
         "exp": now + 3600,
+        "attester_tcb": ["INTEL"],
         "eat_nonce": [BASE64URL.encode(commitment)],
         "dbgstat": "disabled-since-boot",
         "hwmodel": "GCP_INTEL_TDX",
@@ -71,6 +72,10 @@ fn valid_claims(issuer: &str, commitment: [u8; 32]) -> Value {
         "sub": "https://www.googleapis.com/compute/v1/projects/p/zones/z/instances/i",
         "swname": "CONFIDENTIAL_SPACE",
         "swversion": ["260700"],
+        "tdx": {
+            "gcp_attester_tcb_status": "UpToDate",
+            "gcp_attester_tcb_date": "2025-05-14T00:00:00Z"
+        },
         "submods": {
             "confidential_space": {
                 "support_attributes": ["LATEST", "STABLE", "USABLE"],
@@ -432,8 +437,28 @@ async fn valid_google_intel_and_dual_tokens_pass_strict_verification() {
             report.dual_claims_match,
             (mode == ConfidentialSpaceAttesterMode::Dual).then_some(true)
         );
+        let issuer_report = report.google.as_ref().or(report.intel.as_ref()).unwrap();
+        assert!(issuer_report.token_fresh);
+        assert_eq!(issuer_report.tcb_status, "UpToDate");
+        assert_eq!(
+            issuer_report.tcb_date.as_deref(),
+            Some("2025-05-14T00:00:00Z")
+        );
+        assert_eq!(
+            issuer_report.confidential_space_version.as_deref(),
+            Some("260700")
+        );
         server.finish().await;
     }
+}
+
+#[tokio::test]
+async fn documented_tdx_array_shape_also_passes() {
+    let values = public_values();
+    let mut claims = valid_claims(CONFIDENTIAL_SPACE_GOOGLE_ISSUER, values.commitment_hash());
+    claims["tdx"] = json!([claims["tdx"].clone()]);
+    let report = verify_google_claims(claims).await;
+    assert!(report.all_passed(), "{report:#?}");
 }
 
 #[tokio::test]
@@ -554,6 +579,71 @@ async fn signature_algorithm_key_and_time_failures_are_rejected() {
         assert!(!report.all_passed());
         assert!(!report.google.unwrap().jwt_signature_and_time_valid);
     }
+}
+
+#[tokio::test]
+async fn stale_or_future_issued_at_is_rejected() {
+    for issued_at in [now_unix_secs() - 1_000, now_unix_secs() + 120] {
+        let values = public_values();
+        let mut claims = valid_claims(CONFIDENTIAL_SPACE_GOOGLE_ISSUER, values.commitment_hash());
+        claims["iat"] = json!(issued_at);
+        let report = verify_google_claims(claims).await;
+        assert!(!report.all_passed(), "{report:#?}");
+        assert!(!report.google.unwrap().token_fresh);
+    }
+}
+
+#[tokio::test]
+async fn tcb_root_status_date_and_confidential_space_version_are_enforced() {
+    enum Mutation {
+        Attester,
+        Status,
+        Date,
+        TdxCardinality,
+        Version,
+    }
+    for mutation in [
+        Mutation::Attester,
+        Mutation::Status,
+        Mutation::Date,
+        Mutation::TdxCardinality,
+        Mutation::Version,
+    ] {
+        let values = public_values();
+        let mut claims = valid_claims(CONFIDENTIAL_SPACE_GOOGLE_ISSUER, values.commitment_hash());
+        match mutation {
+            Mutation::Attester => claims["attester_tcb"] = json!(["AMD"]),
+            Mutation::Status => claims["tdx"]["gcp_attester_tcb_status"] = json!("OutOfDate"),
+            Mutation::Date => {
+                claims["tdx"]["gcp_attester_tcb_date"] = json!("2025-02-30T00:00:00Z");
+            }
+            Mutation::TdxCardinality => {
+                claims["tdx"] = json!([claims["tdx"].clone(), claims["tdx"].clone()]);
+            }
+            Mutation::Version => claims["swversion"] = json!(["260013"]),
+        }
+        let report = verify_google_claims(claims).await;
+        assert!(!report.all_passed(), "{report:#?}");
+    }
+}
+
+#[tokio::test]
+async fn configured_tcb_date_and_confidential_space_version_minimums_are_enforced() {
+    let values = public_values();
+    let claims = valid_claims(CONFIDENTIAL_SPACE_GOOGLE_ISSUER, values.commitment_hash());
+    let server = JwksServer::spawn(1).await;
+    let attestation = artifact(ConfidentialSpaceTokens::Google {
+        token: sign_token(claims),
+    });
+    let mut verification_policy = policy(&server.url);
+    verification_policy.minimum_tcb_date = Some("2025-05-15T00:00:00Z".to_string());
+    verification_policy.minimum_confidential_space_version = Some("260800".to_string());
+    let report = attestation.verify(&verification_policy).await.unwrap();
+    server.finish().await;
+
+    let google = report.google.unwrap();
+    assert!(!google.tcb_date_allowed);
+    assert!(!google.confidential_space_version_allowed);
 }
 
 #[tokio::test]
@@ -691,10 +781,24 @@ async fn invalid_policy_inputs_are_rejected() {
     let attestation = artifact(ConfidentialSpaceTokens::Google {
         token: "a.b.c".to_string(),
     });
-    for policy in [
+    let mut policies = vec![
         ConfidentialSpaceVerificationPolicy::new("", IMAGE_DIGEST),
         ConfidentialSpaceVerificationPolicy::new(AUDIENCE, "not-a-digest"),
-    ] {
+    ];
+    let mut no_statuses = ConfidentialSpaceVerificationPolicy::new(AUDIENCE, IMAGE_DIGEST);
+    no_statuses.accepted_tcb_statuses.clear();
+    policies.push(no_statuses);
+    let mut invalid_tcb_date = ConfidentialSpaceVerificationPolicy::new(AUDIENCE, IMAGE_DIGEST);
+    invalid_tcb_date.minimum_tcb_date = Some("2025-02-30T00:00:00Z".to_string());
+    policies.push(invalid_tcb_date);
+    let mut invalid_version = ConfidentialSpaceVerificationPolicy::new(AUDIENCE, IMAGE_DIGEST);
+    invalid_version.minimum_confidential_space_version = Some("260013".to_string());
+    policies.push(invalid_version);
+    let mut invalid_age = ConfidentialSpaceVerificationPolicy::new(AUDIENCE, IMAGE_DIGEST);
+    invalid_age.max_token_age_secs = 0;
+    policies.push(invalid_age);
+
+    for policy in policies {
         assert!(matches!(
             attestation.verify(&policy).await,
             Err(ConfidentialSpaceError::InvalidConfiguration(_))
