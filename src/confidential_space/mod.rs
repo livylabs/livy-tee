@@ -37,6 +37,8 @@ const DEFAULT_STS_TOKEN_URL: &str = "https://sts.googleapis.com/v1/token";
 const DEFAULT_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 const DEFAULT_MAX_TOKEN_AGE_SECS: u64 = 300;
 const TOKEN_CLOCK_SKEW_SECS: u64 = 60;
+const LAUNCHER_CONNECT_ATTEMPTS: usize = 6;
+const LAUNCHER_CONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Workload Identity Federation settings for a Confidential Space workload.
 #[derive(Debug, Clone)]
@@ -586,24 +588,44 @@ impl ConfidentialSpace {
                     self.config.request_timeout_secs,
                 ))
                 .build()
-                .map_err(|error| ConfidentialSpaceError::Launcher(error.to_string()))?;
+                .map_err(|error| ConfidentialSpaceError::Launcher(format_error_chain(&error)))?;
             let request = TokenRequest {
                 audience: &self.config.audience,
                 token_type: "OIDC",
                 nonces: [BASE64URL.encode(commitment)],
             };
-            let response = client
-                .post(format!("http://localhost{}", issuer.launcher_path()))
-                .header("Accept", "application/json")
-                .json(&request)
-                .send()
-                .await
-                .map_err(|error| ConfidentialSpaceError::Launcher(error.to_string()))?;
+            let endpoint = format!("http://localhost{}", issuer.launcher_path());
+            let mut attempt = 1;
+            let mut backoff = LAUNCHER_CONNECT_INITIAL_BACKOFF;
+            let response = loop {
+                match client
+                    .post(&endpoint)
+                    .header("Accept", "application/json")
+                    .json(&request)
+                    .send()
+                    .await
+                {
+                    Ok(response) => break response,
+                    Err(error) if error.is_connect() && attempt < LAUNCHER_CONNECT_ATTEMPTS => {
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        backoff = backoff.saturating_mul(2);
+                    }
+                    Err(error) => {
+                        return Err(ConfidentialSpaceError::Launcher(format!(
+                            "socket {} after {attempt} attempt{}: {}",
+                            self.config.launcher_socket.display(),
+                            if attempt == 1 { "" } else { "s" },
+                            format_error_chain(&error)
+                        )));
+                    }
+                }
+            };
             let status = response.status();
             let body = response
                 .text()
                 .await
-                .map_err(|error| ConfidentialSpaceError::Launcher(error.to_string()))?;
+                .map_err(|error| ConfidentialSpaceError::Launcher(format_error_chain(&error)))?;
             if !status.is_success() {
                 return Err(ConfidentialSpaceError::LauncherStatus {
                     issuer,
@@ -614,6 +636,17 @@ impl ConfidentialSpace {
             normalize_launcher_token(issuer, &body)
         }
     }
+}
+
+fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 fn normalize_launcher_token(

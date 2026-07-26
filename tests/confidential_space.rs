@@ -179,14 +179,22 @@ struct LauncherServer {
 #[cfg(unix)]
 impl LauncherServer {
     async fn spawn(responses: Vec<(u16, String, u64)>) -> Self {
+        Self::spawn_after(responses, 0).await
+    }
+
+    async fn spawn_after(responses: Vec<(u16, String, u64)>, delay_ms: u64) -> Self {
         let short_id = uuid::Uuid::new_v4().simple().to_string();
         let socket_path = PathBuf::from(format!(
             "/tmp/livy-cs-{}-{}.sock",
             std::process::id(),
             &short_id[..8]
         ));
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let task_socket_path = socket_path.clone();
         let task = tokio::spawn(async move {
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            let listener = UnixListener::bind(&task_socket_path).unwrap();
             let mut observed = Vec::new();
             for (status, body, delay_ms) in responses {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -272,6 +280,44 @@ fn launcher_client(socket_path: PathBuf, mode: ConfidentialSpaceAttesterMode) ->
     config.launcher_socket = socket_path;
     config.request_timeout_secs = 1;
     ConfidentialSpace::new(config)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn launcher_retries_until_a_delayed_socket_is_ready() {
+    let server =
+        LauncherServer::spawn_after(vec![(200, json!({"token":"a.b.c"}).to_string(), 0)], 125)
+            .await;
+    let client = launcher_client(
+        server.socket_path.clone(),
+        ConfidentialSpaceAttesterMode::Google,
+    );
+
+    let tokens = client.request_tokens(&[0u8; 32]).await.unwrap();
+    assert!(matches!(
+        tokens,
+        ConfidentialSpaceTokens::Google { ref token } if token == "a.b.c"
+    ));
+    assert_eq!(server.finish().await.len(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn launcher_connect_error_includes_socket_and_os_cause() {
+    let socket_path = PathBuf::from(format!(
+        "/tmp/livy-cs-missing-{}-{}.sock",
+        std::process::id(),
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let client = launcher_client(socket_path.clone(), ConfidentialSpaceAttesterMode::Google);
+
+    let error = client.request_tokens(&[0u8; 32]).await.unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains(&socket_path.display().to_string()));
+    assert!(
+        message.contains("os error") || message.contains("No such file"),
+        "{message}"
+    );
 }
 
 #[cfg(unix)]
