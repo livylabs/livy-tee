@@ -8,12 +8,17 @@ use jsonwebtoken::Algorithm;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// Confidential Space launcher Unix socket.
 const CONFIDENTIAL_SPACE_LAUNCHER_SOCKET: &str = "/run/container_launcher/teeserver.sock";
+/// Launcher-managed, hourly refreshed token for Workload Identity Federation.
+pub const CONFIDENTIAL_SPACE_DEFAULT_CLAIMS_TOKEN_PATH: &str =
+    "/run/container_launcher/attestation_verifier_claims_token";
 /// Trusted Google Cloud Attestation issuer.
 pub const CONFIDENTIAL_SPACE_GOOGLE_ISSUER: &str = "https://confidentialcomputing.googleapis.com";
 /// Trusted Intel Trust Authority Confidential Space issuer.
@@ -26,8 +31,261 @@ const GOOGLE_DISCOVERY_URL: &str =
 const INTEL_DISCOVERY_URL: &str =
     "https://portal.trustauthority.intel.com/.well-known/openid-configuration";
 const MAX_AUDIENCE_BYTES: usize = 512;
+const MAX_SUBJECT_TOKEN_BYTES: usize = 64 * 1024;
+const MAX_ACCESS_TOKEN_BYTES: usize = 64 * 1024;
+const DEFAULT_STS_TOKEN_URL: &str = "https://sts.googleapis.com/v1/token";
+const DEFAULT_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 const DEFAULT_MAX_TOKEN_AGE_SECS: u64 = 300;
 const TOKEN_CLOCK_SKEW_SECS: u64 = 60;
+
+/// Workload Identity Federation settings for a Confidential Space workload.
+#[derive(Debug, Clone)]
+pub struct ConfidentialSpaceWorkloadIdentityConfig {
+    /// Full provider resource name, beginning with `projects/`.
+    pub workload_identity_provider: String,
+    /// Launcher-managed default claims token.
+    pub subject_token_path: PathBuf,
+    /// Google Security Token Service endpoint.
+    pub token_url: String,
+    /// OAuth scope requested from Security Token Service.
+    pub scope: String,
+    /// Token exchange timeout in seconds.
+    pub request_timeout_secs: u64,
+}
+
+impl ConfidentialSpaceWorkloadIdentityConfig {
+    /// Create production settings for a Workload Identity Pool provider.
+    #[must_use]
+    pub fn new(workload_identity_provider: impl Into<String>) -> Self {
+        Self {
+            workload_identity_provider: workload_identity_provider.into(),
+            subject_token_path: PathBuf::from(CONFIDENTIAL_SPACE_DEFAULT_CLAIMS_TOKEN_PATH),
+            token_url: DEFAULT_STS_TOKEN_URL.to_string(),
+            scope: DEFAULT_CLOUD_PLATFORM_SCOPE.to_string(),
+            request_timeout_secs: 30,
+        }
+    }
+
+    /// Return the canonical external-account audience for this provider.
+    pub fn audience(&self) -> Result<String, ConfidentialSpaceError> {
+        self.validate()?;
+        Ok(format!(
+            "//iam.googleapis.com/{}",
+            self.workload_identity_provider
+        ))
+    }
+
+    fn validate(&self) -> Result<(), ConfidentialSpaceError> {
+        let segments: Vec<_> = self.workload_identity_provider.split('/').collect();
+        if segments.len() != 8
+            || segments[0] != "projects"
+            || segments[1].parse::<u64>().is_err()
+            || segments[2] != "locations"
+            || segments[3] != "global"
+            || segments[4] != "workloadIdentityPools"
+            || segments[5].is_empty()
+            || segments[6] != "providers"
+            || segments[7].is_empty()
+        {
+            return Err(ConfidentialSpaceError::InvalidConfiguration(
+                "workload_identity_provider must be projects/NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER"
+                    .to_string(),
+            ));
+        }
+        if self.subject_token_path.as_os_str().is_empty() {
+            return Err(ConfidentialSpaceError::InvalidConfiguration(
+                "subject_token_path must not be empty".to_string(),
+            ));
+        }
+        let token_url = reqwest::Url::parse(&self.token_url).map_err(|error| {
+            ConfidentialSpaceError::InvalidConfiguration(format!("token_url is invalid: {error}"))
+        })?;
+        if token_url.scheme() != "https"
+            && !(cfg!(test)
+                && token_url.scheme() == "http"
+                && token_url.host_str() == Some("127.0.0.1"))
+        {
+            return Err(ConfidentialSpaceError::InvalidConfiguration(
+                "token_url must use HTTPS".to_string(),
+            ));
+        }
+        if self.scope.trim().is_empty() || self.scope.len() > MAX_AUDIENCE_BYTES {
+            return Err(ConfidentialSpaceError::InvalidConfiguration(
+                "scope must be non-empty and at most 512 bytes".to_string(),
+            ));
+        }
+        if self.request_timeout_secs == 0 {
+            return Err(ConfidentialSpaceError::InvalidConfiguration(
+                "request_timeout_secs must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A short-lived OAuth bearer token exchanged from Confidential Space claims.
+///
+/// `Debug` deliberately redacts the bearer value.
+#[derive(Clone)]
+pub struct ConfidentialSpaceAccessToken {
+    token: Zeroizing<String>,
+    expires_at: SystemTime,
+}
+
+impl fmt::Debug for ConfidentialSpaceAccessToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfidentialSpaceAccessToken")
+            .field("token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl ConfidentialSpaceAccessToken {
+    /// Borrow the bearer value for an authenticated request.
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        self.token.as_str()
+    }
+
+    /// Return the provider-reported expiry time.
+    #[must_use]
+    pub fn expires_at(&self) -> SystemTime {
+        self.expires_at
+    }
+
+    /// Return whether the token remains valid for at least `minimum_ttl`.
+    #[must_use]
+    pub fn is_valid_for(&self, minimum_ttl: Duration) -> bool {
+        SystemTime::now()
+            .checked_add(minimum_ttl)
+            .is_some_and(|minimum_expiry| self.expires_at > minimum_expiry)
+    }
+}
+
+/// Exchanges the launcher-managed attestation token for federated Google
+/// Cloud credentials.
+#[derive(Clone)]
+pub struct ConfidentialSpaceWorkloadIdentity {
+    config: ConfidentialSpaceWorkloadIdentityConfig,
+    client: reqwest::Client,
+}
+
+impl fmt::Debug for ConfidentialSpaceWorkloadIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfidentialSpaceWorkloadIdentity")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConfidentialSpaceWorkloadIdentity {
+    /// Create a token exchanger after validating all local settings.
+    pub fn new(
+        config: ConfidentialSpaceWorkloadIdentityConfig,
+    ) -> Result<Self, ConfidentialSpaceError> {
+        config.validate()?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.request_timeout_secs))
+            .build()
+            .map_err(|error| ConfidentialSpaceError::Federation(error.to_string()))?;
+        Ok(Self { config, client })
+    }
+
+    /// Exchange the current launcher claims token through Google Security
+    /// Token Service.
+    ///
+    /// The returned token is not cached. Callers should cache it until shortly
+    /// before `expires_at()` and continue to enforce authorization at each
+    /// protected resource.
+    pub async fn exchange(&self) -> Result<ConfidentialSpaceAccessToken, ConfidentialSpaceError> {
+        let subject_token = std::fs::read_to_string(&self.config.subject_token_path)
+            .map_err(|error| ConfidentialSpaceError::ClaimsToken(error.to_string()))?;
+        let subject_token = subject_token.trim();
+        if subject_token.is_empty()
+            || subject_token.len() > MAX_SUBJECT_TOKEN_BYTES
+            || subject_token.split('.').count() != 3
+        {
+            return Err(ConfidentialSpaceError::ClaimsToken(
+                "launcher claims token is not a bounded three-part JWT".to_string(),
+            ));
+        }
+        let audience = self.config.audience()?;
+        let response = self
+            .client
+            .post(&self.config.token_url)
+            .form(&[
+                (
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                ),
+                ("audience", audience.as_str()),
+                ("scope", self.config.scope.as_str()),
+                (
+                    "requested_token_type",
+                    "urn:ietf:params:oauth:token-type:access_token",
+                ),
+                ("subject_token_type", "urn:ietf:params:oauth:token-type:jwt"),
+                ("subject_token", subject_token),
+            ])
+            .send()
+            .await
+            .map_err(|error| ConfidentialSpaceError::Federation(error.to_string()))?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| ConfidentialSpaceError::Federation(error.to_string()))?;
+        if body.len() > MAX_ACCESS_TOKEN_BYTES {
+            return Err(ConfidentialSpaceError::FederationResponse(
+                "Security Token Service response is too large".to_string(),
+            ));
+        }
+        if !status.is_success() {
+            return Err(ConfidentialSpaceError::FederationStatus {
+                status: status.as_u16(),
+            });
+        }
+
+        #[derive(Deserialize)]
+        struct TokenResponse {
+            access_token: String,
+            issued_token_type: String,
+            token_type: String,
+            expires_in: u64,
+        }
+
+        let token: TokenResponse = serde_json::from_slice(&body).map_err(|error| {
+            ConfidentialSpaceError::FederationResponse(format!(
+                "Security Token Service returned invalid JSON: {error}"
+            ))
+        })?;
+        if token.access_token.is_empty()
+            || token.access_token.len() > MAX_ACCESS_TOKEN_BYTES
+            || token.token_type != "Bearer"
+            || token.issued_token_type != "urn:ietf:params:oauth:token-type:access_token"
+            || token.expires_in == 0
+            || token.expires_in > 86_400
+        {
+            return Err(ConfidentialSpaceError::FederationResponse(
+                "Security Token Service returned an invalid access-token contract".to_string(),
+            ));
+        }
+        let expires_at = SystemTime::now()
+            .checked_add(Duration::from_secs(token.expires_in))
+            .ok_or_else(|| {
+                ConfidentialSpaceError::FederationResponse(
+                    "Security Token Service expiry overflowed".to_string(),
+                )
+            })?;
+        Ok(ConfidentialSpaceAccessToken {
+            token: Zeroizing::new(token.access_token),
+            expires_at,
+        })
+    }
+}
 
 /// Which Confidential Space attestation service must mint the artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +368,21 @@ pub enum ConfidentialSpaceError {
         /// Diagnostic message.
         message: String,
     },
+    /// The launcher-managed default claims token was unavailable or malformed.
+    #[error("Confidential Space claims token failed: {0}")]
+    ClaimsToken(String),
+    /// Workload Identity Federation transport or client setup failed.
+    #[error("Confidential Space federation failed: {0}")]
+    Federation(String),
+    /// Google Security Token Service rejected the exchange.
+    #[error("Security Token Service returned HTTP {status}")]
+    FederationStatus {
+        /// HTTP status returned without including a potentially sensitive body.
+        status: u16,
+    },
+    /// Google Security Token Service returned a malformed success response.
+    #[error("invalid Security Token Service response: {0}")]
+    FederationResponse(String),
     /// The serialized artifact is not schema version 2.
     #[error(
         "unsupported Confidential Space attestation schema version {0}; only version 2 is supported"
@@ -1153,4 +1426,140 @@ where
 
 const fn is_leap_year(year: u16) -> bool {
     year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+#[cfg(test)]
+mod workload_identity_tests {
+    use super::{
+        ConfidentialSpaceError, ConfidentialSpaceWorkloadIdentity,
+        ConfidentialSpaceWorkloadIdentityConfig,
+    };
+    use std::path::PathBuf;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const PROVIDER: &str = "projects/123456789/locations/global/workloadIdentityPools/tee/providers/confidential-space";
+
+    fn claims_token_file(contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "livy-tee-cs-claims-{}-{}.jwt",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    async fn token_server(status: u16, body: String) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let header_end = header_end + 4;
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + content_length {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status} TEST\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (format!("http://{address}/v1/token"), task)
+    }
+
+    #[tokio::test]
+    async fn exchanges_launcher_claims_without_leaking_tokens_in_debug() {
+        let path = claims_token_file("header.payload.signature");
+        let body = serde_json::json!({
+            "access_token": "sensitive-access-token",
+            "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })
+        .to_string();
+        let (token_url, server) = token_server(200, body).await;
+        let mut config = ConfidentialSpaceWorkloadIdentityConfig::new(PROVIDER);
+        config.subject_token_path = path.clone();
+        config.token_url = token_url;
+        let credentials = ConfidentialSpaceWorkloadIdentity::new(config).unwrap();
+
+        let token = credentials.exchange().await.unwrap();
+        let request = server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(token.expose_secret(), "sensitive-access-token");
+        assert!(token.is_valid_for(std::time::Duration::from_secs(300)));
+        assert!(!format!("{token:?}").contains("sensitive-access-token"));
+        assert!(request.contains(
+            "audience=%2F%2Fiam.googleapis.com%2Fprojects%2F123456789%2Flocations%2Fglobal"
+        ));
+        assert!(request.contains("subject_token=header.payload.signature"));
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_launcher_claims_before_sts() {
+        let path = claims_token_file("not-a-jwt");
+        let mut config = ConfidentialSpaceWorkloadIdentityConfig::new(PROVIDER);
+        config.subject_token_path = path.clone();
+        let credentials = ConfidentialSpaceWorkloadIdentity::new(config).unwrap();
+
+        let error = credentials.exchange().await.unwrap_err();
+        std::fs::remove_file(path).unwrap();
+
+        assert!(matches!(error, ConfidentialSpaceError::ClaimsToken(_)));
+    }
+
+    #[tokio::test]
+    async fn sts_error_does_not_include_the_response_body() {
+        let path = claims_token_file("header.payload.signature");
+        let (token_url, server) =
+            token_server(403, r#"{"error":"sensitive-policy-detail"}"#.to_string()).await;
+        let mut config = ConfidentialSpaceWorkloadIdentityConfig::new(PROVIDER);
+        config.subject_token_path = path.clone();
+        config.token_url = token_url;
+        let credentials = ConfidentialSpaceWorkloadIdentity::new(config).unwrap();
+
+        let error = credentials.exchange().await.unwrap_err();
+        let _request = server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert!(matches!(
+            error,
+            ConfidentialSpaceError::FederationStatus { status: 403 }
+        ));
+        assert!(!error.to_string().contains("sensitive-policy-detail"));
+    }
+
+    #[test]
+    fn provider_resource_name_is_strict() {
+        let config = ConfidentialSpaceWorkloadIdentityConfig::new(
+            "projects/name/locations/us-east4/workloadIdentityPools/pool/providers/provider",
+        );
+        assert!(config.audience().is_err());
+    }
 }

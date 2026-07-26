@@ -25,6 +25,7 @@ uuid      = { version = "1", features = ["v4", "serde"] }
 
 reqwest      = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 jsonwebtoken = { version = "9", optional = true }
+zeroize      = { version = "1", optional = true }
 
 [dev-dependencies]
 base64     = "0.22"
@@ -41,7 +42,7 @@ attestation = ["dep:reqwest", "dep:jsonwebtoken"]
 # ita-verify: Intel Trust Authority REST API verification
 ita-verify = ["attestation"]
 # confidential-space: Google Confidential Space launcher and token verification
-confidential-space = ["attestation"]
+confidential-space = ["attestation", "dep:zeroize"]
 
 [[example]]
 name = "ita_cli_cross_verify"

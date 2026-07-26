@@ -180,6 +180,43 @@ application identity than raw instance MRTD.
 Instance MRTD remains useful only with an external reference-measurement
 policy, and it does not by itself identify the running application.
 
+For direct access to Google Cloud resources, configure a Workload Identity
+Pool provider for the Confidential Space issuer and exchange the launcher's
+default claims token:
+
+```rust,no_run
+use livy_tee::{
+    ConfidentialSpaceWorkloadIdentity, ConfidentialSpaceWorkloadIdentityConfig,
+};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let config = ConfidentialSpaceWorkloadIdentityConfig::new(
+    "projects/123456789/locations/global/workloadIdentityPools/tee/providers/confidential-space",
+);
+let credentials = ConfidentialSpaceWorkloadIdentity::new(config)?;
+let token = credentials.exchange().await?;
+
+let client = reqwest::Client::new();
+let response = client
+    .get("https://storage.googleapis.com/storage/v1/b/example/o")
+    .bearer_auth(token.expose_secret())
+    .send()
+    .await?;
+# Ok(())
+# }
+```
+
+The library reads
+`/run/container_launcher/attestation_verifier_claims_token`, which the launcher
+refreshes. It exchanges that assertion with Google Security Token Service and
+returns a redacted, zeroized bearer-token wrapper. It does not cache tokens or
+weaken resource-side policy: callers must grant the federated principal access
+only when its signed image digest and posture claims meet their policy.
+
+Prefer direct resource access over service-account impersonation. Never expose
+the launcher claims token or the exchanged bearer token through logs, health
+endpoints, deployment evidence, or application responses.
+
 ## Runnable workload and verifier
 
 The repository includes two executable examples:

@@ -68,9 +68,11 @@ pub use verify::ita::unauthenticated_report_data_hash_from_token;
 
 #[cfg(feature = "confidential-space")]
 pub use confidential_space::{
-    ConfidentialSpace, ConfidentialSpaceAttestation, ConfidentialSpaceAttesterMode,
-    ConfidentialSpaceConfig, ConfidentialSpaceError, ConfidentialSpaceIssuer,
-    ConfidentialSpaceIssuerVerification, ConfidentialSpaceTokens, ConfidentialSpaceVerification,
-    ConfidentialSpaceVerificationPolicy, CONFIDENTIAL_SPACE_ATTESTATION_SCHEMA_VERSION,
+    ConfidentialSpace, ConfidentialSpaceAccessToken, ConfidentialSpaceAttestation,
+    ConfidentialSpaceAttesterMode, ConfidentialSpaceConfig, ConfidentialSpaceError,
+    ConfidentialSpaceIssuer, ConfidentialSpaceIssuerVerification, ConfidentialSpaceTokens,
+    ConfidentialSpaceVerification, ConfidentialSpaceVerificationPolicy,
+    ConfidentialSpaceWorkloadIdentity, ConfidentialSpaceWorkloadIdentityConfig,
+    CONFIDENTIAL_SPACE_ATTESTATION_SCHEMA_VERSION, CONFIDENTIAL_SPACE_DEFAULT_CLAIMS_TOKEN_PATH,
     CONFIDENTIAL_SPACE_GOOGLE_ISSUER, CONFIDENTIAL_SPACE_INTEL_ISSUER,
 };
